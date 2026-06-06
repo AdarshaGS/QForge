@@ -1,0 +1,8 @@
+PySide6>=6.5.0
+pymysql>=1.1.0
+pandas>=2.0.0
+sqlparse>=0.4.4
+psycopg2-binary>=2.9.9
+sshtunnel>=0.4.0
+openpyxl>=3.1.0
+pyarrow>=10.0.0
