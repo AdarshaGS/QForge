@@ -18,9 +18,6 @@ BUNDLE_ID="com.qforge.app"
 DMG_NAME="QForge.dmg"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Tap repo: use the sibling directory of the main repo
-TAP_DIR="$(dirname "$REPO_DIR")/${TAP_REPO}"
-
 # Read version from first argument, or prompt
 VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
@@ -261,24 +258,13 @@ MySQL · PostgreSQL · SQLite · SSH tunnels" \
 ok "Release live → https://github.com/${GITHUB_USER}/${GITHUB_REPO}/releases/tag/${TAG}"
 
 # =============================================================================
-# STEP 6 — Update Homebrew tap formula
+# STEP 6 — Update Homebrew tap formula (GitHub API only, no local git needed)
 # =============================================================================
 step "[6/7] Updating Homebrew tap formula"
 
-# Clone tap repo if not present, otherwise pull latest
-if [ ! -d "$TAP_DIR/.git" ]; then
-    echo "  Cloning ${GITHUB_USER}/${TAP_REPO}..."
-    git clone "https://github.com/${GITHUB_USER}/${TAP_REPO}.git" "$TAP_DIR"
-fi
-
-cd "$TAP_DIR"
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
-git pull --rebase origin "$BRANCH"
-
-# Create Casks/ folder first, then write the formula
-mkdir -p "$TAP_DIR/Casks"
-
-cat > "$TAP_DIR/Casks/qforge.rb" << FORMULA_EOF
+# Write formula to a temp file so we can base64-encode it cleanly
+FORMULA_TMP="$(mktemp /tmp/qforge_formula_XXXX.rb)"
+cat > "$FORMULA_TMP" << FORMULA_EOF
 cask "qforge" do
   version "${VERSION}"
   sha256 "${SHA256}"
@@ -310,21 +296,20 @@ cask "qforge" do
 end
 FORMULA_EOF
 
-# Push via GitHub API — works regardless of local git credential config.
-# gh is already verified as the repo owner in Step 1.
-FORMULA_CONTENT=$(base64 < "$TAP_DIR/Casks/qforge.rb")
+# macOS base64 requires -i flag; strip newlines for the API
+FORMULA_CONTENT=$(base64 -i "$FORMULA_TMP" | tr -d '\n')
+rm -f "$FORMULA_TMP"
+
 EXISTING_SHA=$(gh api "repos/${GITHUB_USER}/${TAP_REPO}/contents/Casks/qforge.rb" \
     --jq '.sha' 2>/dev/null || echo "")
 
 if [ -n "$EXISTING_SHA" ]; then
-    # File exists — update it
     gh api --method PUT "repos/${GITHUB_USER}/${TAP_REPO}/contents/Casks/qforge.rb" \
         -f message="qforge ${TAG}: update to ${VERSION} (sha256 ${SHA256:0:12}...)" \
         -f content="$FORMULA_CONTENT" \
         -f sha="$EXISTING_SHA" \
         --jq '.commit.sha' | xargs -I{} echo "  Committed: {}"
 else
-    # File doesn't exist yet — create it
     gh api --method PUT "repos/${GITHUB_USER}/${TAP_REPO}/contents/Casks/qforge.rb" \
         -f message="qforge ${TAG}: initial formula ${VERSION}" \
         -f content="$FORMULA_CONTENT" \
@@ -334,24 +319,19 @@ fi
 ok "Tap formula pushed → https://github.com/${GITHUB_USER}/${TAP_REPO}/blob/master/Casks/qforge.rb"
 
 # =============================================================================
-# STEP 7 — Sync Homebrew tap and smoke-test
+# STEP 7 — Sync Homebrew tap cache
 # =============================================================================
 step "[7/7] Syncing Homebrew tap and smoke-testing"
 
 # Clear any cached DMG so Homebrew re-downloads and re-verifies the fresh one
 rm -f "$(brew --cache)/downloads/"*"--${DMG_NAME}" 2>/dev/null || true
 
-# Force-pull the pushed formula into Homebrew's tap cache.
-# 'brew update' is sometimes delayed — this guarantees Homebrew sees the
-# formula that was just pushed to GitHub.
 TAP_SLUG="$(echo "${GITHUB_USER}" | tr '[:upper:]' '[:lower:]')/${TAP_REPO}"
-TAP_CACHE="$(brew --repository)/Library/Taps/${TAP_SLUG}"
 
-if [ -d "$TAP_CACHE/.git" ]; then
-    git -C "$TAP_CACHE" fetch origin
-    CACHE_BRANCH=$(git -C "$TAP_CACHE" rev-parse --abbrev-ref HEAD)
-    git -C "$TAP_CACHE" reset --hard "origin/${CACHE_BRANCH}"
-    ok "Homebrew tap cache synced ($(grep sha256 "$TAP_CACHE/Casks/qforge.rb" | xargs))"
+# Ensure tap is registered, then force-pull the latest formula from GitHub
+if brew tap | grep -qi "${TAP_SLUG}"; then
+    brew tap --repair "${TAP_SLUG}" 2>/dev/null || true
+    ok "Homebrew tap refreshed"
 else
     brew tap "${TAP_SLUG}"
     ok "Homebrew tap installed"
