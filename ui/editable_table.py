@@ -49,7 +49,9 @@ class EditableTableWidget(QTableWidget):
         # Styling
         self.verticalHeader().setVisible(False)  # Hide row numbers
         self.setAlternatingRowColors(True)
-        self.setSortingEnabled(True)  # Enable sorting
+        # Sorting is handled server-side (via ORDER BY in the query);
+        # Qt's built-in client-side sort must be OFF to keep row data intact.
+        self.setSortingEnabled(False)
         
         # Connect header click for manual sorting (to avoid breaking modified state)
         self.horizontalHeader().sectionClicked.connect(self.on_header_clicked)

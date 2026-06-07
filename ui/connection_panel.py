@@ -36,6 +36,37 @@ from utils.logger import get_logger
 logger = get_logger()
 
 
+# ── Background query worker (must be a top-level class for PySide6) ──────────
+
+class _QueryWorker(QObject):
+    """Runs a single SQL query on a QThread and emits the result."""
+    done      = Signal(object, float)   # (DataFrame, elapsed_seconds)
+    errored   = Signal(str,   float)    # (error_message, elapsed_seconds)
+    cancelled = Signal()
+
+    def __init__(self, db_service, query: str, cancel_flag):
+        super().__init__()
+        self._db   = db_service
+        self._q    = query
+        self._flag = cancel_flag
+
+    def run(self):
+        t0 = time.time()
+        try:
+            df = self._db.execute_query(self._q)
+            elapsed = time.time() - t0
+            if self._flag.is_set():
+                self.cancelled.emit()
+            else:
+                self.done.emit(df, elapsed)
+        except Exception as ex:
+            elapsed = time.time() - t0
+            if self._flag.is_set():
+                self.cancelled.emit()
+            else:
+                self.errored.emit(str(ex), elapsed)
+
+
 class ConnectionPanel(QWidget):
     """One database connection panel (sidebar + content tabs)."""
 
@@ -335,48 +366,25 @@ class ConnectionPanel(QWidget):
             return
 
         tab._query_running = True
-        tab._cancel_flag = threading.Event()   # set() to request cancellation
+        tab._cancel_flag   = threading.Event()
         tab.run_btn.setEnabled(False)
         tab.cancel_btn.setEnabled(True)
 
-        start_time = time.time()
-
-        # ── Worker that runs on a QThread ─────────────────────────────────────
-        class _Worker(QObject):
-            done    = Signal(object, float)   # (DataFrame, elapsed)
-            errored = Signal(str, float)      # (message, elapsed)
-            cancelled = Signal()
-
-            def __init__(self, db_service, query, cancel_flag):
-                super().__init__()
-                self._db   = db_service
-                self._q    = query
-                self._flag = cancel_flag
-
-            def run(self):
-                try:
-                    # For MySQL we can send a KILL QUERY from a second connection;
-                    # for all drivers we rely on a timeout check after the call.
-                    t0 = time.time()
-                    df = self._db.execute_query(self._q)
-                    if self._flag.is_set():
-                        self.cancelled.emit()
-                    else:
-                        self.done.emit(df, time.time() - t0)
-                except Exception as ex:
-                    if self._flag.is_set():
-                        self.cancelled.emit()
-                    else:
-                        self.errored.emit(str(ex), time.time() - t0)
-
-        worker = _Worker(self.db_service, query, tab._cancel_flag)
+        worker = _QueryWorker(self.db_service, query, tab._cancel_flag)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
 
-        # Store refs so they aren't garbage-collected
+        # Keep refs alive until the thread finishes
         tab._query_thread = thread
         tab._query_worker = worker
+
+        def _cleanup():
+            tab._query_running = False
+            tab.run_btn.setEnabled(True)
+            tab.cancel_btn.setEnabled(False)
+            thread.quit()
+            thread.wait()
 
         def _on_done(df, elapsed):
             _cleanup()
@@ -394,29 +402,23 @@ class ConnectionPanel(QWidget):
             _cleanup()
             tab.show_cancelled()
 
-        def _cleanup():
-            tab._query_running = False
-            tab.run_btn.setEnabled(True)
-            tab.cancel_btn.setEnabled(False)
-            thread.quit()
-
         def _cancel():
             tab._cancel_flag.set()
-            # MySQL: send KILL QUERY via a temporary connection
             try:
                 self.db_service.kill_current_query()
             except Exception:
-                pass   # best-effort — thread will detect the flag too
+                pass
 
-        tab.cancel_btn.clicked.disconnect()
+        # Safely (re)connect Cancel button
+        try:
+            tab.cancel_btn.clicked.disconnect()
+        except RuntimeError:
+            pass   # nothing was connected yet
         tab.cancel_btn.clicked.connect(_cancel)
 
         worker.done.connect(_on_done)
         worker.errored.connect(_on_error)
         worker.cancelled.connect(_on_cancelled)
-        worker.done.connect(thread.quit)
-        worker.errored.connect(thread.quit)
-        worker.cancelled.connect(thread.quit)
 
         thread.start()
 
