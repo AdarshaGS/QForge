@@ -13,6 +13,7 @@ GITHUB_USER="AdarshaGS"
 GITHUB_REPO="QForge"
 TAP_REPO="homebrew-qforge"                # must start with homebrew-
 APP_NAME="QForge"
+APP_NAME_LOWER="$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]')"
 BUNDLE_ID="com.qforge.app"
 DMG_NAME="QForge.dmg"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -243,7 +244,7 @@ Professional database client — free alternative to TablePlus.
 
 ### Install via Homebrew
 \`\`\`bash
-brew tap ${GITHUB_USER}/${APP_NAME,,}
+brew tap ${GITHUB_USER}/${APP_NAME_LOWER}
 brew install --cask qforge
 \`\`\`
 
@@ -372,7 +373,7 @@ echo -e "  Homebrew tap:     https://github.com/${GITHUB_USER}/${TAP_REPO}"
 echo ""
 echo -e "${BOLD}Users can now install with:${NC}"
 echo ""
-echo -e "  brew tap ${GITHUB_USER}/${APP_NAME,,}"
+echo -e "  brew tap ${GITHUB_USER}/${APP_NAME_LOWER}"
 echo -e "  brew install --cask qforge"
 echo ""
 echo -e "  # or update an existing install:"
