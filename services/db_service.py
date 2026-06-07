@@ -198,6 +198,33 @@ class DbService:
         )
         return any(k in msg for k in keywords)
 
+    def kill_current_query(self):
+        """Best-effort: kill the running query on the server side.
+
+        MySQL  — opens a second connection and sends KILL QUERY <thread_id>.
+        Others — no-op (the cancel flag in the worker thread is sufficient).
+        """
+        if self.db_type != "mysql" or not self.connection:
+            return
+        try:
+            import pymysql
+            thread_id = self.connection.thread_id()
+            # Open a short-lived kill connection using the same config
+            kc = pymysql.connect(
+                host=self._config.get("host", "127.0.0.1"),
+                port=int(self._config.get("port", 3306)),
+                user=self._config.get("user", ""),
+                password=self._config.get("password", ""),
+                database=self._config.get("database", ""),
+                connect_timeout=3,
+            )
+            with kc.cursor() as cur:
+                cur.execute(f"KILL QUERY {thread_id}")
+            kc.close()
+            logger.info(f"Sent KILL QUERY {thread_id}")
+        except Exception as ex:
+            logger.warning(f"kill_current_query failed (non-fatal): {ex}")
+
     def _reconnect(self):
         """Re-establish the connection using the stored config."""
         if not self._config:

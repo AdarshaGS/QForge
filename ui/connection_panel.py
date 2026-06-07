@@ -12,8 +12,9 @@ connection tab bar, giving a TablePlus-style multi-connection experience.
 import os
 import time
 import re
+import threading
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QThread, QObject
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTreeWidget, QTreeWidgetItem, QTabWidget,
@@ -324,39 +325,100 @@ class ConnectionPanel(QWidget):
         QTimer.singleShot(0, tab.editor.setFocus)
 
     def _run_query_in_tab(self, tab):
-        """Execute the SQL in `tab` using this connection's db_service."""
+        """Execute the SQL in `tab` on a background thread; Cancel actually stops it."""
         query = tab.get_query().strip()
         if not query:
             return
 
-        progress = QProgressDialog("Executing query…", None, 0, 0, self)
-        progress.setWindowTitle("Running Query")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setCancelButton(None)
-        progress.setMinimumDuration(2000)
-        progress.show()
+        # Don't allow concurrent queries on the same tab
+        if getattr(tab, '_query_running', False):
+            return
 
-        try:
-            from PySide6.QtCore import QCoreApplication
-            QCoreApplication.processEvents()
+        tab._query_running = True
+        tab._cancel_flag = threading.Event()   # set() to request cancellation
+        tab.run_btn.setEnabled(False)
+        tab.cancel_btn.setEnabled(True)
 
-            start = time.time()
-            df = self.db_service.execute_query(query)
-            elapsed = time.time() - start
-            progress.close()
+        start_time = time.time()
 
+        # ── Worker that runs on a QThread ─────────────────────────────────────
+        class _Worker(QObject):
+            done    = Signal(object, float)   # (DataFrame, elapsed)
+            errored = Signal(str, float)      # (message, elapsed)
+            cancelled = Signal()
+
+            def __init__(self, db_service, query, cancel_flag):
+                super().__init__()
+                self._db   = db_service
+                self._q    = query
+                self._flag = cancel_flag
+
+            def run(self):
+                try:
+                    # For MySQL we can send a KILL QUERY from a second connection;
+                    # for all drivers we rely on a timeout check after the call.
+                    t0 = time.time()
+                    df = self._db.execute_query(self._q)
+                    if self._flag.is_set():
+                        self.cancelled.emit()
+                    else:
+                        self.done.emit(df, time.time() - t0)
+                except Exception as ex:
+                    if self._flag.is_set():
+                        self.cancelled.emit()
+                    else:
+                        self.errored.emit(str(ex), time.time() - t0)
+
+        worker = _Worker(self.db_service, query, tab._cancel_flag)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        # Store refs so they aren't garbage-collected
+        tab._query_thread = thread
+        tab._query_worker = worker
+
+        def _on_done(df, elapsed):
+            _cleanup()
             table_name = self._extract_table_name(query)
             tab.load_dataframe(df, table_name)
             tab.update_status(len(df), elapsed)
-
             self.query_history.add_query(
                 query, self.config["name"], len(df), elapsed)
-        except Exception as ex:
-            progress.close()
-            if hasattr(tab, 'show_error'):
-                tab.show_error(str(ex))
-            else:
-                QMessageBox.critical(self, "SQL Error", str(ex))
+
+        def _on_error(message, elapsed):
+            _cleanup()
+            tab.show_error(message, query=query, elapsed=elapsed)
+
+        def _on_cancelled():
+            _cleanup()
+            tab.show_cancelled()
+
+        def _cleanup():
+            tab._query_running = False
+            tab.run_btn.setEnabled(True)
+            tab.cancel_btn.setEnabled(False)
+            thread.quit()
+
+        def _cancel():
+            tab._cancel_flag.set()
+            # MySQL: send KILL QUERY via a temporary connection
+            try:
+                self.db_service.kill_current_query()
+            except Exception:
+                pass   # best-effort — thread will detect the flag too
+
+        tab.cancel_btn.clicked.disconnect()
+        tab.cancel_btn.clicked.connect(_cancel)
+
+        worker.done.connect(_on_done)
+        worker.errored.connect(_on_error)
+        worker.cancelled.connect(_on_cancelled)
+        worker.done.connect(thread.quit)
+        worker.errored.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+
+        thread.start()
 
     @staticmethod
     def _extract_table_name(query: str):
@@ -460,22 +522,72 @@ class ConnectionPanel(QWidget):
     # ─── Table filter ─────────────────────────────────────────────────────────
 
     def filter_tables(self, search_text: str):
-        search_text = search_text.lower().strip()
-        if not search_text:
-            for item in self.all_table_items.values():
-                item.setHidden(False)
+        """Fuzzy-match table names; bold-highlight matched characters."""
+        from PySide6.QtGui import QBrush, QColor
+
+        raw = search_text.strip()
+        query = raw.lower()
+
+        # ── Reset all items ───────────────────────────────────────────────────
+        for table_name, item in self.all_table_items.items():
+            item.setHidden(False)
+            item.setText(0, table_name)   # clear previous highlight
+            item.setForeground(0, QBrush(QColor("#e5e5ea")))
+
+        if not query:
             return
 
-        search_prefix = search_text[:3] if len(search_text) >= 3 else search_text
-        indexed = set(self.table_index.get(search_prefix, []))
-        search_norm = search_text.replace("_", "").replace("-", "").replace(" ", "")
+        # ── Score every table ─────────────────────────────────────────────────
+        def _score(name: str) -> int:
+            nl = name.lower()
+            if nl == query:                    return 1000
+            if nl.startswith(query):           return 900
+            if query in nl:                    return 800
+            # fuzzy: all chars of query appear in order in name
+            idx = 0
+            for ch in nl:
+                if idx < len(query) and ch == query[idx]:
+                    idx += 1
+            if idx == len(query):              return 700
+            return -1   # no match
 
+        scored = []
         for table_name, item in self.all_table_items.items():
-            if table_name in indexed:
-                item.setHidden(False)
-            else:
-                norm = table_name.lower().replace("_", "").replace("-", "").replace(" ", "")
-                item.setHidden(search_norm not in norm)
+            s = _score(table_name)
+            item.setHidden(s < 0)
+            if s >= 0:
+                scored.append((s, table_name, item))
+
+        # ── Highlight matched characters in green ─────────────────────────────
+        # QTreeWidget doesn't support rich text, so we colour the whole item
+        # for prefix/exact matches and use normal colour for fuzzy hits.
+        for s, table_name, item in scored:
+            if s >= 800:
+                # Direct substring match — tint green
+                item.setForeground(0, QBrush(QColor("#89d185")))
+            elif s == 700:
+                # Fuzzy match — dim tint to distinguish from prefix matches
+                item.setForeground(0, QBrush(QColor("#6cba68")))
+
+        # ── Re-sort visible items so best matches appear first ────────────────
+        # QTreeWidget doesn't have a built-in sort by custom score, so we
+        # reorder children of each top-level category item.
+        def _reorder(parent_item):
+            children = []
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if not child.isHidden():
+                    name = child.text(0)
+                    children.append((_score(name), name, child))
+            # Sort descending by score, then alphabetically
+            children.sort(key=lambda x: (-x[0], x[1]))
+            for rank, (_, _, child) in enumerate(children):
+                parent_item.removeChild(child)
+                parent_item.insertChild(rank, child)
+
+        root = self.schema_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            _reorder(root.child(i))
 
     # ─── Refresh ──────────────────────────────────────────────────────────────
 

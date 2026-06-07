@@ -32,6 +32,65 @@ from ui.theme_manager import ThemeManager
 from ui.snippet_manager import SnippetManager
 
 
+# ─── SQL error hint engine ────────────────────────────────────────────────────
+
+_ERROR_HINTS = [
+    # Syntax errors
+    (r"you have an error in your sql syntax",
+     "Check for missing commas, unmatched parentheses, or typos near the marked position."),
+    (r"syntax error at or near",
+     "Check for missing commas, unmatched parentheses, or incorrect keyword usage."),
+    # Unknown column / table
+    (r"unknown column '(.+?)'",
+     lambda m: f"Column '{m.group(1)}' doesn't exist — check the table schema or your alias."),
+    (r"table '(.+?)' doesn't exist",
+     lambda m: f"Table '{m.group(1)}' not found — verify the table name and active database."),
+    (r"relation \"(.+?)\" does not exist",
+     lambda m: f"Table '{m.group(1)}' not found — check spelling and current schema."),
+    # Access denied
+    (r"access denied",
+     "Permission denied — your user lacks privileges for this operation."),
+    (r"permission denied",
+     "Permission denied — your user lacks privileges for this operation."),
+    # Duplicate / constraint
+    (r"duplicate entry '(.+?)' for key '(.+?)'",
+     lambda m: f"Duplicate value '{m.group(1)}' on key '{m.group(2)}' — value must be unique."),
+    (r"unique constraint",
+     "A unique constraint was violated — the value already exists in that column."),
+    (r"foreign key constraint",
+     "Foreign key violation — the referenced row doesn't exist or a dependent row blocks deletion."),
+    (r"cannot be null|null value in column",
+     "A required (NOT NULL) column has no value — provide a value for all required fields."),
+    # Connection
+    (r"lost connection|server has gone away|broken pipe",
+     "The database connection dropped — try running the query again."),
+    (r"connection refused|could not connect",
+     "Cannot reach the database server — check host, port, and firewall settings."),
+    # Timeout / cancel
+    (r"query was cancelled|canceling statement",
+     "The query was cancelled by the user."),
+    (r"lock wait timeout|deadlock",
+     "A lock timeout or deadlock occurred — another process may be holding a lock on this table."),
+    # Disk / space
+    (r"disk full|no space left",
+     "The server disk is full — contact your DBA."),
+    # Data too long
+    (r"data too long for column '(.+?)'",
+     lambda m: f"The value for '{m.group(1)}' exceeds the column's maximum length."),
+]
+
+import re as _re
+
+def _sql_error_hint(message: str, query: str = "") -> str:
+    """Return a short actionable hint for a SQL error message, or empty string."""
+    ml = message.lower()
+    for pattern, hint in _ERROR_HINTS:
+        m = _re.search(pattern, ml)
+        if m:
+            return hint(m) if callable(hint) else hint
+    return ""
+
+
 class SqlTab(QWidget):
 
     def __init__(self):
@@ -606,21 +665,47 @@ class SqlTab(QWidget):
             }
         """)
 
-    def show_error(self, message: str):
-        """Display a SQL error inline in the results area (no modal dialog)."""
+    def show_error(self, message: str, query: str = "", elapsed: float = 0.0):
+        """Display a SQL error inline with actionable hints."""
         self.result_table.clearContents()
         self.result_table.setRowCount(0)
         self.result_table.setColumnCount(0)
         self.result_table.show()
 
-        self.status_label.setText(f"❌  {message}")
+        # ── Parse error into a human-friendly hint ────────────────────────────
+        hint = _sql_error_hint(message, query)
+        time_str = f"  ({elapsed:.2f}s)" if elapsed > 0 else ""
+        display = f"❌  {message}{time_str}"
+        if hint:
+            display += f"\n💡  {hint}"
+
+        self.status_label.setText(display)
+        self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("""
             QLabel {
                 color: #f48771;
-                padding: 5px 8px;
+                padding: 8px 10px;
                 font-size: 12px;
                 font-weight: 500;
                 background-color: #3a1a1a;
+                border-radius: 4px;
+                border-left: 3px solid #f48771;
+            }
+        """)
+
+    def show_cancelled(self):
+        """Show a neutral 'query cancelled' status."""
+        self.result_table.clearContents()
+        self.result_table.setRowCount(0)
+        self.result_table.setColumnCount(0)
+        self.status_label.setText("⊘  Query cancelled")
+        self.status_label.setWordWrap(False)
+        self.status_label.setStyleSheet("""
+            QLabel {
+                color: #8e8e93;
+                padding: 6px 10px;
+                font-size: 12px;
+                background-color: #2c2c2e;
                 border-radius: 4px;
             }
         """)
