@@ -29,17 +29,19 @@ class StructureEditorDialog(QDialog):
         "JSON", "BLOB", "ENUM"
     ]
     
-    def __init__(self, db_type="mysql", table_name=None, parent=None):
+    def __init__(self, db_type="mysql", table_name=None, existing_columns=None, parent=None):
         super().__init__(parent)
-        
+
         self.db_type = db_type
         self.table_name = table_name
         self.is_new_table = (table_name is None)
-        
-        title = "Create Table" if self.is_new_table else f"Edit Table: {table_name}"
+        # existing_columns: list of dicts with keys Field, Type, Null, Default, Key, Extra
+        self.existing_columns = existing_columns or []
+
+        title = "Create Table" if self.is_new_table else f"Edit Structure: {table_name}"
         self.setWindowTitle(title)
         self.resize(800, 600)
-        
+
         self.init_ui()
     
     def init_ui(self):
@@ -144,6 +146,10 @@ class StructureEditorDialog(QDialog):
         
         # Connect primary key checkbox to auto increment
         self.col_primary_check.stateChanged.connect(self.on_primary_key_changed)
+
+        # If editing an existing table, pre-populate the columns grid
+        if not self.is_new_table and self.existing_columns:
+            self._populate_existing_columns()
     
     def on_type_changed(self, data_type):
         """Enable/disable length input based on type"""
@@ -285,11 +291,117 @@ class StructureEditorDialog(QDialog):
         
         return sql
     
+    def _populate_existing_columns(self):
+        """Pre-fill the columns grid with the table's current columns."""
+        for col in self.existing_columns:
+            raw_type = str(col.get('Type', col.get('type', 'VARCHAR')))
+            # Split type and length: VARCHAR(255) -> VARCHAR, 255
+            import re
+            m = re.match(r'(\w+)\((\d+)\)', raw_type)
+            if m:
+                col_type = m.group(1).upper()
+                length = m.group(2)
+            else:
+                col_type = raw_type.split('(')[0].upper()
+                length = ""
+
+            nullable = "YES" if str(col.get('Null', col.get('nullable', 'YES'))).upper() in ('YES', 'TRUE', '1') else "NO"
+            key_val = str(col.get('Key', col.get('key', '')))
+            primary = "YES" if key_val.upper() in ('PRI', 'PRIMARY KEY') else "NO"
+            extra = str(col.get('Extra', col.get('extra', '')))
+            auto_inc = "YES" if 'auto_increment' in extra.lower() else "NO"
+            default = str(col.get('Default', col.get('default', '')) or '')
+            name = str(col.get('Field', col.get('column_name', col.get('name', ''))))
+
+            row = self.columns_table.rowCount()
+            self.columns_table.insertRow(row)
+            self.columns_table.setItem(row, 0, QTableWidgetItem(name))
+            self.columns_table.setItem(row, 1, QTableWidgetItem(col_type))
+            self.columns_table.setItem(row, 2, QTableWidgetItem(length))
+            self.columns_table.setItem(row, 3, QTableWidgetItem(nullable))
+            self.columns_table.setItem(row, 4, QTableWidgetItem(primary))
+            self.columns_table.setItem(row, 5, QTableWidgetItem(auto_inc))
+            self.columns_table.setItem(row, 6, QTableWidgetItem(default))
+
     def generate_alter_sql(self):
-        """Generate ALTER TABLE SQL (simplified)"""
-        # This is a simplified version - full ALTER TABLE would require
-        # comparing existing structure with new structure
-        return "-- ALTER TABLE not yet fully implemented\n-- Please use CREATE TABLE syntax"
+        """Generate ALTER TABLE SQL by diffing existing vs new column list."""
+        table = self.table_name
+        quote = '`' if self.db_type == 'mysql' else '"'
+
+        # Build dict of existing columns: name -> dict
+        old_cols = {}
+        for col in self.existing_columns:
+            name = str(col.get('Field', col.get('column_name', col.get('name', ''))))
+            if name:
+                old_cols[name] = col
+
+        # Build dict of new columns from the grid
+        new_cols = {}  # name -> (type, length, nullable, primary, auto_inc, default)
+        new_order = []
+        for row in range(self.columns_table.rowCount()):
+            name = self.columns_table.item(row, 0).text().strip()
+            if not name:
+                continue
+            col_type  = self.columns_table.item(row, 1).text()
+            length    = self.columns_table.item(row, 2).text()
+            nullable  = self.columns_table.item(row, 3).text()
+            primary   = self.columns_table.item(row, 4).text()
+            auto_inc  = self.columns_table.item(row, 5).text()
+            default   = self.columns_table.item(row, 6).text()
+            new_cols[name] = (col_type, length, nullable, primary, auto_inc, default)
+            new_order.append(name)
+
+        if not new_cols:
+            raise ValueError("At least one column is required")
+
+        def col_def(name, col_type, length, nullable, auto_inc, default):
+            defn = f"{quote}{name}{quote} {col_type}"
+            if length:
+                defn += f"({length})"
+            if nullable == "NO":
+                defn += " NOT NULL"
+            if auto_inc == "YES" and self.db_type == 'mysql':
+                defn += " AUTO_INCREMENT"
+            if default:
+                up = default.upper()
+                if up in ("NULL", "CURRENT_TIMESTAMP"):
+                    defn += f" DEFAULT {up}"
+                else:
+                    defn += f" DEFAULT '{default}'"
+            return defn
+
+        statements = []
+
+        # DROP columns that were removed
+        for name in list(old_cols.keys()):
+            if name not in new_cols:
+                statements.append(f"ALTER TABLE {quote}{table}{quote} DROP COLUMN {quote}{name}{quote};")
+
+        # ADD or MODIFY columns
+        for name in new_order:
+            col_type, length, nullable, primary, auto_inc, default = new_cols[name]
+            defn = col_def(name, col_type, length, nullable, auto_inc, default)
+            if name not in old_cols:
+                statements.append(f"ALTER TABLE {quote}{table}{quote} ADD COLUMN {defn};")
+            else:
+                # Check if anything changed — always emit MODIFY to be safe
+                old = old_cols[name]
+                old_type = str(old.get('Type', old.get('type', ''))).upper()
+                new_type_full = col_type + (f"({length})" if length else "")
+                old_nullable = "YES" if str(old.get('Null', 'YES')).upper() in ('YES', 'TRUE', '1') else "NO"
+                if new_type_full.upper() != old_type or nullable != old_nullable:
+                    if self.db_type == 'mysql':
+                        statements.append(f"ALTER TABLE {quote}{table}{quote} MODIFY COLUMN {defn};")
+                    else:
+                        # PostgreSQL uses separate clauses
+                        statements.append(f"ALTER TABLE {quote}{table}{quote} ALTER COLUMN {quote}{name}{quote} TYPE {col_type}{f'({length})' if length else ''};")
+                        null_clause = "DROP NOT NULL" if nullable == "YES" else "SET NOT NULL"
+                        statements.append(f"ALTER TABLE {quote}{table}{quote} ALTER COLUMN {quote}{name}{quote} {null_clause};")
+
+        if not statements:
+            return f"-- No changes detected for table {table}"
+
+        return "\n".join(statements)
     
     def preview_sql(self):
         """Show SQL preview"""

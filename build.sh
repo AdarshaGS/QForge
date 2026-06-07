@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# SQL Workbench - Build Script
+# QForge - Build Script
 # Creates a standalone macOS application
 
 set -e  # Exit on error
 
-echo "🚀 Building SQL Workbench..."
+echo "🚀 Building QForge..."
 
 # Colors
 GREEN='\033[0;32m'
@@ -35,7 +35,7 @@ rm -rf build/ dist/ *.spec
 
 # Create PyInstaller spec file
 echo "${BLUE}📝 Creating build configuration...${NC}"
-cat > SQL-Workbench.spec << 'EOF'
+cat > QForge.spec << 'EOF'
 # -*- mode: python ; coding: utf-8 -*-
 
 block_cipher = None
@@ -80,7 +80,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='SQL-Workbench',
+    name='QForge',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -101,14 +101,14 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='SQL-Workbench',
+    name='QForge',
 )
 
 app = BUNDLE(
     coll,
-    name='SQL-Workbench.app',
+    name='QForge.app',
     icon=None,
-    bundle_identifier='com.sqlworkbench.app',
+    bundle_identifier='com.qforge.app',
     version='1.0.0',
     info_plist={
         'NSPrincipalClass': 'NSApplication',
@@ -122,17 +122,17 @@ EOF
 
 # Build the application
 echo "${BLUE}🔨 Building application...${NC}"
-pyinstaller --clean SQL-Workbench.spec
+pyinstaller --clean QForge.spec
 
 # Check if build succeeded
-if [ -d "dist/SQL-Workbench.app" ]; then
+if [ -d "dist/QForge.app" ]; then
     echo "${GREEN}✅ Build successful!${NC}"
     echo ""
-    echo "📦 Application created at: ${BLUE}dist/SQL-Workbench.app${NC}"
+    echo "📦 Application created at: ${BLUE}dist/QForge.app${NC}"
     echo ""
     
     # Get app size
-    APP_SIZE=$(du -sh dist/SQL-Workbench.app | cut -f1)
+    APP_SIZE=$(du -sh dist/QForge.app | cut -f1)
     echo "📏 Size: ${APP_SIZE}"
     echo ""
     
@@ -140,30 +140,30 @@ if [ -d "dist/SQL-Workbench.app" ]; then
     echo "${BLUE}📀 Creating DMG installer...${NC}"
     
     # Clean old DMG
-    rm -f SQL-Workbench.dmg
+    rm -f QForge.dmg
     
     # Create DMG
-    hdiutil create -volname "SQL Workbench" -srcfolder dist/SQL-Workbench.app -ov -format UDZO SQL-Workbench.dmg
+    hdiutil create -volname "QForge" -srcfolder dist/QForge.app -ov -format UDZO QForge.dmg
     
-    if [ -f "SQL-Workbench.dmg" ]; then
-        DMG_SIZE=$(du -sh SQL-Workbench.dmg | cut -f1)
+    if [ -f "QForge.dmg" ]; then
+        DMG_SIZE=$(du -sh QForge.dmg | cut -f1)
         echo "${GREEN}✅ DMG created!${NC}"
-        echo "📀 Installer: ${BLUE}SQL-Workbench.dmg${NC} (${DMG_SIZE})"
+        echo "📀 Installer: ${BLUE}QForge.dmg${NC} (${DMG_SIZE})"
     fi
     
     echo ""
     echo "${GREEN}🎉 Build complete!${NC}"
     echo ""
     echo "To distribute:"
-    echo "1. ${BLUE}Share SQL-Workbench.dmg${NC} with users"
-    echo "2. Users drag SQL-Workbench.app to Applications folder"
+    echo "1. ${BLUE}Share QForge.dmg${NC} with users"
+    echo "2. Users drag QForge.app to Applications folder"
     echo "3. On first launch, users need to:"
     echo "   - Right-click → Open (to bypass Gatekeeper)"
-    echo "   - Or run: ${BLUE}xattr -cr /Applications/SQL-Workbench.app${NC}"
+    echo "   - Or run: ${BLUE}xattr -cr /Applications/QForge.app${NC}"
     echo ""
     echo "For signed distribution (no Gatekeeper warning):"
     echo "1. Get Apple Developer account ($99/year)"
-    echo "2. Sign with: ${BLUE}codesign --deep --force --sign \"Developer ID\" dist/SQL-Workbench.app${NC}"
+    echo "2. Sign with: ${BLUE}codesign --deep --force --sign \"Developer ID\" dist/QForge.app${NC}"
     echo "3. Notarize with Apple"
     echo ""
 else

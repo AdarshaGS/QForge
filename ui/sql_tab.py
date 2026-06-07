@@ -18,13 +18,18 @@ from PySide6.QtWidgets import (
     QComboBox,
     QLineEdit
 )
+from PySide6.QtGui import QTextCursor
+
+from ui.code_editor import CodeEditor
 from PySide6.QtGui import QTextCursor, QKeyEvent, QShortcut, QKeySequence
 
 from ui.sql_highlighter import SqlHighlighter
 from ui.sql_completer import SqlCompleter
 from ui.editable_table import EditableTableWidget
+from ui.editable_table import EditableTableWidget
 from ui.column_filter_dialog import ColumnFilterDialog
 from ui.theme_manager import ThemeManager
+from ui.snippet_manager import SnippetManager
 
 
 class SqlTab(QWidget):
@@ -56,32 +61,20 @@ class SqlTab(QWidget):
         # SQL EDITOR
         # ==================================
 
-        self.editor = QTextEdit()
+        self.editor = CodeEditor()
+        self.editor.setPlaceholderText("Write SQL here…")
+        self.editor.setMinimumHeight(120)
 
-        self.editor.setPlaceholderText(
-            "Write SQL here..."
-        )
-
-        self.editor.setMinimumHeight(150)
-        
-        # Set monospace font - Menlo first (always available on macOS)
-        from PySide6.QtGui import QFont
-        font = QFont("Menlo", 13)
-        if not font.exactMatch():
-            font = QFont("Monaco", 13)
-        if not font.exactMatch():
-            font = QFont("Courier New", 13)
-        self.editor.setFont(font)
-
-        # Apply syntax highlighting
+        # Apply syntax highlighting to the document
         self.highlighter = SqlHighlighter(self.editor.document())
         
         # Apply autocomplete
         self.completer = SqlCompleter(self.editor)
-        self.completer.setWidget(self.editor)
-        # Connect to activated signal with string parameter
-        self.completer.activated[str].connect(self.insert_completion)
-        
+
+        # Snippets
+        self.snippet_manager = SnippetManager()
+        self.completer.set_snippets(self.snippet_manager.get_all())
+
         # Install event filter for better control
         self.editor.installEventFilter(self)
         
@@ -89,44 +82,61 @@ class SqlTab(QWidget):
         # BUTTONS TOOLBAR (after editor)
         # ==================================
         
+        # Toolbar: { } Snippets | Cancel | ▶ Run
         run_layout = QHBoxLayout()
-        run_layout.setContentsMargins(5, 5, 5, 5)
+        run_layout.setContentsMargins(6, 4, 6, 4)
+        run_layout.setSpacing(6)
+
+        snip_btn = QPushButton("{ } Snippets")
+        snip_btn.setFixedHeight(28)
+        snip_btn.setToolTip("Manage SQL snippets")
+        snip_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #8e8e93;
+                border: 1px solid #3a3a3c;
+                border-radius: 5px;
+                padding: 0 12px;
+                font-size: 12px;
+            }
+            QPushButton:hover { color: #89d185; border-color: #89d185; }
+        """)
+        snip_btn.clicked.connect(self._open_snippet_editor)
+        run_layout.addWidget(snip_btn)
+
         run_layout.addStretch()
-        
+
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setFixedHeight(28)
         self.cancel_btn.setStyleSheet("""
             QPushButton {
-                background-color: #3a3a3a;
-                color: #cccccc;
-                border: 1px solid #555555;
-                border-radius: 4px;
-                padding: 5px 15px;
-                font-weight: bold;
+                background: transparent;
+                color: #8e8e93;
+                border: 1px solid #3a3a3c;
+                border-radius: 5px;
+                padding: 0 14px;
+                font-size: 12px;
             }
-            QPushButton:disabled {
-                background-color: #2a2a2a;
-                color: #666666;
-            }
+            QPushButton:hover { color: #e5e5ea; }
+            QPushButton:disabled { color: #48484a; border-color: #2c2c2e; }
         """)
         run_layout.addWidget(self.cancel_btn)
-        
-        self.run_btn = QPushButton("▶ Run")
+
+        self.run_btn = QPushButton("▶  Run")
+        self.run_btn.setFixedHeight(28)
         self.run_btn.setStyleSheet("""
             QPushButton {
-                background-color: #0078d4;
-                color: white;
+                background: #0A84FF;
+                color: #fff;
                 border: none;
-                border-radius: 4px;
-                padding: 5px 20px;
-                font-weight: bold;
+                border-radius: 5px;
+                padding: 0 18px;
+                font-weight: 600;
+                font-size: 13px;
             }
-            QPushButton:hover {
-                background-color: #1084d8;
-            }
-            QPushButton:pressed {
-                background-color: #006cbe;
-            }
+            QPushButton:hover  { background: #228BFF; }
+            QPushButton:pressed { background: #0066CC; }
         """)
         run_layout.addWidget(self.run_btn)
         
@@ -344,104 +354,90 @@ class SqlTab(QWidget):
     def set_schema(self, tables, columns_dict):
         """Update autocomplete with schema information"""
         self.completer.set_schema(tables, columns_dict)
-    
+
+    def _open_snippet_editor(self):
+        """Open the snippet management dialog."""
+        from ui.snippet_editor_dialog import SnippetEditorDialog
+        dlg = SnippetEditorDialog(self.snippet_manager, parent=self.window())
+        dlg.snippets_changed.connect(self._reload_snippets)
+        dlg.exec()
+
+    def _reload_snippets(self):
+        """Called when snippets are changed in the editor dialog."""
+        self.completer.set_snippets(self.snippet_manager.get_all())
+
     def eventFilter(self, obj, event):
-        """Handle key events for autocomplete"""
-        if obj == self.editor and event.type() == event.Type.KeyPress:
-            key_event = event
-            
-            # Check if completer popup is visible
-            if self.completer.popup().isVisible():
-                # Handle navigation in popup
-                if key_event.key() in (Qt.Key_Enter, Qt.Key_Return, Qt.Key_Escape, Qt.Key_Tab):
-                    return False
-            
-            # Trigger autocomplete on specific keys
-            if key_event.key() in (Qt.Key_Space,) and key_event.modifiers() == Qt.ControlModifier:
-                # Ctrl+Space: force autocomplete
-                self.update_completer()
-                return True
-            elif key_event.text().isalnum() or key_event.text() in ('_', '.'):
-                # Auto-trigger on alphanumeric characters
-                result = super().eventFilter(obj, event)
-                self.update_completer()
-                return result
-        
+        """Route key events: popup navigation first, then auto-trigger."""
+        if obj != self.editor or event.type() != event.Type.KeyPress:
+            return super().eventFilter(obj, event)
+
+        key = event.key()
+        mod = event.modifiers()
+
+        # 1. Esc: hide popup first; if popup was not visible, fall through to
+        #    the QShortcut (hide_filter). Returning True stops the Esc reaching
+        #    the shortcut, so only do that when the popup actually was visible.
+        if key == Qt.Key_Escape:
+            if self.completer.popup_visible:
+                self.completer.hide_popup()
+                return True          # consumed — don't also close the filter bar
+            # popup not visible → let the existing Esc shortcut hide the filter
+            return super().eventFilter(obj, event)
+
+        # 2. Let popup consume navigation / accept keys
+        if self.completer.handle_key(event):
+            return True
+
+        # 3. Ctrl+Space: force-show suggestions without inserting a space
+        if key == Qt.Key_Space and mod == Qt.ControlModifier:
+            self.completer.update(force=True)
+            return True
+
+        # 3. Cursor-movement keys: hide popup, pass to editor normally
+        if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End,
+                   Qt.Key_PageUp, Qt.Key_PageDown):
+            self.completer.hide_popup()
+            return super().eventFilter(obj, event)
+
+        # 4. Cmd+Backspace (⌘⌫ on Mac) — delete entire current line
+        if key == Qt.Key_Backspace and mod == Qt.ControlModifier:
+            self._delete_current_line()
+            return True
+
+        # 5. Backspace / Delete: process first, then update
+        if key in (Qt.Key_Backspace, Qt.Key_Delete):
+            result = super().eventFilter(obj, event)
+            self.completer.update()
+            return result
+
+        # 5. Printable word characters: process first, then update
+        text = event.text()
+        if text and (text.isalnum() or text in ('_', '.')):
+            result = super().eventFilter(obj, event)
+            self.completer.update()
+            return result
+
+        # 6. Any other key (Enter for new line, space, punctuation…): hide popup
+        if key not in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt, Qt.Key_Meta,
+                       Qt.Key_CapsLock, Qt.Key_NumLock):
+            self.completer.hide_popup()
+
         return super().eventFilter(obj, event)
     
-    def update_completer(self):
-        """Update completer popup with context-aware suggestions"""
+    def _delete_current_line(self):
+        """Delete the entire line the cursor is on (Cmd+Backspace / ⌘⌫)."""
         cursor = self.editor.textCursor()
-        
-        # Get full query text and cursor position
-        query_text = self.editor.toPlainText()
-        cursor_position = cursor.position()
-        
-        # Get the word under cursor (including dot notation)
-        cursor.select(QTextCursor.WordUnderCursor)
-        word = cursor.selectedText()
-        
-        # For dot notation, extend selection to include prefix
-        if '.' not in word:
-            # Check if there's a dot just before the word
-            temp_cursor = self.editor.textCursor()
-            temp_cursor.setPosition(cursor_position)
-            temp_cursor.movePosition(QTextCursor.Left, QTextCursor.MoveAnchor, len(word) + 1)
-            temp_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, len(word) + 1)
-            extended_word = temp_cursor.selectedText()
-            if '.' in extended_word:
-                word = extended_word
-        
-        if len(word) >= 1:  # Start suggesting after 1 character
-            # Update suggestions based on context (this rebuilds the list)
-            count = self.completer.update_suggestions(query_text, cursor_position, word)
-            
-            # Show popup if there are matches
-            if count > 0:
-                # Set completion prefix for filtering
-                self.completer.setCompletionPrefix(word)
-                
-                # Position popup at cursor
-                rect = self.editor.cursorRect()
-                rect.setWidth(400)  # Wider popup to show type information
-                self.completer.complete(rect)
-            else:
-                self.completer.popup().hide()
-        else:
-            self.completer.popup().hide()
-    
-    def insert_completion(self, completion):
-        """Insert the selected completion at cursor - REPLACE mode"""
-        # Extract just the text if it includes type info
-        if "    [" in completion:
-            completion = completion.split("    [")[0]
-        
-        cursor = self.editor.textCursor()
-        
-        # Find the start of the current word by moving left until we hit whitespace or special char
-        end_pos = cursor.position()
-        start_pos = end_pos
-        
-        text = self.editor.toPlainText()
-        
-        # Move back to find word start (including dots for table.column notation)
-        while start_pos > 0:
-            char = text[start_pos - 1]
-            if char.isalnum() or char in ('_', '.'):
-                start_pos -= 1
-            else:
-                break
-        
-        # Select the partial word
-        cursor.setPosition(start_pos)
-        cursor.setPosition(end_pos, QTextCursor.KeepAnchor)
-        
-        # Replace with completion
-        cursor.insertText(completion)
-        
-        # Update the editor cursor
+        cursor.beginEditBlock()
+        cursor.movePosition(QTextCursor.StartOfBlock)
+        cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()
+        # Also remove the newline unless we're on the last line
+        if not cursor.atEnd():
+            cursor.deleteChar()
+        cursor.endEditBlock()
         self.editor.setTextCursor(cursor)
-    
+        self.completer.hide_popup()
+
     # ======================================
     # DATA EDITING
     # ======================================
@@ -499,41 +495,21 @@ class SqlTab(QWidget):
     # ======================================
 
     def format_sql(self):
-
         query = self.editor.toPlainText()
-
         if not query.strip():
             return
+        formatted = sqlparse.format(query, reindent=True, keyword_case="upper")
+        self.editor.setPlainText(formatted)
 
-        formatted = sqlparse.format(
-            query,
-            reindent=True,
-            keyword_case="upper"
-        )
-
-        self.editor.setPlainText(
-            formatted
-        )
-    
     def minify_sql(self):
-        """Minify/compress SQL query (remove extra whitespace)"""
+        """Minify/compress SQL query."""
         query = self.editor.toPlainText()
-
         if not query.strip():
             return
-
-        # Minify: remove extra whitespace, newlines
-        minified = sqlparse.format(
-            query,
-            reindent=False,
-            keyword_case="upper",
-            strip_comments=True
-        )
-        
-        # Further compress by removing extra spaces
         import re
+        minified = sqlparse.format(
+            query, reindent=False, keyword_case="upper", strip_comments=True)
         minified = re.sub(r'\s+', ' ', minified).strip()
-
         self.editor.setPlainText(minified)    
     def show_filter_dialog(self):
         """Show filter dialog for current results"""
@@ -627,6 +603,25 @@ class SqlTab(QWidget):
                 padding: 5px;
                 font-size: 12px;
                 font-weight: 500;
+            }
+        """)
+
+    def show_error(self, message: str):
+        """Display a SQL error inline in the results area (no modal dialog)."""
+        self.result_table.clearContents()
+        self.result_table.setRowCount(0)
+        self.result_table.setColumnCount(0)
+        self.result_table.show()
+
+        self.status_label.setText(f"❌  {message}")
+        self.status_label.setStyleSheet("""
+            QLabel {
+                color: #f48771;
+                padding: 5px 8px;
+                font-size: 12px;
+                font-weight: 500;
+                background-color: #3a1a1a;
+                border-radius: 4px;
             }
         """)
 
@@ -760,30 +755,29 @@ class SqlTab(QWidget):
     # ======================================
 
     def get_query(self):
-        """Get query text - returns selected text, query at cursor, or all text"""
+        """Return selected text, query at cursor, or all text."""
         cursor = self.editor.textCursor()
-        
-        # If text is selected, return selection
         if cursor.hasSelection():
+            # QPlainTextEdit uses \u2029 for paragraph separators
             return cursor.selectedText().replace('\u2029', '\n')
-        
-        # Try to find query at cursor position
         query_at_cursor = self.get_query_at_cursor()
         if query_at_cursor:
             return query_at_cursor
-        
-        # Fall back to all text
         return self.editor.toPlainText()
-    
+
+    def set_query(self, text: str):
+        """Set the editor content."""
+        self.editor.setPlainText(text)
+
     def update_theme(self, is_dark=True):
-        """Update filter container theme"""
+        """Update editor palette and filter container theme."""
         if is_dark:
+            self.editor.apply_dark_palette()
             style = ThemeManager.get_filter_container_style_dark()
         else:
+            self.editor.apply_light_palette()
             style = ThemeManager.get_filter_container_style_light()
         self.filter_container.setStyleSheet(style)
-        
-        # Update result table theme
         if hasattr(self, 'result_table'):
             self.result_table.update_theme(is_dark)
     

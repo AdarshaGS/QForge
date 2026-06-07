@@ -22,8 +22,11 @@ from PySide6.QtCore import Qt
 
 class ConnectionDialog(QDialog):
 
-    CONNECTION_FILE = "connections.json"
-    LAST_CONNECTION_FILE = "last_connection.json"
+    # Store connection files in a fixed location that works both when running
+    # from source and when launched as a deployed .app bundle.
+    _APP_DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "QForge")
+    CONNECTION_FILE = os.path.join(_APP_DIR, "connections.json")
+    LAST_CONNECTION_FILE = os.path.join(_APP_DIR, "last_connection.json")
 
     def __init__(self, auto_connect_last=False):
         super().__init__()
@@ -318,7 +321,24 @@ class ConnectionDialog(QDialog):
             self.ssh_password_input.setEchoMode(QLineEdit.Password)
             self.ssh_password_visible_btn.setText("👁️")
 
+    def _migrate_legacy_connections(self):
+        """Move connections.json from old relative/home locations to the new fixed path."""
+        if os.path.exists(self.CONNECTION_FILE):
+            return  # already in the right place
+        legacy_candidates = [
+            os.path.join(os.path.expanduser("~"), "connections.json"),
+            os.path.join(os.getcwd(), "connections.json"),
+        ]
+        for legacy in legacy_candidates:
+            if os.path.exists(legacy):
+                os.makedirs(os.path.dirname(self.CONNECTION_FILE), exist_ok=True)
+                import shutil
+                shutil.copy2(legacy, self.CONNECTION_FILE)
+                break
+
     def load_connections(self):
+
+        self._migrate_legacy_connections()
 
         self.connection_list.clear()
 
@@ -354,6 +374,8 @@ class ConnectionDialog(QDialog):
 
     def save_connections(self):
 
+        os.makedirs(os.path.dirname(self.CONNECTION_FILE), exist_ok=True)
+
         with open(
             self.CONNECTION_FILE,
             "w"
@@ -368,34 +390,44 @@ class ConnectionDialog(QDialog):
     def get_form_data(self):
 
         db_type = self.type_input.currentText().lower()
-        
+        name = self.name_input.text().strip()
+
+        if not name:
+            raise ValueError("Connection name cannot be empty.")
+
         data = {
             "type": db_type,
-            "name": self.name_input.text(),
-            "database": self.database_input.text()
+            "name": name,
+            "database": self.database_input.text().strip()
         }
-        
+
         # Add host/port/user/password only for non-SQLite
         if db_type != "sqlite":
-            data["host"] = self.host_input.text()
-            data["port"] = int(self.port_input.text())
-            data["user"] = self.user_input.text()
+            port_text = self.port_input.text().strip()
+            if not port_text.isdigit():
+                raise ValueError(f"Port must be a number (got '{port_text}').")
+            data["host"] = self.host_input.text().strip()
+            data["port"] = int(port_text)
+            data["user"] = self.user_input.text().strip()
             data["password"] = self.password_input.text()
-            
+
             # Add SSH tunnel data if enabled
             if self.ssh_enabled.currentText() == "Yes":
+                ssh_port_text = self.ssh_port_input.text().strip()
+                if not ssh_port_text.isdigit():
+                    raise ValueError(f"SSH port must be a number (got '{ssh_port_text}').")
                 data["ssh_tunnel"] = {
                     "enabled": True,
-                    "host": self.ssh_host_input.text(),
-                    "port": int(self.ssh_port_input.text()),
-                    "user": self.ssh_user_input.text(),
+                    "host": self.ssh_host_input.text().strip(),
+                    "port": int(ssh_port_text),
+                    "user": self.ssh_user_input.text().strip(),
                     "use_key": self.ssh_use_key_checkbox.isChecked(),
                     "password": self.ssh_password_input.text() if not self.ssh_use_key_checkbox.isChecked() else "",
                     "key_path": self.ssh_key_path_input.text() if self.ssh_use_key_checkbox.isChecked() else ""
                 }
             else:
                 data["ssh_tunnel"] = {"enabled": False}
-        
+
         return data
 
     def clear_form(self):
@@ -419,7 +451,11 @@ class ConnectionDialog(QDialog):
 
     def add_connection(self):
 
-        data = self.get_form_data()
+        try:
+            data = self.get_form_data()
+        except ValueError as ex:
+            QMessageBox.warning(self, "Invalid Input", str(ex))
+            return
 
         self.connections.append(data)
 
@@ -436,9 +472,11 @@ class ConnectionDialog(QDialog):
         if row < 0:
             return
 
-        self.connections[row] = (
-            self.get_form_data()
-        )
+        try:
+            self.connections[row] = self.get_form_data()
+        except ValueError as ex:
+            QMessageBox.warning(self, "Invalid Input", str(ex))
+            return
 
         self.save_connections()
 

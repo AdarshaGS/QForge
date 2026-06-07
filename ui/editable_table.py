@@ -69,25 +69,28 @@ class EditableTableWidget(QTableWidget):
             # Dark theme
             self.setStyleSheet("""
                 QTableWidget {
-                    gridline-color: #3a3a3a;
-                    background-color: #1e1e1e;
-                    alternate-background-color: #252526;
-                    color: #ffffff;
-                    selection-background-color: #005fb8;
-                    selection-color: #ffffff;
+                    gridline-color: #2c2c2e;
+                    background-color: #1c1c1e;
+                    alternate-background-color: #202022;
+                    color: #e5e5ea;
+                    selection-background-color: #0A84FF33;
+                    selection-color: #e5e5ea;
+                    border: none;
+                    outline: none;
                 }
-                QTableWidget::item:selected {
-                    background-color: #005fb8;
-                }
+                QTableWidget::item { padding: 2px 6px; border: none; }
+                QTableWidget::item:selected { background: #0A84FF33; }
                 QHeaderView::section {
-                    background-color: #252526;
-                    color: #cccccc;
-                    border: 1px solid #3a3a3a;
-                    padding: 5px;
+                    background: #2c2c2e;
+                    color: #8e8e93;
+                    border: none;
+                    border-right: 1px solid #3a3a3c;
+                    border-bottom: 1px solid #3a3a3c;
+                    padding: 4px 8px;
+                    font-size: 12px;
+                    font-weight: 600;
                 }
-                QHeaderView::section:hover {
-                    background-color: #2d2d30;
-                }
+                QHeaderView::section:hover { background: #3a3a3c; color: #e5e5ea; }
             """)
         else:
             # Light theme

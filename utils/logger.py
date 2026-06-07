@@ -1,6 +1,7 @@
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 
 
 def setup_logger(name="sql_workbench", level=logging.INFO):
@@ -23,12 +24,12 @@ def setup_logger(name="sql_workbench", level=logging.INFO):
     if logger.handlers:
         return logger
     
-    # Create logs directory if it doesn't exist
-    if not os.path.exists("logs"):
-        os.makedirs("logs")
+    # Create logs directory in user's home folder (writable location)
+    log_dir = Path.home() / ".qforge" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
     
     # Create log filename with date
-    log_filename = f"logs/app_{datetime.now().strftime('%Y%m%d')}.log"
+    log_filename = log_dir / f"app_{datetime.now().strftime('%Y%m%d')}.log"
     
     # File handler - logs everything
     file_handler = logging.FileHandler(log_filename)

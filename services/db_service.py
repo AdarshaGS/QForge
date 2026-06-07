@@ -13,6 +13,7 @@ class DbService:
         self.connection_name = None
         self.db_type = None  # 'mysql', 'postgresql', 'sqlite'
         self.ssh_tunnel = None  # SSH tunnel object
+        self._config = None   # stored for auto-reconnect
 
     def connect(self, config):
         """Connect to database based on type"""
@@ -32,6 +33,7 @@ class DbService:
             raise Exception(f"Unsupported database type: {db_type}")
         
         self.connection_name = config["name"]
+        self._config = config   # save for reconnect
         logger.info(f"Successfully connected to {db_type} database")
         return self.connection
     
@@ -185,6 +187,39 @@ class DbService:
                 logger.error(f"Error closing SSH tunnel: {str(ex)}")
             self.ssh_tunnel = None
 
+    def _is_connection_error(self, ex):
+        """Return True if the exception looks like a dropped/lost connection."""
+        msg = str(ex).lower()
+        keywords = (
+            'lost connection', 'server has gone away', 'broken pipe',
+            'connection reset', 'connection closed', 'interface error',
+            'server closed', 'operationalerror', 'not connected',
+            'connection refused', 'timed out',
+        )
+        return any(k in msg for k in keywords)
+
+    def _reconnect(self):
+        """Re-establish the connection using the stored config."""
+        if not self._config:
+            raise Exception("No connection config stored — cannot reconnect")
+        logger.info(f"Attempting reconnect to {self.connection_name}...")
+        # Close cleanly first
+        try:
+            if self.connection:
+                self.connection.close()
+        except Exception:
+            pass
+        self.connection = None
+        # Re-open SSH tunnel if needed
+        if self.ssh_tunnel:
+            try:
+                self.ssh_tunnel.stop()
+            except Exception:
+                pass
+            self.ssh_tunnel = None
+        self.connect(self._config)
+        logger.info("Reconnect successful")
+
     def is_connected(self):
 
         try:
@@ -205,35 +240,41 @@ class DbService:
             raise Exception("No active database connection")
 
         try:
-            if self.db_type == "mysql":
-                cursor = self.connection.cursor()
-                cursor.execute(query)
-                rows = cursor.fetchall()
-                cursor.close()
-                return pd.DataFrame(rows)
-            
-            elif self.db_type == "postgresql":
-                import psycopg2.extras
-                cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-                cursor.execute(query)
-                rows = cursor.fetchall()
-                cursor.close()
-                return pd.DataFrame(rows)
-            
-            elif self.db_type == "sqlite":
-                cursor = self.connection.cursor()
-                cursor.execute(query)
-                rows = cursor.fetchall()
-                cursor.close()
-                # Convert sqlite3.Row to dict
-                data = [dict(row) for row in rows]
-                return pd.DataFrame(data)
-            
-            else:
-                raise Exception(f"Unsupported database type: {self.db_type}")
+            return self._execute_query_raw(query)
         except Exception as ex:
-            logger.error(f"Query execution error: {str(ex)}")
+            if self._is_connection_error(ex):
+                logger.warning(f"Connection lost during query, reconnecting... ({ex})")
+                self._reconnect()
+                return self._execute_query_raw(query)
             raise
+
+    def _execute_query_raw(self, query):
+        """Internal: run SELECT without reconnect logic."""
+        if self.db_type == "mysql":
+            cursor = self.connection.cursor()
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            cursor.close()
+            return pd.DataFrame(rows)
+        
+        elif self.db_type == "postgresql":
+            import psycopg2.extras
+            cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            cursor.close()
+            return pd.DataFrame(rows)
+        
+        elif self.db_type == "sqlite":
+            cursor = self.connection.cursor()
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            cursor.close()
+            data = [dict(row) for row in rows]
+            return pd.DataFrame(data)
+        
+        else:
+            raise Exception(f"Unsupported database type: {self.db_type}")
 
     def execute_update(self, query):
 
@@ -241,15 +282,23 @@ class DbService:
             raise Exception("No active database connection")
 
         try:
-            cursor = self.connection.cursor()
-            cursor.execute(query)
-            affected_rows = cursor.rowcount  # Get affected rows from rowcount
-            cursor.close()
-            self.connection.commit()
-            return affected_rows
+            return self._execute_update_raw(query)
         except Exception as ex:
+            if self._is_connection_error(ex):
+                logger.warning(f"Connection lost during update, reconnecting... ({ex})")
+                self._reconnect()
+                return self._execute_update_raw(query)
             logger.error(f"Update execution error: {str(ex)}")
             raise
+
+    def _execute_update_raw(self, query):
+        """Internal: run DML without reconnect logic."""
+        cursor = self.connection.cursor()
+        cursor.execute(query)
+        affected_rows = cursor.rowcount
+        cursor.close()
+        self.connection.commit()
+        return affected_rows
 
     def get_tables(self):
         """Get list of tables based on database type"""
@@ -385,6 +434,57 @@ class DbService:
         
         else:
             return []
+
+    def get_all_columns(self) -> dict:
+        """Return {table_name: [col_name, ...]} for all tables in one query.
+        Used to populate autocomplete — much faster than N individual SHOW COLUMNS calls."""
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT TABLE_NAME, COLUMN_NAME
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    ORDER BY TABLE_NAME, ORDINAL_POSITION
+                """)
+                rows = cursor.fetchall()
+                result: dict = {}
+                for row in rows:
+                    tbl = list(row.values())[0]
+                    col = list(row.values())[1]
+                    result.setdefault(tbl, []).append(col)
+                return result
+
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT table_name, column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                    ORDER BY table_name, ordinal_position
+                """)
+                rows = cursor.fetchall()
+                result = {}
+                for row in rows:
+                    result.setdefault(row[0], []).append(row[1])
+                return result
+
+            elif self.db_type == "sqlite":
+                cursor = self.connection.cursor()
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+                tables = [r[0] for r in cursor.fetchall()]
+                result = {}
+                for tbl in tables:
+                    cursor.execute(f"PRAGMA table_info({tbl})")
+                    result[tbl] = [r[1] for r in cursor.fetchall()]
+                return result
+
+        except Exception:
+            pass
+        return {}
 
     def get_databases(self):
 

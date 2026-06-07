@@ -26,6 +26,7 @@ class TableViewWidget(QWidget):
     """Widget that shows a table with 3 tabs: Data, Structure, Query Editor"""
     
     execute_query_signal = Signal(object)  # Signal to execute query in query editor tab
+    dirty_changed = Signal(bool)           # True = unsaved changes, False = clean
     
     def __init__(self, db_service, table_name, parent=None):
         super().__init__(parent)
@@ -162,6 +163,9 @@ class TableViewWidget(QWidget):
         self.data_table.horizontalHeader().sectionClicked.connect(self.on_column_header_clicked)
         
         layout.addWidget(self.data_table)
+
+        # Notify parent when data is modified
+        self.data_table.changes_made.connect(lambda: self.dirty_changed.emit(True))
         
         # Bottom controls - row count center, pagination right
         bottom_controls = QHBoxLayout()
@@ -721,7 +725,9 @@ class TableViewWidget(QWidget):
             
             # Reload table data to show saved changes
             self.load_table_data()
-            
+            # Notify parent tab is now clean
+            self.dirty_changed.emit(False)
+
         except Exception as e:
             QMessageBox.critical(
                 self,
