@@ -51,9 +51,9 @@ class CodeEditor(QPlainTextEdit):
         self._gutter_active_fg   = QColor("#858585")
 
         # Font
-        font = QFont("Menlo", 15)
+        font = QFont("Menlo", 18)
         if not font.exactMatch():
-            font = QFont("Monaco", 15)
+            font = QFont("Monaco", 18)
         if not font.exactMatch():
             font.setFamily("Courier New")
         font.setFixedPitch(True)

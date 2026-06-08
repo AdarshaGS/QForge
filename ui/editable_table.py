@@ -3,11 +3,35 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, 
     QHeaderView,
     QMenu,
-    QMessageBox
+    QMessageBox,
+    QAbstractItemView,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QBrush
 import pandas as pd
+
+
+# ── Colour palette ───────────────────────────────────────────────────
+# Dark theme
+_D_SEL_ROW   = QColor("#1B4F8A")   # selected row  → TablePlus-style blue
+_D_SEL_TEXT  = QColor("#ffffff")
+_D_MOD_ROW   = QColor("#2a1e00")   # row that has at least one changed cell
+_D_MOD_CELL  = QColor("#4d3500")   # the exact cell whose value changed
+_D_MOD_TEXT  = QColor("#ffd60a")   # amber text on changed cell
+_D_NEW_ROW   = QColor("#0d2a0d")   # newly added row
+_D_NEW_TEXT  = QColor("#4ec9a0")
+_D_DEL_ROW   = QColor("#2a0d0d")   # row marked for deletion
+_D_DEL_TEXT  = QColor("#f48771")
+# Light theme
+_L_SEL_ROW   = QColor("#0A84FF")
+_L_SEL_TEXT  = QColor("#ffffff")
+_L_MOD_ROW   = QColor("#fff9e6")
+_L_MOD_CELL  = QColor("#ffe58a")
+_L_MOD_TEXT  = QColor("#7a5c00")
+_L_NEW_ROW   = QColor("#e6ffed")
+_L_NEW_TEXT  = QColor("#1a6e3c")
+_L_DEL_ROW   = QColor("#ffe6e6")
+_L_DEL_TEXT  = QColor("#b00020")
 
 
 class EditableTableWidget(QTableWidget):
@@ -22,10 +46,15 @@ class EditableTableWidget(QTableWidget):
         self.original_data = None
         self.filtered_data = None  # Store filtered version
         self.column_filters = {}  # Store filter text for each column
-        self.modified_rows = set()  # Track which rows have been modified
-        self.new_rows = set()  # Track newly added rows
-        self.deleted_rows = set()  # Track rows marked for deletion
-        
+        self.modified_rows = set()    # rows with at least one changed cell
+        self.modified_cells = set()   # (row, col) of individually changed cells
+        self.new_rows = set()         # newly inserted rows
+        self.deleted_rows = set()     # rows marked for deletion
+
+        # Client-side sort state
+        self._sort_col = -1   # -1 = no active sort
+        self._sort_asc = True
+
         self.table_name = None
         self.primary_key_column = None
         
@@ -45,7 +74,15 @@ class EditableTableWidget(QTableWidget):
         # Cmd+D to duplicate row
         self.duplicate_shortcut = QShortcut(QKeySequence("Ctrl+D"), self)
         self.duplicate_shortcut.activated.connect(self.duplicate_selected_rows)
+
+        # Cmd+Backspace to delete selected row(s)
+        self.delete_shortcut = QShortcut(QKeySequence("Ctrl+Backspace"), self)
+        self.delete_shortcut.activated.connect(self.delete_selected_rows)
         
+        # Full-row selection (like TablePlus)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
         # Styling
         self.verticalHeader().setVisible(False)  # Hide row numbers
         self.setAlternatingRowColors(True)
@@ -54,10 +91,10 @@ class EditableTableWidget(QTableWidget):
         self.setSortingEnabled(False)
         
         # Connect header click for manual sorting (to avoid breaking modified state)
-        self.horizontalHeader().sectionClicked.connect(self.on_header_clicked)
-        
-        # Disable column header selection highlighting
-        self.horizontalHeader().setHighlightSections(False)
+        hdr = self.horizontalHeader()
+        hdr.sectionClicked.connect(self.on_header_clicked)
+        hdr.setSortIndicatorShown(True)   # show ▲▼ arrows without enabling Qt sort
+        hdr.setHighlightSections(False)
         
         # Theme will be set by update_theme method
         self.current_theme = 'dark'
@@ -101,22 +138,28 @@ class EditableTableWidget(QTableWidget):
                     gridline-color: #d0d0d0;
                     background-color: #ffffff;
                     alternate-background-color: #f8f8f8;
-                    color: #000000;
-                    selection-background-color: #cce8ff;
-                    selection-color: #000000;
+                    color: #1c1c1e;
+                    selection-background-color: #0A84FF;
+                    selection-color: #ffffff;
+                    border: none;
+                    outline: none;
                 }
+                QTableWidget::item { padding: 2px 6px; border: none; }
                 QTableWidget::item:selected {
-                    background-color: #cce8ff;
+                    background: #0A84FF;
+                    color: #ffffff;
                 }
                 QHeaderView::section {
-                    background-color: #f3f3f3;
-                    color: #000000;
-                    border: 1px solid #d0d0d0;
-                    padding: 5px;
+                    background: #f3f3f3;
+                    color: #636366;
+                    border: none;
+                    border-right: 1px solid #d0d0d0;
+                    border-bottom: 1px solid #d0d0d0;
+                    padding: 4px 8px;
+                    font-size: 12px;
+                    font-weight: 600;
                 }
-                QHeaderView::section:hover {
-                    background-color: #e8e8e8;
-                }
+                QHeaderView::section:hover { background: #e5e5e5; color: #1c1c1e; }
             """)
         
     def load_data(self, dataframe: pd.DataFrame, table_name=None):
@@ -125,16 +168,36 @@ class EditableTableWidget(QTableWidget):
         self.filtered_data = dataframe.copy() if dataframe is not None else None
         self.table_name = table_name
         self.modified_rows.clear()
+        self.modified_cells.clear()
         self.new_rows.clear()
         self.deleted_rows.clear()
         self.column_filters.clear()
+        self._sort_col = -1
+        self._sort_asc = True
+        self.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
         
         self._display_data(dataframe)
     
     def _display_data(self, dataframe):
         """Display dataframe in the table"""
+        # Re-entrancy guard: if we're already rebuilding the table (e.g. a
+        # second sectionClicked handler fires while _display_data is running),
+        # skip silently to avoid double-disconnect and widget corruption.
+        if getattr(self, '_displaying', False):
+            return
+        self._displaying = True
+        try:
+            self._display_data_impl(dataframe)
+        finally:
+            self._displaying = False
+
+    def _display_data_impl(self, dataframe):
+        """Inner (non-reentrant) implementation of _display_data."""
         # Temporarily disconnect itemChanged signal
-        self.itemChanged.disconnect(self.on_item_changed)
+        try:
+            self.itemChanged.disconnect(self.on_item_changed)
+        except Exception:
+            pass  # already disconnected; safe to continue
         
         self.clear()
         self.setRowCount(0)
@@ -155,8 +218,10 @@ class EditableTableWidget(QTableWidget):
                     item = QTableWidgetItem("")
                     self.setItem(row, col, item)
             
-            self.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-            self.horizontalHeader().setStretchLastSection(True)
+            self.resizeColumnsToContents()
+            hdr = self.horizontalHeader()
+            hdr.setSectionResizeMode(QHeaderView.Interactive)
+            hdr.setStretchLastSection(True)
             self.itemChanged.connect(self.on_item_changed)
             return
         
@@ -174,12 +239,25 @@ class EditableTableWidget(QTableWidget):
                 item.setData(Qt.UserRole, dataframe.iloc[row, col])  # Store original value
                 self.setItem(row, col, item)
         
-        self.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.horizontalHeader().setStretchLastSection(True)
+        self.resizeColumnsToContents()
+        hdr = self.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.Interactive)
+        hdr.setStretchLastSection(True)
         
         # Reconnect signal
         self.itemChanged.connect(self.on_item_changed)
+
+        # Re-apply colour for any rows that were already dirty before this
+        # display call (e.g. after a client-side sort or filter refresh).
+        self._restore_dirty_highlights()
     
+    def _restore_dirty_highlights(self):
+        """Re-apply colour to all rows that have a known dirty state.
+        Called after every _display_data so highlights survive sort/filter refreshes."""
+        for row in (self.modified_rows | self.new_rows | self.deleted_rows):
+            if 0 <= row < self.rowCount():
+                self._repaint_row(row)
+
     def apply_column_filter(self, column_index, filter_text):
         """Apply filter to a specific column"""
         if not filter_text:
@@ -216,36 +294,85 @@ class EditableTableWidget(QTableWidget):
         return ""
     
     def on_item_changed(self, item):
-        """Track when an item is modified"""
+        """Track when an item is modified and paint changed cell + row."""
         row = item.row()
-        
-        # Check if this is a formula
+        col = item.column()
+
+        # Formula evaluation
         text = item.text()
         if text.startswith('='):
             self.evaluate_formula(item)
             return
-        
+
         if row not in self.new_rows:
-            # Check if value actually changed
             original_value = item.data(Qt.UserRole)
-            current_value = item.text()
-            
-            # Convert for comparison
+            current_value  = item.text()
+
             if current_value == "" and pd.isna(original_value):
-                return  # No actual change
-            
+                return  # no actual change
+
             if str(original_value) != current_value:
                 self.modified_rows.add(row)
-                # Highlight modified row with prominent amber/orange
-                self.highlight_row(row, QColor(180, 100, 30))  # Bright amber for visibility
-                self.changes_made.emit()  # Notify parent
+                self.modified_cells.add((row, col))
+                self._repaint_row(row)
+                self.changes_made.emit()
     
-    def highlight_row(self, row, color):
-        """Highlight a row with a specific color"""
+    def _repaint_row(self, row: int):
+        """Apply the correct colour to every cell in *row* based on its state."""
+        dark = self.current_theme == 'dark'
+
+        if row in self.deleted_rows:
+            row_bg   = _D_DEL_ROW   if dark else _L_DEL_ROW
+            row_fg   = _D_DEL_TEXT  if dark else _L_DEL_TEXT
+            for col in range(self.columnCount()):
+                item = self.item(row, col)
+                if item:
+                    item.setBackground(QBrush(row_bg))
+                    item.setForeground(QBrush(row_fg))
+            return
+
+        if row in self.new_rows:
+            row_bg = _D_NEW_ROW  if dark else _L_NEW_ROW
+            row_fg = _D_NEW_TEXT if dark else _L_NEW_TEXT
+            for col in range(self.columnCount()):
+                item = self.item(row, col)
+                if item:
+                    item.setBackground(QBrush(row_bg))
+                    item.setForeground(QBrush(row_fg))
+            return
+
+        if row in self.modified_rows:
+            row_bg   = _D_MOD_ROW  if dark else _L_MOD_ROW
+            cell_bg  = _D_MOD_CELL if dark else _L_MOD_CELL
+            cell_fg  = _D_MOD_TEXT if dark else _L_MOD_TEXT
+            default_fg = QColor("#e5e5ea") if dark else QColor("#1c1c1e")
+            for col in range(self.columnCount()):
+                item = self.item(row, col)
+                if item:
+                    if (row, col) in self.modified_cells:
+                        # Changed cell: bright amber background + amber text
+                        item.setBackground(QBrush(cell_bg))
+                        item.setForeground(QBrush(cell_fg))
+                    else:
+                        # Rest of the row: subtle amber tint
+                        item.setBackground(QBrush(row_bg))
+                        item.setForeground(QBrush(default_fg))
+            return
+
+        # Unmodified row — restore default (clear any previous colour)
+        default_bg = QColor(0, 0, 0, 0)   # transparent → falls back to stylesheet
+        default_fg = QColor("#e5e5ea") if dark else QColor("#1c1c1e")
         for col in range(self.columnCount()):
             item = self.item(row, col)
             if item:
-                item.setBackground(color)
+                item.setBackground(QBrush(default_bg))
+                item.setForeground(QBrush(default_fg))
+
+    def highlight_row(self, row: int, color: QColor):
+        """Legacy helper — delegates to _repaint_row when state is already set."""
+        # Colour callers just add the row to the right set first;
+        # we repaint via _repaint_row for consistency.
+        self._repaint_row(row)
     
     def add_new_row(self):
         """Add a new empty row"""
@@ -261,8 +388,7 @@ class EditableTableWidget(QTableWidget):
             item.setData(Qt.UserRole, None)
             self.setItem(row_count, col, item)
         
-        # Highlight as new with bright green
-        self.highlight_row(row_count, QColor(60, 140, 60))
+        self._repaint_row(row_count)
         self.changes_made.emit()  # Notify parent
         
         # Start editing first cell
@@ -273,24 +399,14 @@ class EditableTableWidget(QTableWidget):
         selected_rows = set()
         for item in self.selectedItems():
             selected_rows.add(item.row())
-        
+
         if not selected_rows:
-            QMessageBox.warning(self, "Warning", "No rows selected")
             return
-        
-        reply = QMessageBox.question(
-            self,
-            "Delete Rows",
-            f"Mark {len(selected_rows)} row(s) for deletion?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        
-        if reply == QMessageBox.Yes:
-            for row in selected_rows:
-                self.deleted_rows.add(row)
-                # Highlight as deleted with subtle red
-                self.highlight_row(row, QColor(70, 50, 50))
-            self.changes_made.emit()  # Notify parent
+
+        for row in selected_rows:
+            self.deleted_rows.add(row)
+            self._repaint_row(row)
+        self.changes_made.emit()  # Notify parent
     
     def revert_changes(self):
         """Revert all changes"""
@@ -390,166 +506,313 @@ class EditableTableWidget(QTableWidget):
         
         return changes
     
-    def on_header_clicked(self, logical_index):
-        """Handle column header click for sorting"""
-        # Just toggle sorting - QTableWidget handles the actual sorting
-        pass
+    def on_header_clicked(self, col: int):
+        """Sort the currently displayed data by the clicked column (client-side)."""
+        if self.filtered_data is None or self.filtered_data.empty:
+            return
+
+        # Sorting while there are unsaved edits would corrupt the row-index
+        # tracking (modified_rows/modified_cells) because sort reorders rows.
+        # Block it — the same behaviour as TablePlus.
+        if self.has_changes():
+            return
+
+        # Toggle direction if same column, else start ascending
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+
+        order = Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder
+        self.horizontalHeader().setSortIndicator(col, order)
+
+        col_name = self.filtered_data.columns[col]
+        self.filtered_data = self.filtered_data.sort_values(
+            col_name, ascending=self._sort_asc, na_position='last'
+        ).reset_index(drop=True)
+        self._display_data(self.filtered_data)
     
     def has_changes(self):
         """Check if there are any uncommitted changes"""
         return bool(self.modified_rows or self.new_rows or self.deleted_rows)
     
+    # ── Signals used by FK navigation and filter chips ───────────────────────
+    from PySide6.QtCore import Signal as _Signal
+    filter_by_value  = _Signal(str, str, str)  # (column_name, operator, value)
+    navigate_fk      = _Signal(str, str, str)  # (ref_table, ref_column, value)
+    show_structure   = _Signal(str)        # (table_name)
+
     def show_context_menu(self, position):
         """Show comprehensive context menu like TablePlus"""
         menu = QMenu(self)
-        
-        # Get current selection
+
         selected_items = self.selectedItems()
-        has_selection = len(selected_items) > 0
-        
+        has_selection  = len(selected_items) > 0
+        current_item   = self.currentItem() if has_selection else None
+
         if has_selection:
-            current_item = self.currentItem()
-            
-            # Paste
+            # ── Quick-look editor (cell viewer) ──────────────────────────────
+            ql_action = menu.addAction("🔍  Quick Look Editor")
+            ql_action.setShortcut("Ctrl+Return")
+            ql_action.triggered.connect(self._quick_look_cell)
+            menu.addSeparator()
+
+            # ── Paste / Duplicate ─────────────────────────────────────────────
             paste_action = menu.addAction("Paste")
             paste_action.setShortcut("Ctrl+V")
             paste_action.triggered.connect(self.paste_from_clipboard)
-            
-            # Duplicate
             duplicate_action = menu.addAction("Duplicate")
             duplicate_action.setShortcut("Ctrl+D")
             duplicate_action.triggered.connect(self.duplicate_row)
-            
             menu.addSeparator()
-            
-            # Copy options
+
+            # ── Copy ──────────────────────────────────────────────────────────
             copy_action = menu.addAction("Copy")
             copy_action.setShortcut("Ctrl+C")
             copy_action.triggered.connect(self.copy_to_clipboard)
-            
-            copy_cell_action = menu.addAction("Copy Cell Value")
-            copy_cell_action.triggered.connect(self.copy_cell_value)
-            
-            copy_column_action = menu.addAction("Copy All Column Values")
-            copy_column_action.triggered.connect(self.copy_column_values)
-            
-            # Copy Row As submenu
-            copy_row_menu = menu.addMenu("Copy Row As")
-            copy_row_menu.addAction("JSON").triggered.connect(lambda: self.copy_row_as("json"))
-            copy_row_menu.addAction("CSV").triggered.connect(lambda: self.copy_row_as("csv"))
-            copy_row_menu.addAction("SQL INSERT").triggered.connect(lambda: self.copy_row_as("sql"))
-            
+            menu.addAction("Copy Cell Value").triggered.connect(self.copy_cell_value)
+            menu.addAction("Copy All Column Values").triggered.connect(self.copy_column_values)
+
+            # ── Copy Rows As sub-menu (TablePlus-style) ───────────────────────
+            crm = menu.addMenu("Copy Rows As")
+            crm.addAction("Plain Text").triggered.connect(
+                lambda: self.copy_rows_as("plain"))
+            crm.addSeparator()
+            crm.addAction("JSON").triggered.connect(
+                lambda: self.copy_rows_as("json"))
+            crm.addAction("HTML").triggered.connect(
+                lambda: self.copy_rows_as("html"))
+            crm.addAction("Markdown Table").triggered.connect(
+                lambda: self.copy_rows_as("markdown"))
+            crm.addSeparator()
+            crm.addAction("CSV").triggered.connect(
+                lambda: self.copy_rows_as("csv"))
+            crm.addAction("CSV include fields name").triggered.connect(
+                lambda: self.copy_rows_as("csv_header"))
+            crm.addSeparator()
+            crm.addAction("SQL Insert Statement").triggered.connect(
+                lambda: self.copy_rows_as("sql_insert"))
+            crm.addAction("SQL Insert Statement (no auto_inc)").triggered.connect(
+                lambda: self.copy_rows_as("sql_insert_no_id"))
+
             menu.addSeparator()
-            
-            # Export
-            export_action = menu.addAction("Export result...")
-            export_action.triggered.connect(self.export_selected)
-            
+
+            # -- Quick Filter submenu ----------------------------------------
+            if current_item:
+                col_name = (self.horizontalHeaderItem(current_item.column()).text()
+                            if self.horizontalHeaderItem(current_item.column()) else "")
+                cell_val = current_item.text()
+
+                qf = menu.addMenu("Quick Filter")
+
+                def _add(label, op, val=cell_val, cn=col_name):
+                    qf.addAction(label).triggered.connect(
+                        lambda: self.filter_by_value.emit(cn, op, val))
+
+                _add(f"{col_name} = '{cell_val}'",           "=")
+                _add(f"{col_name} <> '{cell_val}'",          "<>")
+                _add(f"{col_name} < '{cell_val}'",           "<")
+                _add(f"{col_name} > '{cell_val}'",           ">")
+                _add(f"{col_name} <= '{cell_val}'",          "<=")
+                _add(f"{col_name} >= '{cell_val}'",          ">=")
+                qf.addSeparator()
+                _add(f"{col_name} Contains '{cell_val}'",     "CONTAINS")
+                _add(f"{col_name} Not contains '{cell_val}'", "NOT CONTAINS")
+                qf.addSeparator()
+                _add(f"{col_name} Has prefix '{cell_val}'",   "STARTS WITH")
+                _add(f"{col_name} Has suffix '{cell_val}'",   "ENDS WITH")
+                qf.addSeparator()
+                _add(f"{col_name} IN ({cell_val})",           "IN")
+                _add(f"{col_name} NOT IN ({cell_val})",       "NOT IN")
+                qf.addSeparator()
+                _add(f"{col_name} IS NULL",                   "IS NULL",     "")
+                _add(f"{col_name} IS NOT NULL",               "IS NOT NULL", "")
+
+                # ── FK navigation ────────────────────────────────────────────
+                fk_info = getattr(self, '_fk_map', {}).get(col_name)
+                if fk_info:
+                    ref_tbl = fk_info['ref_table']
+                    ref_col = fk_info['ref_column']
+                    fk_action = menu.addAction(
+                        f"🔗  Go to {ref_tbl}.{ref_col} = ‘{cell_val[:20]}'")
+                    fk_action.triggered.connect(
+                        lambda: self.navigate_fk.emit(ref_tbl, ref_col, cell_val))
+
             menu.addSeparator()
-            
-            # Delete
-            delete_action = menu.addAction("Delete")
-            delete_action.setShortcut("Delete")
-            delete_action.triggered.connect(self.delete_selected_rows)
-            
+
+            # ── Export ────────────────────────────────────────────────────────
+            menu.addAction("Export result...").triggered.connect(self.export_selected)
             menu.addSeparator()
-            
-            # Set NULL
-            set_null_action = menu.addAction("Set NULL")
-            set_null_action.triggered.connect(self.set_cell_null)
-            
-            # Set Default
-            set_default_action = menu.addAction("Set Default Value")
-            set_default_action.triggered.connect(self.set_cell_default)
-            
+
+            # ── Delete / NULL / Default ───────────────────────────────────────
+            del_action = menu.addAction("Delete")
+            del_action.setShortcut("Delete")
+            del_action.triggered.connect(self.delete_selected_rows)
+            menu.addSeparator()
+            menu.addAction("Set NULL").triggered.connect(self.set_cell_null)
+            menu.addAction("Set Default Value").triggered.connect(self.set_cell_default)
+
         else:
-            # No selection - show row operations
-            add_row_action = menu.addAction("Add New Row")
-            add_row_action.triggered.connect(self.add_new_row)
-        
+            menu.addAction("Add New Row").triggered.connect(self.add_new_row)
+
         menu.addSeparator()
-        
-        # Always available
-        revert_action = menu.addAction("Revert Changes")
-        revert_action.triggered.connect(self.revert_changes)
-        
+        menu.addAction("Revert Changes").triggered.connect(self.revert_changes)
         menu.exec_(self.mapToGlobal(position))
-    
+
+    def set_fk_map(self, fk_list: list):
+        """Store FK metadata: list of {column, ref_table, ref_column} dicts."""
+        self._fk_map = {fk['column']: fk for fk in (fk_list or [])}
+
+    def _quick_look_cell(self):
+        """Open a resizable text viewer for the current cell value."""
+        item = self.currentItem()
+        if not item:
+            return
+        col_name = (self.horizontalHeaderItem(item.column()).text()
+                    if self.horizontalHeaderItem(item.column()) else "col")
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QPlainTextEdit, QDialogButtonBox
+        dlg = QDialog(self.window())
+        dlg.setWindowTitle(f"🔍 {col_name}")
+        dlg.resize(520, 320)
+        lay = QVBoxLayout(dlg)
+        te = QPlainTextEdit(item.text())
+        te.setReadOnly(True)
+        lay.addWidget(te)
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.accept)
+        lay.addWidget(btns)
+        dlg.exec()
+
+    # ── Copy rows in multiple formats ─────────────────────────────────────────
+
+    def _selected_rows_data(self) -> tuple[list[str], list[list[str]]]:
+        """Return (headers, [[row values], ...]) for currently selected rows."""
+        rows = sorted({item.row() for item in self.selectedItems()})
+        cols = list(range(self.columnCount()))
+        headers = [self.horizontalHeaderItem(c).text()
+                   if self.horizontalHeaderItem(c) else str(c) for c in cols]
+        data = []
+        for r in rows:
+            data.append([self.item(r, c).text() if self.item(r, c) else "" for c in cols])
+        return headers, data
+
+    def copy_rows_as(self, fmt: str):
+        """Copy selected rows to clipboard in the requested format."""
+        from PySide6.QtWidgets import QApplication
+        import json
+        headers, rows = self._selected_rows_data()
+        if not rows:
+            return
+
+        if fmt == "plain":
+            lines = ["\t".join(headers)]
+            for row in rows:
+                lines.append("\t".join(row))
+            text = "\n".join(lines)
+
+        elif fmt == "json":
+            objs = [dict(zip(headers, row)) for row in rows]
+            text = json.dumps(objs if len(objs) > 1 else objs[0], indent=2, ensure_ascii=False)
+
+        elif fmt == "html":
+            th = "".join(f"<th>{h}</th>" for h in headers)
+            trs = ""
+            for row in rows:
+                tds = "".join(f"<td>{v}</td>" for v in row)
+                trs += f"<tr>{tds}</tr>\n"
+            text = f"<table>\n<thead><tr>{th}</tr></thead>\n<tbody>\n{trs}</tbody></table>"
+
+        elif fmt == "markdown":
+            sep = "| " + " | ".join("-" * max(len(h), 3) for h in headers) + " |"
+            hdr = "| " + " | ".join(headers) + " |"
+            body = "\n".join("| " + " | ".join(row) + " |" for row in rows)
+            text = f"{hdr}\n{sep}\n{body}"
+
+        elif fmt == "csv":
+            lines = [",".join(f'"{v}"' for v in row) for row in rows]
+            text = "\n".join(lines)
+
+        elif fmt == "csv_header":
+            lines = [",".join(f'"{h}"' for h in headers)]
+            for row in rows:
+                lines.append(",".join(f'"{v}"' for v in row))
+            text = "\n".join(lines)
+
+        elif fmt == "sql_insert":
+            tbl = self.table_name or "table"
+            col_list = ", ".join(f"`{h}`" for h in headers)
+            stmts = []
+            for row in rows:
+                vals = ", ".join(
+                    "NULL" if v == "" else f"'{v.replace(chr(39), chr(39)*2)}'"
+                    for v in row
+                )
+                stmts.append(f"INSERT INTO `{tbl}` ({col_list}) VALUES ({vals});")
+            text = "\n".join(stmts)
+
+        elif fmt == "sql_insert_no_id":
+            # Exclude the first column if its name is 'id' or ends with '_id' and
+            # looks like an auto-increment primary key (single-word, all lower/upper).
+            tbl = self.table_name or "table"
+            skip = {i for i, h in enumerate(headers)
+                    if h.lower() == "id" or h.lower().endswith("_id") and i == 0}
+            # If no obvious id column found, skip index 0 by default
+            if not skip:
+                skip = {0}
+            filt_headers = [h for i, h in enumerate(headers) if i not in skip]
+            col_list = ", ".join(f"`{h}`" for h in filt_headers)
+            stmts = []
+            for row in rows:
+                filt_vals = [v for i, v in enumerate(row) if i not in skip]
+                vals = ", ".join(
+                    "NULL" if v == "" else f"'{v.replace(chr(39), chr(39)*2)}'"
+                    for v in filt_vals
+                )
+                stmts.append(f"INSERT INTO `{tbl}` ({col_list}) VALUES ({vals});")
+            text = "\n".join(stmts)
+        else:
+            text = ""
+
+        QApplication.clipboard().setText(text)
+
+    # keep legacy single-row method for backward compat
+    def copy_row_as(self, format_type):
+        _map = {"json": "json", "csv": "csv", "sql": "sql_insert"}
+        self.copy_rows_as(_map.get(format_type, format_type))
+
     def copy_to_clipboard(self):
         """Copy selected cells to clipboard"""
         from PySide6.QtWidgets import QApplication
         selected = self.selectedItems()
         if not selected:
             return
-        
-        # Get selected range
         rows = sorted(set(item.row() for item in selected))
         cols = sorted(set(item.column() for item in selected))
-        
-        # Build tab-separated text
         text = []
         for row in rows:
-            row_data = []
-            for col in cols:
-                item = self.item(row, col)
-                row_data.append(item.text() if item else "")
+            row_data = [self.item(row, col).text() if self.item(row, col) else "" for col in cols]
             text.append("\t".join(row_data))
-        
         QApplication.clipboard().setText("\n".join(text))
-    
+
     def copy_cell_value(self):
         """Copy current cell value"""
         from PySide6.QtWidgets import QApplication
         current = self.currentItem()
         if current:
             QApplication.clipboard().setText(current.text())
-    
+
     def copy_column_values(self):
         """Copy all values from selected column"""
         from PySide6.QtWidgets import QApplication
         current = self.currentItem()
         if not current:
             return
-        
         col = current.column()
-        values = []
-        for row in range(self.rowCount()):
-            item = self.item(row, col)
-            if item:
-                values.append(item.text())
-        
+        values = [self.item(row, col).text() for row in range(self.rowCount())
+                  if self.item(row, col)]
         QApplication.clipboard().setText("\n".join(values))
-    
-    def copy_row_as(self, format_type):
-        """Copy row in specified format"""
-        from PySide6.QtWidgets import QApplication
-        import json
-        
-        current = self.currentItem()
-        if not current:
-            return
-        
-        row = current.row()
-        row_data = {}
-        
-        for col in range(self.columnCount()):
-            col_name = self.horizontalHeaderItem(col).text()
-            item = self.item(row, col)
-            row_data[col_name] = item.text() if item else ""
-        
-        if format_type == "json":
-            text = json.dumps(row_data, indent=2)
-        elif format_type == "csv":
-            text = ",".join(f'"{v}"' for v in row_data.values())
-        elif format_type == "sql":
-            cols = ", ".join(row_data.keys())
-            vals = ", ".join(f"'{v}'" for v in row_data.values())
-            text = f"INSERT INTO {self.table_name or 'table'} ({cols}) VALUES ({vals});"
-        else:
-            text = str(row_data)
-        
-        QApplication.clipboard().setText(text)
-    
+
     def paste_from_clipboard(self):
         """Paste from clipboard"""
         from PySide6.QtWidgets import QApplication
@@ -595,7 +858,7 @@ class EditableTableWidget(QTableWidget):
                 self.setItem(source_row + 1, col, new_item)
         
         self.new_rows.add(source_row + 1)
-        self.highlight_row(source_row + 1, QColor(50, 70, 50))
+        self._repaint_row(source_row + 1)
     
     def export_selected(self):
         """Export selected rows"""
@@ -640,8 +903,7 @@ class EditableTableWidget(QTableWidget):
             
             # Mark as new row
             self.new_rows.add(source_row + 1)
-            self.highlight_row(source_row + 1, QColor(50, 70, 50))  # Green for new
-        
+            self._repaint_row(source_row + 1)
         # Reconnect signal
         self.itemChanged.connect(self.on_item_changed)
     
@@ -723,7 +985,8 @@ class EditableTableWidget(QTableWidget):
                     
                     # Mark as modified
                     self.modified_rows.add(row)
-                    self.highlight_row(row, QColor(80, 70, 50))
+                    self.modified_cells.add((row, col))
+                    self._repaint_row(row)
             
             # Reconnect signal
             self.itemChanged.connect(self.on_item_changed)

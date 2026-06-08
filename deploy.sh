@@ -1,361 +1,139 @@
 #!/bin/bash
-# =============================================================================
-# QForge — Full Deployment Script
-# Builds the app, packages a DMG, creates a GitHub release, and updates
-# the Homebrew tap formula so users can install with:
-#   brew tap AdarshaGS/qforge && brew install --cask qforge
-# =============================================================================
+# QForge — Upload DMG to GitHub Releases
+# Assumes QForge.dmg is already built (run build.sh first)
 
-set -e
+set -euo pipefail
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ─── Configuration ──────────────────────────────────────────────
 GITHUB_USER="AdarshaGS"
 GITHUB_REPO="QForge"
-TAP_REPO="homebrew-qforge"                # must start with homebrew-
-APP_NAME="QForge"
-APP_NAME_LOWER="$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]')"
-BUNDLE_ID="com.qforge.app"
 DMG_NAME="QForge.dmg"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+DMG_PATH="$REPO_DIR/$DMG_NAME"
 
-# Read version from first argument, or prompt
 VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
-    read -rp "Enter release version (e.g. 1.0.1): " VERSION
+    read -rp "Enter release version (e.g. 1.1.0): " VERSION
 fi
 TAG="v${VERSION}"
 
-# ─── Colors ───────────────────────────────────────────────────────────────────
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BOLD='\033[1m'
-NC='\033[0m'
+# ─── Colors / helpers ───────────────────────────────────────────
+GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
+RED='\033[0;31m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+step()    { echo -e "\n${BOLD}${BLUE}━━━ $1 ━━━${NC}"; }
+substep() { echo -e "  ${CYAN}→ $1${NC}"; }
+ok()      { echo -e "  ${GREEN}✔  $1${NC}"; }
+warn()    { echo -e "  ${YELLOW}⚠  $1${NC}"; }
+die()     { echo -e "\n${RED}✘  $1${NC}"; exit 1; }
 
-step()  { echo -e "\n${BOLD}${BLUE}▶ $1${NC}"; }
-ok()    { echo -e "${GREEN}✔ $1${NC}"; }
-warn()  { echo -e "${YELLOW}⚠ $1${NC}"; }
-die()   { echo -e "${RED}✘ $1${NC}"; exit 1; }
+echo -e "\n${BOLD}QForge Deploy — releasing ${TAG}${NC}"
+echo -e "────────────────────────────────────────"
 
-# =============================================================================
-# STEP 1 — Preflight checks
-# =============================================================================
-step "[1/7] Preflight checks"
+# ─── Step 1: Preflight ──────────────────────────────────────────
+step "[1/4] Preflight checks"
 
-command -v python3  >/dev/null || die "python3 not found"
-command -v hdiutil  >/dev/null || die "hdiutil not found (macOS only)"
-command -v gh       >/dev/null || die "GitHub CLI (gh) not found — install with: brew install gh"
-gh auth status      >/dev/null 2>&1 || die "Not logged in to GitHub CLI — run: gh auth login"
+substep "Checking GitHub CLI (gh)..."
+command -v gh >/dev/null || die "GitHub CLI not found — run: brew install gh"
+ok "gh found: $(gh --version | head -1)"
 
+substep "Checking GitHub auth..."
+gh auth status >/dev/null 2>&1 || die "Not logged in — run: gh auth login"
 GH_USER=$(gh api user --jq .login 2>/dev/null)
-echo "  Logged in as: ${GH_USER}"
-if [ "$GH_USER" != "$GITHUB_USER" ]; then
-    die "GitHub CLI is logged in as '${GH_USER}' but repo owner is '${GITHUB_USER}'. Run: gh auth login"
-fi
-
-# Configure git to use gh's token so all git pushes work automatically
+[ "$GH_USER" = "$GITHUB_USER" ] || die "Logged in as '$GH_USER', expected '$GITHUB_USER'"
 gh auth setup-git
+ok "Authenticated as $GH_USER on github.com"
 
-ok "All tools available"
+substep "Checking DMG file..."
+[ -f "$DMG_PATH" ] || die "DMG not found: $DMG_PATH  →  run build.sh first"
+DMG_SIZE_HR=$(du -sh "$DMG_PATH" | cut -f1)
+DMG_SIZE_BYTES=$(stat -f%z "$DMG_PATH")
+ok "Found: $DMG_NAME  ($DMG_SIZE_HR, $DMG_SIZE_BYTES bytes)"
 
-# =============================================================================
-# STEP 2 — Build the app with PyInstaller
-# =============================================================================
-step "[2/7] Building QForge.app with PyInstaller"
+# ─── Step 2: SHA256 ─────────────────────────────────────────────
+step "[2/4] SHA256 checksum"
 
-cd "$REPO_DIR"
-
-# Ensure venv exists and is healthy
-if [ ! -d "venv" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv venv
-fi
-
-source venv/bin/activate
-
-# Install/upgrade build deps quietly
-pip install --quiet --upgrade pip
-pip install --quiet pyinstaller
-pip install --quiet -r requirements.txt
-
-# Clean previous artifacts
-rm -rf build/ dist/ QForge.spec
-
-# Generate PyInstaller spec
-cat > QForge.spec << 'SPEC_EOF'
-# -*- mode: python ; coding: utf-8 -*-
-block_cipher = None
-
-a = Analysis(
-    ['main.py'],
-    pathex=[],
-    binaries=[],
-    datas=[
-        ('ui/*.py',       'ui'),
-        ('services/*.py', 'services'),
-        ('utils/*.py',    'utils'),
-    ],
-    hiddenimports=[
-        'pymysql',
-        'psycopg2',
-        'pandas',
-        'numpy',
-        'sqlparse',
-        'sshtunnel',
-        'paramiko',
-        'openpyxl',
-        'pyarrow',
-        'PySide6.QtCore',
-        'PySide6.QtGui',
-        'PySide6.QtWidgets',
-        # Lazily-imported ui modules (inside methods — static analyser misses these)
-        'ui.snippet_editor_dialog',
-        'ui.snippet_manager',
-        'ui.code_editor',
-        'ui.connection_panel',
-        'ui.db_switcher_dialog',
-        'ui.query_history_dialog',
-        'ui.quick_search_dialog',
-        'ui.structure_editor',
-    ],
-    hookspath=[],
-    runtime_hooks=[],
-    excludes=[],
-    cipher=block_cipher,
-    noarchive=False,
-)
-
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
-
-exe = EXE(
-    pyz, a.scripts, [],
-    exclude_binaries=True,
-    name='QForge',
-    debug=False,
-    strip=False,
-    upx=True,
-    console=False,
-    argv_emulation=False,
-    codesign_identity=None,
-    entitlements_file=None,
-)
-
-coll = COLLECT(
-    exe, a.binaries, a.zipfiles, a.datas,
-    strip=False, upx=True, upx_exclude=[],
-    name='QForge',
-)
-
-app = BUNDLE(
-    coll,
-    name='QForge.app',
-    icon=None,
-    bundle_identifier='com.qforge.app',
-    version='VERSION_PLACEHOLDER',
-    info_plist={
-        'NSPrincipalClass':        'NSApplication',
-        'NSHighResolutionCapable': 'True',
-        'LSMinimumSystemVersion':  '10.13.0',
-        'CFBundleShortVersionString': 'VERSION_PLACEHOLDER',
-        'CFBundleVersion':            'VERSION_PLACEHOLDER',
-    },
-)
-SPEC_EOF
-
-# Inject the actual version
-sed -i '' "s/VERSION_PLACEHOLDER/${VERSION}/g" QForge.spec
-
-# Run PyInstaller
-pyinstaller QForge.spec --noconfirm --clean 2>&1 | tail -20
-
-[ -d "dist/QForge.app" ] || die "PyInstaller did not produce QForge.app"
-ok "QForge.app built → dist/QForge.app"
-
-# =============================================================================
-# STEP 3 — Package into a DMG
-# =============================================================================
-step "[3/7] Packaging DMG"
-
-DMG_PATH="$REPO_DIR/$DMG_NAME"
-TMP_DMG_DIR="$REPO_DIR/.dmg_tmp"
-
-rm -f "$DMG_PATH"
-rm -rf "$TMP_DMG_DIR"
-mkdir -p "$TMP_DMG_DIR"
-
-# Copy app into staging folder
-cp -r "dist/QForge.app" "$TMP_DMG_DIR/"
-
-# Create a symlink to /Applications so users can drag-and-drop
-ln -s /Applications "$TMP_DMG_DIR/Applications"
-
-# Build a read/write image first, then convert to compressed read-only
-hdiutil create \
-    -volname "$APP_NAME" \
-    -srcfolder "$TMP_DMG_DIR" \
-    -ov \
-    -format UDRW \
-    -fs HFS+ \
-    "$REPO_DIR/.tmp_rw.dmg" >/dev/null
-
-hdiutil convert \
-    "$REPO_DIR/.tmp_rw.dmg" \
-    -format UDZO \
-    -o "$DMG_PATH" >/dev/null
-
-rm -f "$REPO_DIR/.tmp_rw.dmg"
-rm -rf "$TMP_DMG_DIR"
-
-ok "DMG created → $DMG_PATH"
-
-# =============================================================================
-# STEP 4 — Compute SHA256 for Homebrew
-# =============================================================================
-step "[4/7] Computing SHA256 checksum"
-
+substep "Hashing $DMG_NAME..."
 SHA256=$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')
-ok "SHA256: $SHA256"
+ok "$SHA256"
 
-# =============================================================================
-# STEP 5 — Create GitHub release and upload DMG
-# =============================================================================
-step "[5/7] Creating GitHub release $TAG and uploading DMG"
+# ─── Step 3: Create GitHub release (no attachment yet) ──────────
+step "[3/4] Creating GitHub release"
 
-RELEASE_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}/releases/download/${TAG}/${DMG_NAME}"
-
-# Delete existing release/tag if it exists (re-deploy scenario)
 if gh release view "$TAG" --repo "${GITHUB_USER}/${GITHUB_REPO}" >/dev/null 2>&1; then
-    warn "Release $TAG already exists — deleting and recreating"
+    warn "Release $TAG already exists — removing it first"
+    substep "Deleting existing release $TAG..."
     gh release delete "$TAG" --repo "${GITHUB_USER}/${GITHUB_REPO}" --yes
+    ok "Release deleted"
+    substep "Removing local git tag $TAG..."
     git tag -d "$TAG" 2>/dev/null || true
+    substep "Removing remote git tag $TAG..."
     git push origin ":refs/tags/$TAG" 2>/dev/null || true
+    ok "Tags cleared"
 fi
 
+substep "Creating release $TAG on GitHub..."
 gh release create "$TAG" \
     --repo "${GITHUB_USER}/${GITHUB_REPO}" \
-    --title "QForge ${TAG} — Free Database Client" \
+    --title "QForge ${TAG}" \
     --notes "## QForge ${TAG}
 
-Professional database client — free alternative to TablePlus.
-
-### Install via Homebrew
-\`\`\`bash
-brew tap ${GITHUB_USER}/${APP_NAME_LOWER}
-brew install --cask qforge
-\`\`\`
-
-### Manual install
 Download \`${DMG_NAME}\` below, open it, and drag QForge to Applications.
 
-### What's new
-- See FEATURE_ROADMAP.md for details
+**SHA256:** \`${SHA256}\`"
+ok "Release created: https://github.com/${GITHUB_USER}/${GITHUB_REPO}/releases/tag/${TAG}"
 
-### Supported databases
-MySQL · PostgreSQL · SQLite · SSH tunnels" \
-    "$DMG_PATH"
+# ─── Step 4: Upload DMG with progress ───────────────────────────
+step "[4/4] Uploading $DMG_NAME ($DMG_SIZE_HR)"
 
-ok "Release live → https://github.com/${GITHUB_USER}/${GITHUB_REPO}/releases/tag/${TAG}"
+substep "Fetching upload URL..."
+UPLOAD_URL=$(gh api "repos/${GITHUB_USER}/${GITHUB_REPO}/releases/tags/${TAG}" \
+    --jq '.upload_url' | sed 's/{?name,label}//')
+ok "Upload URL ready"
 
-# =============================================================================
-# STEP 6 — Update Homebrew tap formula (GitHub API only, no local git needed)
-# =============================================================================
-step "[6/7] Updating Homebrew tap formula"
+substep "Getting auth token..."
+GH_TOKEN=$(gh auth token)
 
-# Write formula to a temp file so we can base64-encode it cleanly
-FORMULA_TMP="$(mktemp /tmp/qforge_formula_XXXX.rb)"
-cat > "$FORMULA_TMP" << FORMULA_EOF
-cask "qforge" do
-  version "${VERSION}"
-  sha256 "${SHA256}"
+echo ""
+echo -e "  ${BOLD}Uploading to GitHub...${NC}"
+echo -e "  (${DMG_SIZE_HR} — progress shown below)"
+echo ""
 
-  url "https://github.com/${GITHUB_USER}/${GITHUB_REPO}/releases/download/v#{version}/${DMG_NAME}"
-  name "${APP_NAME}"
-  desc "Professional database client — free alternative to TablePlus"
-  homepage "https://github.com/${GITHUB_USER}/${GITHUB_REPO}"
+# curl -# shows a live hash-mark progress bar:
+#   ######################################## 100.0%
+DOWNLOAD_URL=$(curl -# \
+    -X POST \
+    -H "Authorization: token $GH_TOKEN" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "@$DMG_PATH" \
+    "${UPLOAD_URL}?name=${DMG_NAME}" \
+    2>&1 | tee /dev/stderr | tail -1 | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(d.get('browser_download_url',''))" \
+    2>/dev/null || true)
 
-  livecheck do
-    url :url
-    strategy :github_latest
-  end
-
-  app "${APP_NAME}.app"
-
-  zap trash: [
-    "~/Library/Application Support/${APP_NAME}",
-    "~/Library/Preferences/${BUNDLE_ID}.plist",
-    "~/Library/Saved Application State/${BUNDLE_ID}.savedState",
-  ]
-
-  caveats <<~EOS
-    Launch QForge from Applications, or run:
-      open -a ${APP_NAME}
-
-    Docs & source: https://github.com/${GITHUB_USER}/${GITHUB_REPO}
-  EOS
-end
-FORMULA_EOF
-
-# macOS base64 requires -i flag; strip newlines for the API
-FORMULA_CONTENT=$(base64 -i "$FORMULA_TMP" | tr -d '\n')
-rm -f "$FORMULA_TMP"
-
-EXISTING_SHA=$(gh api "repos/${GITHUB_USER}/${TAP_REPO}/contents/Casks/qforge.rb" \
-    --jq '.sha' 2>/dev/null || echo "")
-
-if [ -n "$EXISTING_SHA" ]; then
-    gh api --method PUT "repos/${GITHUB_USER}/${TAP_REPO}/contents/Casks/qforge.rb" \
-        -f message="qforge ${TAG}: update to ${VERSION} (sha256 ${SHA256:0:12}...)" \
-        -f content="$FORMULA_CONTENT" \
-        -f sha="$EXISTING_SHA" \
-        --jq '.commit.sha' | xargs -I{} echo "  Committed: {}"
-else
-    gh api --method PUT "repos/${GITHUB_USER}/${TAP_REPO}/contents/Casks/qforge.rb" \
-        -f message="qforge ${TAG}: initial formula ${VERSION}" \
-        -f content="$FORMULA_CONTENT" \
-        --jq '.commit.sha' | xargs -I{} echo "  Committed: {}"
+# Simpler fallback: just run upload and let curl print its own progress
+if [ -z "$DOWNLOAD_URL" ]; then
+    curl --progress-bar \
+        -X POST \
+        -H "Authorization: token $GH_TOKEN" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@$DMG_PATH" \
+        "${UPLOAD_URL}?name=${DMG_NAME}" \
+        -o /tmp/qforge_upload_resp.json
+    DOWNLOAD_URL=$(python3 -c \
+        "import json; d=json.load(open('/tmp/qforge_upload_resp.json')); print(d.get('browser_download_url',''))" \
+        2>/dev/null || true)
 fi
 
-ok "Tap formula pushed → https://github.com/${GITHUB_USER}/${TAP_REPO}/blob/master/Casks/qforge.rb"
-
-# =============================================================================
-# STEP 7 — Sync Homebrew tap cache
-# =============================================================================
-step "[7/7] Syncing Homebrew tap and smoke-testing"
-
-# Clear any cached DMG so Homebrew re-downloads and re-verifies the fresh one
-rm -f "$(brew --cache)/downloads/"*"--${DMG_NAME}" 2>/dev/null || true
-
-TAP_SLUG="$(echo "${GITHUB_USER}" | tr '[:upper:]' '[:lower:]')/${TAP_REPO}"
-
-# Ensure tap is registered, then force-pull the latest formula from GitHub
-if brew tap | grep -qi "${TAP_SLUG}"; then
-    brew tap --repair "${TAP_SLUG}" 2>/dev/null || true
-    ok "Homebrew tap refreshed"
-else
-    brew tap "${TAP_SLUG}"
-    ok "Homebrew tap installed"
-fi
-
-# Audit the formula — non-fatal, just a lint check
-brew audit --cask qforge 2>&1 || warn "brew audit reported warnings (non-fatal)"
-
-# =============================================================================
-# Done
-# =============================================================================
 echo ""
-echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════${NC}"
-echo -e "${BOLD}${GREEN}  ✅  QForge ${TAG} deployed successfully!${NC}"
-echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════${NC}"
+ok "Upload complete!"
+[ -n "$DOWNLOAD_URL" ] && ok "Download URL: $DOWNLOAD_URL"
+
+# ─── Done ───────────────────────────────────────────────────────
 echo ""
-echo -e "  GitHub release:   https://github.com/${GITHUB_USER}/${GITHUB_REPO}/releases/tag/${TAG}"
-echo -e "  Homebrew tap:     https://github.com/${GITHUB_USER}/${TAP_REPO}"
-echo ""
-echo -e "${BOLD}Users can now install with:${NC}"
-echo ""
-echo -e "  brew tap ${GITHUB_USER}/${APP_NAME_LOWER}"
-echo -e "  brew install --cask qforge"
-echo ""
-echo -e "  # or update an existing install:"
-echo -e "  brew upgrade --cask qforge"
+echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${GREEN}║   ✅  QForge ${TAG} released successfully!${NC}${BOLD}${GREEN}            ║${NC}"
+echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
+echo -e "  ${BOLD}Release:${NC} https://github.com/${GITHUB_USER}/${GITHUB_REPO}/releases/tag/${TAG}"
+echo -e "  ${BOLD}Size:${NC}    ${DMG_SIZE_HR}"
+echo -e "  ${BOLD}SHA256:${NC}  ${SHA256}"
 echo ""

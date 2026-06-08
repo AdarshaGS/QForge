@@ -1,4 +1,4 @@
-# SQL Workbench
+# QForge
 
 A lightweight, cross-platform SQL database client built with Python and PySide6. A simple alternative to TablePlus for managing your databases.
 
@@ -115,7 +115,7 @@ python main.py
 ## Project Structure
 
 ```
-SQL-WorkBench/
+QForge/
 ├── main.py                          # Main application
 ├── requirements.txt                 # Python dependencies
 ├── connections.json                 # Saved database connections

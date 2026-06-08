@@ -1,23 +1,27 @@
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QEvent
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
     QTabWidget,
+    QStackedWidget,
     QLabel,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
     QPushButton,
     QLineEdit,
-    QComboBox
+    QComboBox,
+    QMessageBox,
+    QToolTip,
 )
-from PySide6.QtGui import QShortcut, QKeySequence
+from PySide6.QtGui import QShortcut, QKeySequence, QCursor
 from ui.advanced_filter_dialog import AdvancedFilterDialog
 from ui.theme_manager import ThemeManager
 
 from ui.sql_tab import SqlTab
 from utils.logger import get_logger
+from utils import col_widths as _cw
 
 logger = get_logger()
 
@@ -60,14 +64,119 @@ class TableViewWidget(QWidget):
     def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Table name header removed - already shown in tab title
-        
-        # Only show data tab - structure and query removed
-        # Use Cmd+T to open query editor in a new tab
+        layout.setSpacing(0)
+
+        # ── Stacked content: index 0 = Data, index 1 = Structure ────────────
+        self._view_stack = QStackedWidget()
         self.data_tab = self.create_data_tab()
-        layout.addWidget(self.data_tab)
-        
+        self.struct_tab = self.create_structure_tab()
+        self._view_stack.addWidget(self.data_tab)    # 0
+        self._view_stack.addWidget(self.struct_tab)  # 1
+        layout.addWidget(self._view_stack)
+
+        # ── Bottom bar ───────────────────────────────────────────────────────
+        _BTN_ACTIVE = (
+            "QPushButton { background:#0a7aff; color:#fff; border:none;"
+            " border-radius:4px; padding:3px 10px; font-size:12px;"
+            " font-weight:600; }"
+        )
+        _BTN_INACTIVE = (
+            "QPushButton { background:transparent; color:#aaaaaa; border:none;"
+            " border-radius:4px; padding:3px 10px; font-size:12px; }"
+            " QPushButton:hover { background:#3a3a3c; color:#ffffff; }"
+        )
+
+        bottom_bar = QWidget()
+        bottom_bar.setFixedHeight(32)
+        bb = QHBoxLayout(bottom_bar)
+        bb.setContentsMargins(6, 0, 6, 0)
+        bb.setSpacing(2)
+
+        self._btn_data = QPushButton("Data")
+        self._btn_structure = QPushButton("Structure")
+        self._btn_add_row = QPushButton("+ Row")
+        self._btn_data.setStyleSheet(_BTN_ACTIVE)
+        self._btn_structure.setStyleSheet(_BTN_INACTIVE)
+        self._btn_add_row.setStyleSheet(_BTN_INACTIVE)
+        self._btn_data.clicked.connect(self._show_data_view)
+        self._btn_structure.clicked.connect(self._show_structure_view)
+        self._btn_add_row.clicked.connect(lambda: self.data_table.add_new_row())
+
+        bb.addWidget(self._btn_data)
+        bb.addWidget(self._btn_structure)
+        bb.addSpacing(8)
+        bb.addWidget(self._btn_add_row)
+        bb.addStretch()
+
+        # Row count (center)
+        self.limit_label = QLabel("")
+        self.limit_label.setStyleSheet("color: gray; font-size: 11px;")
+        bb.addWidget(self.limit_label)
+        bb.addStretch()
+
+        # Pagination (right)
+        self.prev_btn = QPushButton("<")
+        self.prev_btn.clicked.connect(self.prev_page)
+        self.prev_btn.setEnabled(False)
+        self.prev_btn.setFixedWidth(30)
+        self.prev_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2d2d2d;
+                color: #cccccc;
+                border: 1px solid #404040;
+                border-radius: 3px;
+                padding: 5px;
+                font-size: 12px;
+            }
+            QPushButton:hover:enabled {
+                background-color: #3d3d3d;
+                border-color: #505050;
+            }
+            QPushButton:pressed {
+                background-color: #1d1d1d;
+            }
+            QPushButton:disabled {
+                background-color: #1e1e1e;
+                color: #666666;
+                border-color: #2d2d2d;
+            }
+        """)
+
+        self.page_label = QLabel("Page 1")
+        self.page_label.setStyleSheet("color: #cccccc; font-size: 11px; margin: 0 8px;")
+
+        self.next_btn = QPushButton(">")
+        self.next_btn.clicked.connect(self.next_page)
+        self.next_btn.setFixedWidth(30)
+        self.next_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2d2d2d;
+                color: #cccccc;
+                border: 1px solid #404040;
+                border-radius: 3px;
+                padding: 5px;
+                font-size: 12px;
+            }
+            QPushButton:hover:enabled {
+                background-color: #3d3d3d;
+                border-color: #505050;
+            }
+            QPushButton:pressed {
+                background-color: #1d1d1d;
+            }
+            QPushButton:disabled {
+                background-color: #1e1e1e;
+                color: #666666;
+                border-color: #2d2d2d;
+            }
+        """)
+
+        bb.addWidget(self.prev_btn)
+        bb.addWidget(self.page_label)
+        bb.addWidget(self.next_btn)
+
+        layout.addWidget(bottom_bar)
+
         # Load data initially
         self.load_table_data()
         
@@ -159,89 +268,28 @@ class TableViewWidget(QWidget):
         from ui.editable_table import EditableTableWidget
         self.data_table = EditableTableWidget()
         
+        # Server-side sort owns this table; disconnect the widget's built-in
+        # client-side sort handler to prevent the double-fire that corrupts state.
+        try:
+            self.data_table.horizontalHeader().sectionClicked.disconnect(
+                self.data_table.on_header_clicked
+            )
+        except Exception:
+            pass
+
         # Enable column sorting on header click
         self.data_table.horizontalHeader().sectionClicked.connect(self.on_column_header_clicked)
+
+        # Column-width memory: save whenever user resizes a column
+        self.data_table.horizontalHeader().sectionResized.connect(self._on_column_resized)
+
+        # Column stats tooltip on header hover
+        self.data_table.horizontalHeader().viewport().installEventFilter(self)
         
         layout.addWidget(self.data_table)
 
         # Notify parent when data is modified
         self.data_table.changes_made.connect(lambda: self.dirty_changed.emit(True))
-        
-        # Bottom controls - row count center, pagination right
-        bottom_controls = QHBoxLayout()
-        bottom_controls.setContentsMargins(3, 3, 3, 3)
-        bottom_controls.setSpacing(3)
-        
-        bottom_controls.addStretch()
-        
-        # Row count in center
-        self.limit_label = QLabel("")
-        self.limit_label.setStyleSheet("color: gray; font-size: 11px;")
-        bottom_controls.addWidget(self.limit_label)
-        
-        bottom_controls.addStretch()
-        
-        # Pagination on right with < > symbols
-        self.prev_btn = QPushButton("<")
-        self.prev_btn.clicked.connect(self.prev_page)
-        self.prev_btn.setEnabled(False)
-        self.prev_btn.setFixedWidth(30)
-        self.prev_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2d2d2d;
-                color: #cccccc;
-                border: 1px solid #404040;
-                border-radius: 3px;
-                padding: 5px;
-                font-size: 12px;
-            }
-            QPushButton:hover:enabled {
-                background-color: #3d3d3d;
-                border-color: #505050;
-            }
-            QPushButton:pressed {
-                background-color: #1d1d1d;
-            }
-            QPushButton:disabled {
-                background-color: #1e1e1e;
-                color: #666666;
-                border-color: #2d2d2d;
-            }
-        """)
-        bottom_controls.addWidget(self.prev_btn)
-        
-        self.page_label = QLabel("Page 1")
-        self.page_label.setStyleSheet("color: #cccccc; font-size: 11px; margin: 0 8px;")
-        bottom_controls.addWidget(self.page_label)
-        
-        self.next_btn = QPushButton(">")
-        self.next_btn.clicked.connect(self.next_page)
-        self.next_btn.setFixedWidth(30)
-        self.next_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2d2d2d;
-                color: #cccccc;
-                border: 1px solid #404040;
-                border-radius: 3px;
-                padding: 5px;
-                font-size: 12px;
-            }
-            QPushButton:hover:enabled {
-                background-color: #3d3d3d;
-                border-color: #505050;
-            }
-            QPushButton:pressed {
-                background-color: #1d1d1d;
-            }
-            QPushButton:disabled {
-                background-color: #1e1e1e;
-                color: #666666;
-                border-color: #2d2d2d;
-            }
-        """)
-        bottom_controls.addWidget(self.next_btn)
-        
-        layout.addLayout(bottom_controls)
         
         return widget
     
@@ -256,7 +304,33 @@ class TableViewWidget(QWidget):
         # Update data table theme
         if hasattr(self, 'data_table'):
             self.data_table.update_theme(is_dark)
-    
+
+    # ── Bottom-bar view switching ────────────────────────────────────────────
+    _BTN_ACTIVE = (
+        "QPushButton { background:#0a7aff; color:#fff; border:none;"
+        " border-radius:4px; padding:3px 10px; font-size:12px; font-weight:600; }"
+    )
+    _BTN_INACTIVE = (
+        "QPushButton { background:transparent; color:#aaaaaa; border:none;"
+        " border-radius:4px; padding:3px 10px; font-size:12px; }"
+        " QPushButton:hover { background:#3a3a3c; color:#ffffff; }"
+    )
+
+    def _show_data_view(self):
+        self._view_stack.setCurrentIndex(0)
+        self._btn_data.setStyleSheet(self._BTN_ACTIVE)
+        self._btn_structure.setStyleSheet(self._BTN_INACTIVE)
+        for w in (self.prev_btn, self.page_label, self.next_btn, self.limit_label):
+            w.show()
+
+    def _show_structure_view(self):
+        self._view_stack.setCurrentIndex(1)
+        self._btn_data.setStyleSheet(self._BTN_INACTIVE)
+        self._btn_structure.setStyleSheet(self._BTN_ACTIVE)
+        for w in (self.prev_btn, self.page_label, self.next_btn, self.limit_label):
+            w.hide()
+        self.load_table_structure()
+
     def create_structure_tab(self):
         """Create the structure viewing tab"""
         widget = QWidget()
@@ -356,8 +430,7 @@ class TableViewWidget(QWidget):
                 df = pd.DataFrame(columns=self.columns)
             
             self.data_table.load_data(df, table_name=self.table_name)
-            
-            # Update labels
+            self._restore_col_widths()
             total_pages = (self.total_rows + self.page_size - 1) // self.page_size
             self.page_label.setText(f"Page {self.current_page}/{max(1, total_pages)}")
             
@@ -657,7 +730,17 @@ class TableViewWidget(QWidget):
     def get_table_name(self):
         """Return the table name"""
         return self.table_name
-    
+
+    def filter_by_column_value(self, col_name: str, value: str):
+        """Instantly apply a WHERE col = value filter (column-value filter chip)."""
+        # Set the search box text to trigger the existing search/filter path
+        if hasattr(self, 'search_input'):
+            # Build a simple pseudo-filter: col:value
+            self.search_input.setText(f"{col_name}:{value}")
+        # If there's a direct filter row mechanism, populate it too
+        if hasattr(self, '_apply_column_filter'):
+            self._apply_column_filter(col_name, value)
+
     def save_changes(self):
         """Save all changes to the database (Cmd+S)"""
         logger.info("🔵 Cmd+S pressed - checking for changes...")
@@ -735,3 +818,60 @@ class TableViewWidget(QWidget):
                 f"Failed to save:\\n{str(e)}"
             )
             logger.error(f"Save failed: {str(e)}")
+
+    # ── Column width memory ───────────────────────────────────────────────────
+
+    def _restore_col_widths(self):
+        """Apply saved column widths after loading data."""
+        widths = _cw.load().get(self.table_name, {})
+        if not widths:
+            return
+        hdr = self.data_table.horizontalHeader()
+        for i, col in enumerate(self.columns):
+            if col in widths:
+                hdr.resizeSection(i, widths[col])
+
+    def _on_column_resized(self, logical_idx: int, _old: int, new_w: int):
+        """Persist column width whenever the user drags a header separator."""
+        if not self.columns or logical_idx >= len(self.columns):
+            return
+        all_w = _cw.load()
+        tbl = all_w.get(self.table_name, {})
+        tbl[self.columns[logical_idx]] = new_w
+        all_w[self.table_name] = tbl
+        _cw.save(all_w)
+
+    # ── Column stats tooltip ──────────────────────────────────────────────────
+
+    def eventFilter(self, obj, event):
+        """Show column statistics tooltip when hovering over a header section."""
+        if (obj is self.data_table.horizontalHeader().viewport()
+                and event.type() == QEvent.ToolTip):
+            hdr = self.data_table.horizontalHeader()
+            logical = hdr.logicalIndexAt(event.pos())
+            if 0 <= logical < len(self.columns):
+                tip = self._col_stats_tooltip(self.columns[logical], logical)
+                if tip:
+                    QToolTip.showText(QCursor.pos(), tip, obj)
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _col_stats_tooltip(self, col_name: str, col_idx: int) -> str:
+        """Compute min/max/avg/nulls for a column from the loaded data."""
+        try:
+            import pandas as pd
+            df = self.data_table.original_data
+            if df is None or df.empty or col_idx >= len(df.columns):
+                return ""
+            series = df.iloc[:, col_idx]
+            total = len(series)
+            nulls = int(series.isna().sum())
+            lines = [f"<b>{col_name}</b>", f"Rows: {total}  |  Nulls: {nulls}"]
+            numeric = pd.to_numeric(series, errors="coerce").dropna()
+            if len(numeric) > 0:
+                lines.append(
+                    f"Min: {numeric.min():.4g}  |  Max: {numeric.max():.4g}  |  Avg: {numeric.mean():.4g}"
+                )
+            return "<br>".join(lines)
+        except Exception:
+            return ""

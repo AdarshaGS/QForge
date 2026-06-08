@@ -275,6 +275,77 @@ class DbService:
                 return self._execute_query_raw(query)
             raise
 
+    def execute_multi_query(self, script: str) -> list[tuple[str, object]]:
+        """Split *script* on ';', execute each non-empty statement.
+        Returns list of (label, DataFrame|None) tuples — one per result-producing stmt.
+        Non-SELECT statements produce (label, None).
+        """
+        import sqlparse
+        results: list[tuple[str, object]] = []
+        stmts = [s.strip() for s in sqlparse.split(script) if s.strip()]
+        for stmt in stmts:
+            kw = stmt.split()[0].upper() if stmt.split() else ""
+            label = stmt[:40].replace("\n", " ").strip() + ("…" if len(stmt) > 40 else "")
+            if kw in ("SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "WITH"):
+                try:
+                    df = self.execute_query(stmt)
+                    results.append((label, df))
+                except Exception as ex:
+                    results.append((label, ex))
+            else:
+                try:
+                    self.execute_update(stmt)
+                    results.append((label, None))
+                except Exception as ex:
+                    results.append((label, ex))
+        return results
+
+    def get_foreign_keys(self, table_name: str) -> list[dict]:
+        """Return FK definitions for *table_name*.
+        Each dict has keys: column, ref_table, ref_column.
+        """
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+                    FROM information_schema.KEY_COLUMN_USAGE
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = %s
+                      AND REFERENCED_TABLE_NAME IS NOT NULL
+                """, (table_name,))
+                rows = cursor.fetchall()
+                cursor.close()
+                return [{"column": list(r.values())[0],
+                         "ref_table": list(r.values())[1],
+                         "ref_column": list(r.values())[2]} for r in rows]
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT kcu.column_name,
+                           ccu.table_name  AS ref_table,
+                           ccu.column_name AS ref_column
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                         ON tc.constraint_name = kcu.constraint_name
+                    JOIN information_schema.constraint_column_usage ccu
+                         ON ccu.constraint_name = tc.constraint_name
+                    WHERE tc.constraint_type = 'FOREIGN KEY'
+                      AND tc.table_name = %s
+                """, (table_name,))
+                rows = cursor.fetchall()
+                cursor.close()
+                return [{"column": r[0], "ref_table": r[1], "ref_column": r[2]} for r in rows]
+            elif self.db_type == "sqlite":
+                cursor = self.connection.cursor()
+                cursor.execute(f"PRAGMA foreign_key_list({table_name})")
+                rows = cursor.fetchall()
+                cursor.close()
+                return [{"column": r[3], "ref_table": r[2], "ref_column": r[4]} for r in rows]
+        except Exception:
+            pass
+        return []
+
     def _execute_query_raw(self, query):
         """Internal: run SELECT without reconnect logic."""
         if self.db_type == "mysql":

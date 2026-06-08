@@ -47,6 +47,7 @@ QMenu {{
 QMenu::item {{ padding: 6px 24px 6px 14px; border-radius: 4px; }}
 QMenu::item:selected {{ background: {A}; color: #fff; }}
 QMenu::separator {{ height: 1px; background: #3a3a3c; margin: 3px 8px; }}
+QMenu::right-arrow {{ width: 6px; height: 6px; }}
 
 /* ── Sidebar tree ───────────────────────────────────────────────── */
 QTreeWidget {{
@@ -99,19 +100,26 @@ QTabBar::tab:selected {{
 QTabBar::tab:hover:!selected {{ color: #c7c7cc; background: #3a3a3c22; }}
 QTabBar::close-button {{
     subcontrol-position: right;
-    padding: 2px;
+    subcontrol-origin: padding;
+    width: 16px;
+    height: 16px;
     border-radius: 3px;
+    image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'><line x1='4' y1='4' x2='12' y2='12' stroke='%23c7c7cc' stroke-width='2' stroke-linecap='round'/><line x1='12' y1='4' x2='4' y2='12' stroke='%23c7c7cc' stroke-width='2' stroke-linecap='round'/></svg>");
 }}
-QTabBar::close-button:hover {{ background: #ff453a33; }}
-
-/* ── Connection tab bar (top-level) ─────────────────────────────── */
+QTabBar::close-button:hover {{
+    background: #ff453a44;
+    border-radius: 3px;
+    image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'><line x1='4' y1='4' x2='12' y2='12' stroke='%23ff6b6b' stroke-width='2.5' stroke-linecap='round'/><line x1='12' y1='4' x2='4' y2='12' stroke='%23ff6b6b' stroke-width='2.5' stroke-linecap='round'/></svg>");
+}}
 QTabBar#conn_tab_bar::tab {{
     background: transparent;
     color: #8e8e93;
     padding: 6px 14px;
     border: none;
     border-bottom: 2px solid transparent;
+    border-right: 1px solid #3a3a3c;
     font-size: 12px;
+    margin-right: 2px;
 }}
 QTabBar#conn_tab_bar::tab:selected {{
     color: #e5e5ea;
@@ -300,6 +308,7 @@ QMenu {{
 }}
 QMenu::item {{ padding: 6px 24px 6px 14px; border-radius: 4px; }}
 QMenu::item:selected {{ background: {A}; color: #fff; }}
+QMenu::right-arrow {{ width: 6px; height: 6px; }}
 
 QTreeWidget {{
     background: #f2f2f7; color: #1c1c1e;
@@ -318,6 +327,19 @@ QTabBar::tab {{
 }}
 QTabBar::tab:selected {{ color: #1c1c1e; border-bottom: 2px solid {A}; background: #ffffff; }}
 QTabBar::tab:hover:!selected {{ color: #1c1c1e; }}
+QTabBar::close-button {{
+    subcontrol-position: right;
+    subcontrol-origin: padding;
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+    image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'><line x1='4' y1='4' x2='12' y2='12' stroke='%23555' stroke-width='2' stroke-linecap='round'/><line x1='12' y1='4' x2='4' y2='12' stroke='%23555' stroke-width='2' stroke-linecap='round'/></svg>");
+}}
+QTabBar::close-button:hover {{
+    background: #ff3b3044;
+    border-radius: 3px;
+    image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'><line x1='4' y1='4' x2='12' y2='12' stroke='%23ff3b30' stroke-width='2.5' stroke-linecap='round'/><line x1='12' y1='4' x2='4' y2='12' stroke='%23ff3b30' stroke-width='2.5' stroke-linecap='round'/></svg>");
+}}
 
 QPlainTextEdit, QTextEdit {{
     background: #ffffff; color: #1c1c1e; border: none;

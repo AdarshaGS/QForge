@@ -7,8 +7,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabBar, QStackedWidget, QPushButton, QMessageBox, QProgressDialog,
+    QMenu,
 )
-from PySide6.QtGui import QShortcut, QKeySequence
+from PySide6.QtGui import QShortcut, QKeySequence, QColor
 
 from services.db_service import DbService
 from services.query_history import QueryHistory
@@ -16,6 +17,7 @@ from ui.connection_dialog import ConnectionDialog
 from ui.connection_panel import ConnectionPanel
 from ui.theme_manager import ThemeManager
 from utils.logger import setup_logger, get_logger
+from utils.updater import UpdateChecker, APP_VERSION
 
 logger = setup_logger()
 
@@ -60,13 +62,38 @@ class MainWindow(QMainWindow):
             lambda: self._current_panel() and self._current_panel().refresh_current_view()
         )
         QShortcut(QKeySequence("Ctrl+W"), self).activated.connect(
-            self._close_current_content_tab
+            self._smart_close
         )
         QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(
             lambda: self._prompt_new_connection()
         )
 
         self.restore_session()
+        self._start_update_check()
+
+    # ─── Update checker ───────────────────────────────────────────────────────
+
+    def _start_update_check(self):
+        self._update_checker = UpdateChecker()
+        self._update_checker.update_available.connect(self._on_update_available)
+        self._update_checker.start()
+        self._release_url = ""
+
+    def _on_update_available(self, tag: str, url: str):
+        self._release_url = url
+        self._update_label.setText(
+            f"\u2B06  QForge {tag} is available \u2014 click to download"
+        )
+        self._update_banner.show()
+
+    def _open_release_url(self):
+        if self._release_url:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(self._release_url))
+
+    def _dismiss_update_banner(self):
+        self._update_banner.hide()
 
     # ─── UI ──────────────────────────────────────────────────────────────────
 
@@ -90,16 +117,33 @@ class MainWindow(QMainWindow):
         tab_row_layout.setSpacing(0)
 
         self.conn_tab_bar = QTabBar()
+        self.conn_tab_bar.setObjectName("conn_tab_bar")
         self.conn_tab_bar.setTabsClosable(True)
         self.conn_tab_bar.setMovable(True)
         self.conn_tab_bar.tabCloseRequested.connect(self._close_connection_tab)
         self.conn_tab_bar.currentChanged.connect(self._on_connection_tab_changed)
+        # Right-click context menu on connection tabs
+        self.conn_tab_bar.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.conn_tab_bar.customContextMenuRequested.connect(self._conn_tab_context_menu)
         tab_row_layout.addWidget(self.conn_tab_bar, 1)
 
-        add_conn_btn = QPushButton("+")
+        add_conn_btn = QPushButton("＋")
         add_conn_btn.setToolTip("Open new connection (Ctrl+N)")
-        add_conn_btn.setFixedSize(28, 28)
+        add_conn_btn.setFixedSize(30, 26)
         add_conn_btn.clicked.connect(self._prompt_new_connection)
+        add_conn_btn.setStyleSheet("""
+            QPushButton {
+                background: #2c2c2e;
+                color: #e5e5ea;
+                border: 1px solid #48484a;
+                border-radius: 6px;
+                font-size: 16px;
+                font-weight: 400;
+                padding: 0;
+            }
+            QPushButton:hover  { background: #3a3a3c; color: #ffffff; border-color: #636366; }
+            QPushButton:pressed { background: #1c1c1e; }
+        """)
         tab_row_layout.addWidget(add_conn_btn)
 
         root.addWidget(tab_row)
@@ -107,6 +151,40 @@ class MainWindow(QMainWindow):
         # ── Stacked panel area ────────────────────────────────────────────────
         self.stack = QStackedWidget()
         root.addWidget(self.stack)
+
+        # ── Update notification banner (hidden until an update is found) ──────
+        self._update_banner = QWidget()
+        self._update_banner.setFixedHeight(36)
+        self._update_banner.hide()
+        self._update_banner.setStyleSheet(
+            "background:#1c3a1c; border-bottom:1px solid #2d6a2d;"
+        )
+        banner_layout = QHBoxLayout(self._update_banner)
+        banner_layout.setContentsMargins(12, 0, 8, 0)
+        banner_layout.setSpacing(8)
+
+        self._update_label = QPushButton()
+        self._update_label.setFlat(True)
+        self._update_label.setCursor(Qt.PointingHandCursor)
+        self._update_label.setStyleSheet(
+            "color:#5cdb5c; font-size:13px; font-weight:600;"
+            " text-align:left; border:none; background:transparent;"
+        )
+        self._update_label.clicked.connect(self._open_release_url)
+        banner_layout.addWidget(self._update_label, 1)
+
+        dismiss_btn = QPushButton("✕")
+        dismiss_btn.setFixedSize(22, 22)
+        dismiss_btn.setFlat(True)
+        dismiss_btn.setCursor(Qt.PointingHandCursor)
+        dismiss_btn.setStyleSheet(
+            "color:#5cdb5c; font-size:12px; border:none; background:transparent;"
+            " QPushButton:hover{color:#ffffff;}"
+        )
+        dismiss_btn.clicked.connect(self._dismiss_update_banner)
+        banner_layout.addWidget(dismiss_btn)
+
+        root.addWidget(self._update_banner)
 
         self.statusBar().hide()
 
@@ -125,6 +203,13 @@ class MainWindow(QMainWindow):
         self.conn_tab_bar.setCurrentIndex(tab_idx)
         self.stack.setCurrentWidget(panel)
         self._update_window_title()
+        # Wire health indicator and reconnect toast
+        panel.health_changed.connect(
+            lambda status, p=panel: self._on_health_changed(p, status)
+        )
+        panel.reconnected.connect(self._show_reconnect_toast)
+        # Set initial green dot immediately
+        self._on_health_changed(panel, 'idle')
 
     def _on_connection_tab_changed(self, index: int):
         if 0 <= index < len(self._panels):
@@ -183,28 +268,64 @@ class MainWindow(QMainWindow):
                     progress.close()
                 QMessageBox.critical(None, "Connection Error", str(ex))
 
-    # ─── Close connection tab ─────────────────────────────────────────────────
+    # ─── Close connection tab ────────────────────────────────────────────────
 
     def _close_connection_tab(self, index: int):
-        if len(self._panels) == 1:
+        if len(self._panels) <= 1:
             QMessageBox.warning(self, "Warning",
                                 "Cannot close the last connection.")
             return
+        self._close_connection_at(index)
 
-        panel = self._panels[index]
-        reply = QMessageBox.question(
-            self, "Close Connection",
-            f"Close connection to '{panel.label}'?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
+    def _close_connection_at(self, index: int):
+        """Close the connection panel at *index* without confirmation."""
+        if index < 0 or index >= len(self._panels):
             return
-
+        panel = self._panels[index]
         panel.disconnect()
         self.stack.removeWidget(panel)
         panel.deleteLater()
         self._panels.pop(index)
         self.conn_tab_bar.removeTab(index)
+
+    def _close_other_connections(self, keep_index: int):
+        """Close all connection tabs except the one at *keep_index*."""
+        if len(self._panels) <= 1:
+            return
+        for i in reversed(range(len(self._panels))):
+            if i != keep_index:
+                self._close_connection_at(i)
+
+    def _smart_close(self):
+        """Cmd+W: close current content tab; if none, close the connection."""
+        panel = self._current_panel()
+        if not panel:
+            return
+        if panel.tabs.count() > 0:
+            idx = panel.tabs.currentIndex()
+            if idx >= 0:
+                panel.tabs.removeTab(idx)
+        else:
+            self._close_connection_tab(self.conn_tab_bar.currentIndex())
+
+    def _conn_tab_context_menu(self, pos):
+        """Right-click menu on a connection tab."""
+        idx = self.conn_tab_bar.tabAt(pos)
+        if idx < 0:
+            return
+        menu = QMenu(self)
+        close_act = menu.addAction("Close Connection")
+        close_others_act = menu.addAction("Close Other Connections")
+        close_others_act.setEnabled(len(self._panels) > 1)
+        action = menu.exec(self.conn_tab_bar.mapToGlobal(pos))
+        if action == close_act:
+            if len(self._panels) <= 1:
+                QMessageBox.warning(self, "Warning",
+                                    "Cannot close the last connection.")
+            else:
+                self._close_connection_at(idx)
+        elif action == close_others_act:
+            self._close_other_connections(keep_index=idx)
 
     def _close_current_content_tab(self):
         panel = self._current_panel()
@@ -247,7 +368,80 @@ class MainWindow(QMainWindow):
             if panel:
                 panel.restore_session_tabs(entry.get("tabs", []))
 
+        # Restore pinned tabs for all panels (persists across sessions)
+        for panel in self._panels:
+            panel.restore_pinned_tabs()
+
         logger.info("Session restored")
+
+    # ─── Connection health indicator ───────────────────────────────────────────────
+
+    _HEALTH_DOT = {'idle': '● ', 'running': '● ', 'disconnected': '● '}
+    _HEALTH_COLOR = {
+        'idle':         '#30d158',  # green
+        'running':      '#ff9f0a',  # amber
+        'disconnected': '#ff453a',  # red
+    }
+
+    def _on_health_changed(self, panel: ConnectionPanel, status: str):
+        try:
+            idx = self._panels.index(panel)
+        except ValueError:
+            return
+        dot   = self._HEALTH_DOT.get(status, '● ')
+        color = self._HEALTH_COLOR.get(status, '#8e8e93')
+        base_label = panel.label
+        self.conn_tab_bar.setTabText(idx, dot + base_label)
+        self.conn_tab_bar.setTabTextColor(idx, QColor(color))
+
+    # ─── Reconnect toast ───────────────────────────────────────────────────────────
+
+    def _show_reconnect_toast(self, message: str):
+        """Briefly show a green banner at the top when a dropped connection recovers."""
+        # Re-use the update banner widget (already exists, different style)
+        from PySide6.QtCore import QTimer
+        self._update_label.setText(f"↺  {message}")
+        self._update_banner.setStyleSheet(
+            "background:#1c2e1c; border-bottom:1px solid #2d5a2d;"
+        )
+        self._update_banner.show()
+        QTimer.singleShot(4000, self._dismiss_update_banner)
+
+    def _check_for_updates_manual(self):
+        """Triggered by Help → Check for Updates. Shows a dialog with result."""
+        from PySide6.QtCore import QEventLoop
+        checker = UpdateChecker()
+        found = {"tag": None, "url": None}
+
+        def _got(tag, url):
+            found["tag"] = tag
+            found["url"] = url
+
+        checker.update_available.connect(_got)
+        checker.start()
+        checker.wait(10_000)   # max 10 s
+
+        if found["tag"]:
+            self._release_url = found["url"]
+            self._update_label.setText(
+                f"\u2B06  QForge {found['tag']} is available \u2014 click to download"
+            )
+            self._update_banner.show()
+            reply = QMessageBox.question(
+                self,
+                "Update Available",
+                f"QForge <b>{found['tag']}</b> is available.\n\n"
+                f"You are on <b>v{APP_VERSION}</b>.\n\nOpen the download page?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                self._open_release_url()
+        else:
+            QMessageBox.information(
+                self,
+                "No Updates",
+                f"You are on the latest version (v{APP_VERSION}).",
+            )
 
     def closeEvent(self, event):
         self.save_session()
@@ -333,6 +527,11 @@ class MainWindow(QMainWindow):
         help_menu = menubar.addMenu("Help")
         act = help_menu.addAction("Keyboard Shortcuts")
         act.triggered.connect(self._show_shortcuts)
+
+        help_menu.addSeparator()
+
+        act = help_menu.addAction("Check for Updates…")
+        act.triggered.connect(self._check_for_updates_manual)
 
     # ─── Theme ───────────────────────────────────────────────────────────────
 

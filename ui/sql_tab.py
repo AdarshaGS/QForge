@@ -1,7 +1,7 @@
 import pandas as pd
 import sqlparse
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -93,6 +93,9 @@ def _sql_error_hint(message: str, query: str = "") -> str:
 
 class SqlTab(QWidget):
 
+    # Emitted when user confirms inline edits — parent executes the SQL
+    commit_sql = Signal(list)  # list of SQL strings
+
     def __init__(self):
         super().__init__()
 
@@ -101,6 +104,19 @@ class SqlTab(QWidget):
         self.filter_visible = False
         self.filter_conditions = []  # List of (column, operator, value) tuples
         self.original_df = None  # Store original unfiltered data
+
+        # Pagination state for result table
+        self._result_page_size = 500
+        self._result_page      = 0
+        self._result_view_df   = None   # current sorted/filtered full dataset
+        self._result_sort_col  = -1
+        self._result_sort_asc  = True
+
+        # Extra features
+        self._format_on_run = False   # auto-beautify SQL before executing
+        self._prev_df       = None    # previous result set for diff
+        self._diff_active   = False   # diff mode toggle
+        self.pinned         = False   # favourite / pinned tab
 
         self.init_ui()
         
@@ -163,6 +179,67 @@ class SqlTab(QWidget):
         snip_btn.clicked.connect(self._open_snippet_editor)
         run_layout.addWidget(snip_btn)
 
+        # ── Format on Run toggle ──
+        self.fmt_run_btn = QPushButton("⌨ Auto-Format")
+        self.fmt_run_btn.setFixedHeight(28)
+        self.fmt_run_btn.setCheckable(True)
+        self.fmt_run_btn.setToolTip("Auto-beautify SQL before every run (Ctrl+Shift+F)")
+        self.fmt_run_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #8e8e93;
+                border: 1px solid #3a3a3c;
+                border-radius: 5px;
+                padding: 0 10px;
+                font-size: 12px;
+            }
+            QPushButton:checked { color: #30d158; border-color: #30d158; }
+            QPushButton:hover   { color: #e5e5ea; border-color: #636366; }
+        """)
+        self.fmt_run_btn.toggled.connect(lambda v: setattr(self, '_format_on_run', v))
+        run_layout.addWidget(self.fmt_run_btn)
+
+        # ── Diff toggle ──
+        self.diff_btn = QPushButton("≠ Diff")
+        self.diff_btn.setFixedHeight(28)
+        self.diff_btn.setCheckable(True)
+        self.diff_btn.setToolTip("Highlight changes between last two query results")
+        self.diff_btn.setEnabled(False)
+        self.diff_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #8e8e93;
+                border: 1px solid #3a3a3c;
+                border-radius: 5px;
+                padding: 0 10px;
+                font-size: 12px;
+            }
+            QPushButton:checked { color: #ff9f0a; border-color: #ff9f0a; }
+            QPushButton:hover   { color: #e5e5ea; border-color: #636366; }
+            QPushButton:disabled { color: #48484a; border-color: #2c2c2e; }
+        """)
+        self.diff_btn.toggled.connect(self._on_diff_toggled)
+        run_layout.addWidget(self.diff_btn)
+
+        # ── Pin / favourite toggle ──
+        self.pin_btn = QPushButton("★")
+        self.pin_btn.setFixedSize(28, 28)
+        self.pin_btn.setCheckable(True)
+        self.pin_btn.setToolTip("Pin this tab — it will reopen on next launch")
+        self.pin_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #636366;
+                border: 1px solid #3a3a3c;
+                border-radius: 5px;
+                font-size: 14px;
+            }
+            QPushButton:checked { color: #ffd60a; border-color: #ffd60a; }
+            QPushButton:hover   { color: #e5e5ea; border-color: #636366; }
+        """)
+        self.pin_btn.toggled.connect(self._on_pin_toggled)
+        run_layout.addWidget(self.pin_btn)
+
         run_layout.addStretch()
 
         self.cancel_btn = QPushButton("Cancel")
@@ -198,10 +275,45 @@ class SqlTab(QWidget):
             QPushButton:pressed { background: #0066CC; }
         """)
         run_layout.addWidget(self.run_btn)
-        
-        # ==================================
-        # FILTER BAR (Similar to TablePlus)
-        # ==================================
+
+        # ── Find / Replace bar (Cmd+H, hidden by default) ────────────────────
+        self._find_bar = QWidget()
+        self._find_bar.hide()
+        fb_layout = QHBoxLayout(self._find_bar)
+        fb_layout.setContentsMargins(6, 4, 6, 4)
+        fb_layout.setSpacing(6)
+        self._find_input   = QLineEdit()
+        self._find_input.setPlaceholderText("Find…")
+        self._find_input.setFixedHeight(26)
+        self._replace_input = QLineEdit()
+        self._replace_input.setPlaceholderText("Replace with…")
+        self._replace_input.setFixedHeight(26)
+        _btn_style = "QPushButton{padding:0 10px;height:26px;border:1px solid #3a3a3c;border-radius:4px;background:transparent;color:#e5e5ea;font-size:12px;}QPushButton:hover{background:#3a3a3c;}"
+        _find_next_btn    = QPushButton("Next")
+        _find_next_btn.setStyleSheet(_btn_style)
+        _replace_btn      = QPushButton("Replace")
+        _replace_btn.setStyleSheet(_btn_style)
+        _replace_all_btn  = QPushButton("All")
+        _replace_all_btn.setStyleSheet(_btn_style)
+        _close_find_btn   = QPushButton("✕")
+        _close_find_btn.setFixedSize(22, 22)
+        _close_find_btn.setStyleSheet("QPushButton{border:none;background:transparent;color:#8e8e93;font-size:14px;}")
+        fb_layout.addWidget(QLabel("Find:"))
+        fb_layout.addWidget(self._find_input, 2)
+        fb_layout.addWidget(QLabel("Replace:"))
+        fb_layout.addWidget(self._replace_input, 2)
+        fb_layout.addWidget(_find_next_btn)
+        fb_layout.addWidget(_replace_btn)
+        fb_layout.addWidget(_replace_all_btn)
+        fb_layout.addStretch()
+        fb_layout.addWidget(_close_find_btn)
+        _find_next_btn.clicked.connect(self._find_next)
+        _replace_btn.clicked.connect(self._replace_current)
+        _replace_all_btn.clicked.connect(self._replace_all)
+        _close_find_btn.clicked.connect(self._hide_find_bar)
+        self._find_input.returnPressed.connect(self._find_next)
+
+        # ── Top widget assembly ───────────────────────────────────────────────
         
         self.filter_container = QWidget()
         self.filter_container.hide()
@@ -297,36 +409,66 @@ class SqlTab(QWidget):
         self.result_table = EditableTableWidget()
 
         # remove serial number column
+        self.result_table.verticalHeader().setVisible(False)
+        self.result_table.setAlternatingRowColors(True)
 
-        self.result_table.verticalHeader().setVisible(
-            False
+        # Client-side sort is managed by SqlTab (pagination-aware);
+        # disable EditableTableWidget's own handler to prevent double-fire.
+        self.result_table.setSortingEnabled(False)
+        try:
+            self.result_table.horizontalHeader().sectionClicked.disconnect(
+                self.result_table.on_header_clicked
+            )
+        except Exception:
+            pass
+        self.result_table.horizontalHeader().sectionClicked.connect(
+            self._on_result_sort
         )
 
-        self.result_table.setAlternatingRowColors(
-            True
-        )
-
-        self.result_table.setSortingEnabled(
-            True
-        )
-        
         # Connect filter signal
         self.result_table.filter_changed.connect(self.on_filter_changed)
-        
+
+        # Wire filter-chip: clicking a cell value pre-fills the filter row
+        self.result_table.filter_by_value.connect(self._on_result_filter_chip)
+        # Wire structure viewer signal (routed up to parent ConnectionPanel)
+        self.result_table.show_structure.connect(self._on_result_show_structure)
+
         # Hide results table by default - only show after query execution
         self.result_table.hide()
+
+        # ── Pagination bar ─────────────────────────────────────────────
+        self._pagination_bar = QWidget()
+        self._pagination_bar.hide()
+        _pag_layout = QHBoxLayout(self._pagination_bar)
+        _pag_layout.setContentsMargins(6, 2, 6, 2)
+        _pag_layout.setSpacing(6)
+
+        self._prev_page_btn = QPushButton('◀ Prev')
+        self._prev_page_btn.setFixedWidth(70)
+        self._prev_page_btn.clicked.connect(self._prev_result_page)
+        _pag_layout.addWidget(self._prev_page_btn)
+
+        self._page_label = QLabel('')
+        self._page_label.setAlignment(Qt.AlignCenter)
+        _pag_layout.addWidget(self._page_label, 1)
+
+        self._next_page_btn = QPushButton('Next ▶')
+        self._next_page_btn.setFixedWidth(70)
+        self._next_page_btn.clicked.connect(self._next_result_page)
+        _pag_layout.addWidget(self._next_page_btn)
 
         # ==================================
         # ADD TO LAYOUT WITH SPLITTER
         # ==================================
         
-        # Top widget: editor + run button
+        # Top widget: editor + run button + find/replace bar
         top_widget = QWidget()
         top_layout = QVBoxLayout()
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(2)
         top_layout.addWidget(self.editor)
         top_layout.addLayout(run_layout)
+        top_layout.addWidget(self._find_bar)
         top_widget.setLayout(top_layout)
         
         # Bottom widget: filter + status + results
@@ -337,6 +479,7 @@ class SqlTab(QWidget):
         bottom_layout.addWidget(self.filter_container)
         bottom_layout.addWidget(self.status_label)
         bottom_layout.addWidget(self.result_table)
+        bottom_layout.addWidget(self._pagination_bar)
         bottom_widget.setLayout(bottom_layout)
         
         # Add widgets to splitter
@@ -363,7 +506,15 @@ class SqlTab(QWidget):
         
         self.minify_shortcut = QShortcut(QKeySequence("Ctrl+Shift+I"), self)
         self.minify_shortcut.activated.connect(self.minify_sql)
-        
+
+        # Ctrl+H — find & replace
+        self.find_shortcut = QShortcut(QKeySequence("Ctrl+H"), self)
+        self.find_shortcut.activated.connect(self._toggle_find_bar)
+
+        # Ctrl+Shift+F — toggle format-on-run
+        self.fmt_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
+        self.fmt_shortcut.activated.connect(lambda: self.fmt_run_btn.toggle())
+
         # Add keyboard shortcut for save (Cmd+S)
         self.save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         self.save_shortcut.activated.connect(self.save_changes)
@@ -533,8 +684,7 @@ class SqlTab(QWidget):
         )
         
         if reply == QMessageBox.Yes:
-            # Signal parent to execute the SQL
-            self.pending_commit_sql = all_sql
+            self.commit_sql.emit(all_sql)
             self.commit_btn.setEnabled(False)
     
     def revert_changes(self):
@@ -599,28 +749,97 @@ class SqlTab(QWidget):
         dataframe: pd.DataFrame,
         table_name=None
     ):
+        # ── Teardown any active multi-result tab bar ──────────────────────────
+        if hasattr(self, '_multi_result_bar') and self._multi_result_bar is not None:
+            self._multi_result_bar.hide()
 
+        # Keep previous result for diff before overwriting
+        if self.current_df is not None:
+            self._prev_df = self.current_df.copy()
+            self.diff_btn.setEnabled(True)
         self.current_df = dataframe
         self.original_df = dataframe.copy()  # Store original for filtering
         self.current_table_name = table_name
-        
+
+        # Reset pagination + sort state for new query results
+        self._result_view_df  = dataframe.copy()
+        self._result_page     = 0
+        self._result_sort_col = -1
+        self._result_sort_asc = True
+        self.result_table.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
+
         # Update filter column options
         if len(dataframe.columns) > 0:
             self._update_filter_columns(list(dataframe.columns))
-        
-        # Show results table when data is loaded
+
+        # Show results + pagination bar
         self.result_table.show()
-        
-        # Load into editable table
-        self.result_table.load_data(dataframe, table_name)
-        
-        # Add filter headers
-        if dataframe is not None and not dataframe.empty:
-            self.add_filter_headers()
-        
+        self._pagination_bar.show()
+
+        self._refresh_result_view()
+
         # Update button states
         self.commit_btn.setEnabled(False)
         self.revert_btn.setEnabled(False)
+
+    def load_multi_results(self, results: list, elapsed: float):
+        """Show multiple SELECT results as a horizontal tab bar above the grid."""
+        if not results:
+            return
+
+        # Build or rebuild the multi-result bar
+        if not hasattr(self, '_multi_result_bar') or self._multi_result_bar is None:
+            from PySide6.QtWidgets import QTabBar
+            bar = QTabBar()
+            bar.setExpanding(False)
+            bar.setStyleSheet(
+                "QTabBar::tab { padding: 3px 12px; font-size: 11px; }"
+                "QTabBar::tab:selected { font-weight: bold; }"
+            )
+            # Insert above result_table in bottom layout
+            parent_layout = self.result_table.parent().layout()
+            if parent_layout:
+                idx = parent_layout.indexOf(self.result_table)
+                parent_layout.insertWidget(idx, bar)
+            self._multi_result_bar = bar
+            self._multi_results: list = []
+            bar.currentChanged.connect(self._on_multi_result_tab)
+        else:
+            bar = self._multi_result_bar
+            bar.blockSignals(True)
+            while bar.count():
+                bar.removeTab(0)
+            bar.blockSignals(False)
+
+        self._multi_results = results
+        bar.blockSignals(True)
+        for i, (lbl, df) in enumerate(results):
+            short = lbl[:30] + ("…" if len(lbl) > 30 else "")
+            bar.addTab(f"Result {i+1}: {short}")
+        bar.blockSignals(False)
+        bar.show()
+
+        # Show first result
+        bar.setCurrentIndex(0)
+        self._on_multi_result_tab(0)
+        self.update_status(sum(len(df) for _, df in results), elapsed)
+
+    def _on_multi_result_tab(self, index: int):
+        if not hasattr(self, '_multi_results') or index >= len(self._multi_results):
+            return
+        _, df = self._multi_results[index]
+        if isinstance(df, Exception):
+            self.show_error(str(df))
+            return
+        self.current_df = df
+        self.original_df = df.copy()
+        self._result_view_df = df.copy()
+        self._result_page = 0
+        if len(df.columns) > 0:
+            self._update_filter_columns(list(df.columns))
+        self.result_table.show()
+        self._refresh_result_view()
+
     
     def add_filter_headers(self):
         """Add filter input boxes to column headers"""
@@ -633,6 +852,83 @@ class SqlTab(QWidget):
             # Note: QTableWidget doesn't support setCellWidget for headers directly
             # Instead, we'll use the inline filtering in the table itself
     
+
+    # ── Pagination helpers for SQL result table ───────────────────────────
+
+    def _refresh_result_view(self):
+        """Display the current page of _result_view_df in result_table.
+
+        Only 500 rows are rendered at a time so the main thread is never
+        blocked building a 14k-row QTableWidget.
+        """
+        df = self._result_view_df
+        if df is None or df.empty:
+            self.result_table.load_data(df, self.current_table_name)
+            self._pagination_bar.hide()
+            return
+
+        page_size  = self._result_page_size
+        total_rows = len(df)
+        total_pages = max(1, (total_rows + page_size - 1) // page_size)
+        self._result_page = max(0, min(self._result_page, total_pages - 1))
+
+        start = self._result_page * page_size
+        end   = min(start + page_size, total_rows)
+        page_df = df.iloc[start:end].reset_index(drop=True)
+
+        self.result_table.load_data(page_df, self.current_table_name)
+
+        # Re-apply sort indicator so it survives load_data reset
+        if self._result_sort_col >= 0:
+            order = Qt.AscendingOrder if self._result_sort_asc else Qt.DescendingOrder
+            self.result_table.horizontalHeader().setSortIndicator(
+                self._result_sort_col, order
+            )
+
+        # Update pagination controls
+        self._page_label.setText(
+            f"Page {self._result_page + 1} of {total_pages}  "
+            f"({start + 1}–{end} of {total_rows} rows)"
+        )
+        self._prev_page_btn.setEnabled(self._result_page > 0)
+        self._next_page_btn.setEnabled(self._result_page < total_pages - 1)
+        self._pagination_bar.setVisible(total_pages > 1)
+
+    def _on_result_sort(self, col: int):
+        """Sort the full result dataset by column *col* then refresh page 0."""
+        if self._result_view_df is None or self._result_view_df.empty:
+            return
+        # Block sort when there are unsaved cell edits
+        if self.result_table.has_changes():
+            return
+
+        if self._result_sort_col == col:
+            self._result_sort_asc = not self._result_sort_asc
+        else:
+            self._result_sort_col = col
+            self._result_sort_asc = True
+
+        col_name = self._result_view_df.columns[col]
+        self._result_view_df = self._result_view_df.sort_values(
+            col_name, ascending=self._result_sort_asc, na_position='last'
+        ).reset_index(drop=True)
+
+        self._result_page = 0
+        self._refresh_result_view()
+
+    def _prev_result_page(self):
+        if self._result_page > 0:
+            self._result_page -= 1
+            self._refresh_result_view()
+
+    def _next_result_page(self):
+        if self._result_view_df is None:
+            return
+        total_pages = max(1, (len(self._result_view_df) + self._result_page_size - 1) // self._result_page_size)
+        if self._result_page < total_pages - 1:
+            self._result_page += 1
+            self._refresh_result_view()
+
     def on_filter_changed(self):
         """Update status when filters change"""
         filter_status = self.result_table.get_filter_status()
@@ -643,9 +939,36 @@ class SqlTab(QWidget):
             row_count = self.result_table.rowCount()
             self.status_label.setText(f"Rows: {row_count}")
 
-    # ======================================
-    # STATUS
-    # ======================================
+    def _on_result_filter_chip(self, col_name: str, operator: str, value: str):
+        """Pre-populate the filter bar with the clicked cell value and show it."""
+        if not self.filter_visible:
+            self.toggle_filter()
+        if self.filter_rows_layout.count() > 0:
+            row_widget = self.filter_rows_layout.itemAt(0).widget()
+            if row_widget:
+                col_combo = row_widget.findChild(QComboBox, "column_combo")
+                val_input = row_widget.findChild(QLineEdit, "value_input")
+                op_combo  = row_widget.findChild(QComboBox, "operator_combo")
+                if col_combo and col_name in [col_combo.itemText(i)
+                                              for i in range(col_combo.count())]:
+                    col_combo.setCurrentText(col_name)
+                if op_combo:
+                    op_combo.setCurrentText(operator)
+                if val_input:
+                    val_input.setText(value)
+                    val_input.setFocus()
+        self.apply_all_filters()
+
+    def _on_result_show_structure(self, table_name: str):
+        """Route show-structure request to ConnectionPanel parent."""
+        panel = self.parent()
+        while panel is not None:
+            if hasattr(panel, '_show_table_structure'):
+                panel._show_table_structure(table_name)
+                return
+            panel = panel.parent()
+
+
 
     def update_status(
         self,
@@ -715,7 +1038,7 @@ class SqlTab(QWidget):
     # ======================================
 
     def export_data(self):
-        """Export data in multiple formats: CSV, JSON, Excel, Parquet"""
+        """Export data in multiple formats: CSV, JSON, Excel"""
         if self.current_df is None:
             QMessageBox.information(
                 self,
@@ -729,7 +1052,7 @@ class SqlTab(QWidget):
             self,
             "Export Data",
             "results.csv",
-            "CSV Files (*.csv);;SQL Insert (*.sql);;JSON Files (*.json);;Excel Files (*.xlsx);;Parquet Files (*.parquet)"
+            "CSV Files (*.csv);;SQL Insert (*.sql);;JSON Files (*.json);;Excel Files (*.xlsx)"
         )
 
         if not file_name:
@@ -763,9 +1086,6 @@ class SqlTab(QWidget):
             elif selected_filter == "Excel Files (*.xlsx)" or file_name.endswith('.xlsx'):
                 self.current_df.to_excel(file_name, index=False, engine='openpyxl')
                 format_name = "Excel"
-            elif selected_filter == "Parquet Files (*.parquet)" or file_name.endswith('.parquet'):
-                self.current_df.to_parquet(file_name, index=False)
-                format_name = "Parquet"
             else:
                 # Default to CSV
                 self.current_df.to_csv(file_name, index=False)
@@ -909,8 +1229,14 @@ class SqlTab(QWidget):
         # Operator selector
         operator_combo = QComboBox()
         operator_combo.setObjectName("operator_combo")
-        operator_combo.addItems(["CONTAINS", "=", "!=", ">", ">=", "<", "<=", "STARTS WITH", "ENDS WITH"])
-        operator_combo.setMinimumWidth(100)
+        operator_combo.addItems([
+            "=", "<>", "<", ">", "<=", ">=",
+            "CONTAINS", "NOT CONTAINS",
+            "STARTS WITH", "ENDS WITH",
+            "IN", "NOT IN",
+            "IS NULL", "IS NOT NULL",
+        ])
+        operator_combo.setMinimumWidth(120)
         row_layout.addWidget(operator_combo)
         
         # Value input
@@ -981,16 +1307,11 @@ class SqlTab(QWidget):
             
             # Apply filter based on operator
             try:
-                if operator == "CONTAINS":
-                    filtered_df = filtered_df[filtered_df[column].astype(str).str.contains(value, case=False, na=False)]
-                elif operator == "STARTS WITH":
-                    filtered_df = filtered_df[filtered_df[column].astype(str).str.startswith(value, na=False)]
-                elif operator == "ENDS WITH":
-                    filtered_df = filtered_df[filtered_df[column].astype(str).str.endswith(value, na=False)]
-                elif operator == "=":
-                    filtered_df = filtered_df[filtered_df[column].astype(str) == value]
-                elif operator == "!=":
-                    filtered_df = filtered_df[filtered_df[column].astype(str) != value]
+                col_s = filtered_df[column].astype(str)
+                if operator in ("=", "=="):
+                    filtered_df = filtered_df[col_s == value]
+                elif operator in ("<>", "!="):
+                    filtered_df = filtered_df[col_s != value]
                 elif operator == ">":
                     filtered_df = filtered_df[pd.to_numeric(filtered_df[column], errors='coerce') > float(value)]
                 elif operator == ">=":
@@ -999,28 +1320,50 @@ class SqlTab(QWidget):
                     filtered_df = filtered_df[pd.to_numeric(filtered_df[column], errors='coerce') < float(value)]
                 elif operator == "<=":
                     filtered_df = filtered_df[pd.to_numeric(filtered_df[column], errors='coerce') <= float(value)]
+                elif operator == "CONTAINS":
+                    filtered_df = filtered_df[col_s.str.contains(value, case=False, na=False)]
+                elif operator == "NOT CONTAINS":
+                    filtered_df = filtered_df[~col_s.str.contains(value, case=False, na=False)]
+                elif operator == "STARTS WITH":
+                    filtered_df = filtered_df[col_s.str.startswith(value, na=False)]
+                elif operator == "ENDS WITH":
+                    filtered_df = filtered_df[col_s.str.endswith(value, na=False)]
+                elif operator == "IN":
+                    vals = [v.strip() for v in value.split(",")]
+                    filtered_df = filtered_df[col_s.isin(vals)]
+                elif operator == "NOT IN":
+                    vals = [v.strip() for v in value.split(",")]
+                    filtered_df = filtered_df[~col_s.isin(vals)]
+                elif operator == "IS NULL":
+                    filtered_df = filtered_df[
+                        filtered_df[column].isna() | (col_s.str.strip() == "")]
+                elif operator == "IS NOT NULL":
+                    filtered_df = filtered_df[
+                        ~(filtered_df[column].isna() | (col_s.str.strip() == ""))]
             except Exception as e:
                 from utils.logger import get_logger
                 logger = get_logger()
                 logger.error(f"Filter error: {str(e)}")
                 continue
         
-        # Update current_df and reload table
-        self.current_df = filtered_df
-        self.result_table.load_data(self.current_df, self.current_table_name)
+        # Update view and reload with pagination
+        self._result_view_df = filtered_df
+        self._result_page = 0
+        self._refresh_result_view()
         self.result_table.show()
-        
+
         # Update status
-        self.status_label.setText(f"{len(filtered_df)} rows (filtered from {len(self.original_df)})")
+        total = len(self.original_df) if self.original_df is not None else 0
+        self.status_label.setText(f"{len(filtered_df)} rows (filtered from {total})")
     
     def clear_all_filters(self):
         """Clear all filters and show original data"""
-        # Reset to original data
         if self.original_df is not None:
-            self.current_df = self.original_df.copy()
-            self.result_table.load_data(self.current_df, self.current_table_name)
+            self._result_view_df = self.original_df.copy()
+            self._result_page = 0
+            self._refresh_result_view()
             self.result_table.show()
-            self.status_label.setText(f"{len(self.current_df)} rows")
+            self.status_label.setText(f"{len(self.original_df)} rows")
         
         # Clear all filter rows except first one
         while self.filter_rows_layout.count() > 1:
@@ -1114,3 +1457,111 @@ class SqlTab(QWidget):
         self.editor.setPlainText(
             query
         )
+
+    # ── Find / Replace ────────────────────────────────────────────────────────
+
+    def _toggle_find_bar(self):
+        if self._find_bar.isHidden():
+            self._find_bar.show()
+            self._find_input.setFocus()
+            self._find_input.selectAll()
+        else:
+            self._hide_find_bar()
+
+    def _hide_find_bar(self):
+        self._find_bar.hide()
+        self.editor.setFocus()
+
+    def _find_next(self):
+        text = self._find_input.text()
+        if not text:
+            return
+        found = self.editor.find(text)
+        if not found:
+            # Wrap around
+            cursor = self.editor.textCursor()
+            cursor.movePosition(cursor.Start)
+            self.editor.setTextCursor(cursor)
+            self.editor.find(text)
+
+    def _replace_current(self):
+        text = self._find_input.text()
+        repl = self._replace_input.text()
+        if not text:
+            return
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection() and cursor.selectedText() == text:
+            cursor.insertText(repl)
+        self._find_next()
+
+    def _replace_all(self):
+        text = self._find_input.text()
+        repl = self._replace_input.text()
+        if not text:
+            return
+        content = self.editor.toPlainText()
+        new_content = content.replace(text, repl)
+        if new_content != content:
+            self.editor.setPlainText(new_content)
+
+    # ── Diff ──────────────────────────────────────────────────────────────────
+
+    def _on_diff_toggled(self, active: bool):
+        self._diff_active = active
+        if active and self._prev_df is not None:
+            self._apply_diff_highlights()
+        else:
+            self._clear_diff_highlights()
+
+    def _apply_diff_highlights(self):
+        """Highlight cells that differ between _prev_df and current_df."""
+        from PySide6.QtGui import QColor, QBrush
+        if self._prev_df is None or self.current_df is None:
+            return
+        # Compare the full dataframes (not the rendered page)
+        prev = self._prev_df.reset_index(drop=True)
+        curr = self.current_df.reset_index(drop=True)
+        added_bg   = QBrush(QColor("#1a3a1a"))   # green — new row
+        changed_bg = QBrush(QColor("#3a2800"))   # amber — changed cell
+        # Walk the visible result table rows
+        for row in range(self.result_table.rowCount()):
+            # Map visible row back to the full dataframe index
+            # (result_table shows the current page slice)
+            page_start = self._result_page * self._result_page_size
+            df_row = page_start + row
+            for col in range(self.result_table.columnCount()):
+                item = self.result_table.item(row, col)
+                if item is None:
+                    continue
+                if df_row >= len(prev):
+                    item.setBackground(added_bg)
+                else:
+                    try:
+                        prev_val = str(prev.iloc[df_row, col]) if col < prev.shape[1] else ""
+                        curr_val = str(curr.iloc[df_row, col]) if col < curr.shape[1] else ""
+                        if prev_val != curr_val:
+                            item.setBackground(changed_bg)
+                    except Exception:
+                        pass
+
+    def _clear_diff_highlights(self):
+        """Remove diff highlighting (restore normal theme colours)."""
+        from PySide6.QtGui import QBrush, QColor
+        clear = QBrush(QColor(0, 0, 0, 0))
+        for row in range(self.result_table.rowCount()):
+            for col in range(self.result_table.columnCount()):
+                item = self.result_table.item(row, col)
+                if item:
+                    item.setBackground(clear)
+
+    # ── Pin / Favourite ───────────────────────────────────────────────────────
+
+    def _on_pin_toggled(self, pinned: bool):
+        self.pinned = pinned
+        # Signal to parent to persist; connection_panel listens via tab widget
+        panel = self.parent()
+        while panel is not None:
+            if hasattr(panel, '_save_pinned_tabs'):
+                panel._save_pinned_tabs()
+                break
+            panel = panel.parent()
