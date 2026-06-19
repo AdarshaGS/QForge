@@ -62,17 +62,17 @@ class EditableTableWidget(QTableWidget):
         
         # Enable editing
         self.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
-        
+
         # Track item changes
         self.itemChanged.connect(self.on_item_changed)
-        
+
         # Context menu
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
-        
+
         # Add keyboard shortcuts
         from PySide6.QtGui import QShortcut, QKeySequence
-        
+
         # Cmd+D to duplicate row
         self.duplicate_shortcut = QShortcut(QKeySequence("Ctrl+D"), self)
         self.duplicate_shortcut.activated.connect(self.duplicate_selected_rows)

@@ -1,0 +1,2 @@
+- [Secure Credential Storage Implementation](memory/secure-credential-storage.md) — Implemented platform-native keyring or encrypted storage for database passwords
+- [UI/UX Improvements: Fuzzy Search & Query Cancellation](memory/ui-ux-improvements.md) — Improved table search with fuzzy matching and added query cancellation capability

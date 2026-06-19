@@ -21,6 +21,15 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QShortcut, QKeySequence, QFont, QColor
 from PySide6.QtCore import Qt
 
+# Import credential manager for secure password storage
+try:
+    from utils.credential_manager import store_connection_password, delete_connection_password
+    CREDENTIAL_MANAGER_AVAILABLE = True
+except ImportError:
+    CREDENTIAL_MANAGER_AVAILABLE = False
+    store_connection_password = None
+    delete_connection_password = None
+
 
 class ConnectionDialog(QDialog):
 
@@ -625,6 +634,11 @@ class ConnectionDialog(QDialog):
         self.save_connections()
         self.load_connections()
         self.clear_form()
+
+        # Remove stored credentials for deleted connection
+        if CREDENTIAL_MANAGER_AVAILABLE and connection_name:
+            delete_connection_password(connection_name)
+            delete_connection_password(f"{connection_name}_ssh_tunnel")
 
     def load_selected_connection(self):
         selected_item = self._get_selected_conn_item()

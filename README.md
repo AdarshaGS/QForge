@@ -156,7 +156,7 @@ Application logs are automatically saved to the `logs/` directory with daily rot
 
 ## Notes
 
-- Passwords are stored in plain text in `connections.json`. Keep this file secure.
+- Passwords are stored securely using platform-native keyring or encrypted storage (no longer in plain text)
 - Query history is limited to the last 100 queries
 - SQLite connections don't require host, port, user, or password
 
