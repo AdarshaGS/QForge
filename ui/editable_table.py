@@ -5,6 +5,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QAbstractItemView,
+    QFileDialog,
+    QApplication,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QBrush
@@ -108,58 +110,73 @@ class EditableTableWidget(QTableWidget):
             # Dark theme
             self.setStyleSheet("""
                 QTableWidget {
-                    gridline-color: #2c2c2e;
+                    gridline-color: #333336;
                     background-color: #1c1c1e;
-                    alternate-background-color: #202022;
+                    alternate-background-color: #1c1c1e;
                     color: #e5e5ea;
-                    selection-background-color: #0A84FF33;
+                    selection-background-color: #1a3a5c;
                     selection-color: #e5e5ea;
                     border: none;
                     outline: none;
                 }
-                QTableWidget::item { padding: 2px 6px; border: none; }
-                QTableWidget::item:selected { background: #0A84FF33; }
+                QTableWidget::item {
+                    padding: 1px 8px;
+                    border: none;
+                    border-bottom: 1px solid #2a2a2d;
+                }
+                QTableWidget::item:selected {
+                    background: #1a3a5c;
+                    color: #ffffff;
+                }
                 QHeaderView::section {
-                    background: #2c2c2e;
+                    background: #252528;
                     color: #8e8e93;
                     border: none;
-                    border-right: 1px solid #3a3a3c;
-                    border-bottom: 1px solid #3a3a3c;
-                    padding: 4px 8px;
-                    font-size: 12px;
+                    border-right: 1px solid #333336;
+                    border-bottom: 2px solid #444448;
+                    padding: 3px 8px;
+                    font-size: 11px;
                     font-weight: 600;
+                    text-align: left;
                 }
-                QHeaderView::section:hover { background: #3a3a3c; color: #e5e5ea; }
+                QHeaderView::section:hover { background: #2e2e32; color: #e5e5ea; }
+                QHeaderView::section:first { border-left: none; }
             """)
         else:
             # Light theme
             self.setStyleSheet("""
                 QTableWidget {
-                    gridline-color: #d0d0d0;
+                    gridline-color: #e0e0e3;
                     background-color: #ffffff;
-                    alternate-background-color: #f8f8f8;
+                    alternate-background-color: #ffffff;
                     color: #1c1c1e;
-                    selection-background-color: #0A84FF;
-                    selection-color: #ffffff;
+                    selection-background-color: #d0e8ff;
+                    selection-color: #1c1c1e;
                     border: none;
                     outline: none;
                 }
-                QTableWidget::item { padding: 2px 6px; border: none; }
+                QTableWidget::item {
+                    padding: 1px 8px;
+                    border: none;
+                    border-bottom: 1px solid #e8e8eb;
+                }
                 QTableWidget::item:selected {
-                    background: #0A84FF;
-                    color: #ffffff;
+                    background: #d0e8ff;
+                    color: #1c1c1e;
                 }
                 QHeaderView::section {
-                    background: #f3f3f3;
+                    background: #f4f4f6;
                     color: #636366;
                     border: none;
-                    border-right: 1px solid #d0d0d0;
-                    border-bottom: 1px solid #d0d0d0;
-                    padding: 4px 8px;
-                    font-size: 12px;
+                    border-right: 1px solid #dcdcdf;
+                    border-bottom: 2px solid #c8c8cc;
+                    padding: 3px 8px;
+                    font-size: 11px;
                     font-weight: 600;
+                    text-align: left;
                 }
-                QHeaderView::section:hover { background: #e5e5e5; color: #1c1c1e; }
+                QHeaderView::section:hover { background: #e8e8eb; color: #1c1c1e; }
+                QHeaderView::section:first { border-left: none; }
             """)
         
     def load_data(self, dataframe: pd.DataFrame, table_name=None):
@@ -217,13 +234,10 @@ class EditableTableWidget(QTableWidget):
                 for col in range(len(dataframe.columns)):
                     item = QTableWidgetItem("")
                     self.setItem(row, col, item)
-            
-            self.resizeColumnsToContents()
             hdr = self.horizontalHeader()
             hdr.setSectionResizeMode(QHeaderView.Interactive)
-            hdr.setStretchLastSection(True)
-            self.itemChanged.connect(self.on_item_changed)
-            return
+            hdr.setStretchLastSection(False)
+            self._set_compact_column_widths(dataframe)
         
         # Display actual data
         self.setRowCount(len(dataframe))
@@ -239,10 +253,10 @@ class EditableTableWidget(QTableWidget):
                 item.setData(Qt.UserRole, dataframe.iloc[row, col])  # Store original value
                 self.setItem(row, col, item)
         
-        self.resizeColumnsToContents()
         hdr = self.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.Interactive)
-        hdr.setStretchLastSection(True)
+        hdr.setStretchLastSection(False)
+        self._set_compact_column_widths(dataframe)
         
         # Reconnect signal
         self.itemChanged.connect(self.on_item_changed)
@@ -257,6 +271,69 @@ class EditableTableWidget(QTableWidget):
         for row in (self.modified_rows | self.new_rows | self.deleted_rows):
             if 0 <= row < self.rowCount():
                 self._repaint_row(row)
+
+    _COL_WIDTH_MIN = 60     # never narrower than this
+    _COL_WIDTH_MAX = 300    # never wider than this without manual resize
+    _COL_WIDTH_DEF = 120    # default when content is tiny
+
+    def _set_compact_column_widths(self, dataframe):
+        """Set column widths: sample the first 50 rows to pick a sensible
+        width, clamped to [_COL_WIDTH_MIN, _COL_WIDTH_MAX]. Does NOT
+        resize very-wide columns so long text values stay compact."""
+        from PySide6.QtGui import QFontMetrics
+        from PySide6.QtWidgets import QApplication
+        fm = QFontMetrics(QApplication.font())
+        hdr = self.horizontalHeader()
+        for col_idx, col_name in enumerate(dataframe.columns):
+            # Header text width
+            header_w = fm.horizontalAdvance(str(col_name)) + 24  # padding
+            # Sample up to 50 rows
+            sample = dataframe.iloc[:50, col_idx].fillna('').astype(str)
+            content_w = sample.map(lambda s: fm.horizontalAdvance(str(s))).max() if not sample.empty else 0
+            content_w += 20  # cell padding
+            best = max(header_w, content_w, self._COL_WIDTH_DEF)
+            width = min(best, self._COL_WIDTH_MAX)
+            width = max(width, self._COL_WIDTH_MIN)
+            hdr.resizeSection(col_idx, width)
+
+    def keyPressEvent(self, event):
+        """Cmd+Enter opens a detail popup for the current cell value."""
+        if event.key() == Qt.Key_Return and event.modifiers() == Qt.ControlModifier:
+            item = self.currentItem()
+            if item and item.text():
+                self._open_cell_detail(item)
+                return
+        super().keyPressEvent(event)
+
+    def _open_cell_detail(self, item):
+        """Show a resizable read-only popup with the full cell value."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QPlainTextEdit, QDialogButtonBox
+        col_name = self.horizontalHeaderItem(item.column()).text() if self.horizontalHeaderItem(item.column()) else ""
+        dlg = QDialog(self.window())
+        dlg.setWindowTitle(f"Cell value — {col_name}")
+        dlg.resize(600, 400)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(10, 10, 10, 10)
+        te = QPlainTextEdit()
+        te.setPlainText(item.text())
+        te.setReadOnly(True)
+        te.setFont(QApplication.font())
+        te.setStyleSheet("""
+            QPlainTextEdit {
+                background: #1c1c1e;
+                color: #e5e5ea;
+                border: 1px solid #3a3a3c;
+                border-radius: 4px;
+                font-family: 'Menlo', 'Monaco', monospace;
+                font-size: 13px;
+                padding: 6px;
+            }
+        """)
+        layout.addWidget(te)
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        dlg.exec()
 
     def apply_column_filter(self, column_index, filter_text):
         """Apply filter to a specific column"""
@@ -861,8 +938,42 @@ class EditableTableWidget(QTableWidget):
         self._repaint_row(source_row + 1)
     
     def export_selected(self):
-        """Export selected rows"""
-        QMessageBox.information(self, "Export", "Export feature - use Export Data button in toolbar")
+        """Export visible table data to CSV / JSON / Excel / SQL."""
+        df = self.filtered_data if self.filtered_data is not None else self.original_data
+        if df is None or df.empty:
+            QMessageBox.information(self, "Export", "No data to export.")
+            return
+
+        file_name, selected_filter = QFileDialog.getSaveFileName(
+            self, "Export Data", f"{self.table_name or 'data'}.csv",
+            "CSV Files (*.csv);;JSON Files (*.json);;Excel Files (*.xlsx);;SQL Insert (*.sql)"
+        )
+        if not file_name:
+            return
+
+        try:
+            if file_name.endswith(".json"):
+                df.to_json(file_name, orient="records", indent=2, force_ascii=False)
+            elif file_name.endswith(".xlsx"):
+                df.to_excel(file_name, index=False, engine="openpyxl")
+            elif file_name.endswith(".sql"):
+                tbl = self.table_name or "table"
+                lines = []
+                for _, row in df.iterrows():
+                    cols = ", ".join(f"`{c}`" for c in df.columns)
+                    vals = ", ".join(
+                        "NULL" if (v != v or v is None) else
+                        f"'{str(v).replace(chr(39), chr(39)*2)}'"
+                        for v in row
+                    )
+                    lines.append(f"INSERT INTO `{tbl}` ({cols}) VALUES ({vals});")
+                with open(file_name, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(lines))
+            else:
+                df.to_csv(file_name, index=False)
+            QMessageBox.information(self, "Export", f"Exported {len(df)} rows to:\n{file_name}")
+        except Exception as ex:
+            QMessageBox.critical(self, "Export Error", str(ex))
     
     def set_cell_null(self):
         """Set current cell to NULL"""

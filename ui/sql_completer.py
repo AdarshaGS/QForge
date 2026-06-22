@@ -25,23 +25,68 @@ from PySide6.QtGui import (
 # ─── Vocabulary ───────────────────────────────────────────────────────────────
 
 SQL_KEYWORDS = [
-    "SELECT", "FROM", "WHERE", "INSERT", "INTO", "UPDATE", "DELETE",
-    "CREATE", "ALTER", "DROP", "TABLE", "DATABASE", "INDEX", "VIEW",
-    "PROCEDURE", "FUNCTION", "TRIGGER",
+    # ── Query starters ──────────────────────────────────────────────────────
+    "SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE",
+    "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME",
+    "EXPLAIN", "EXPLAIN ANALYZE", "EXPLAIN FORMAT=JSON",
+    "EXPLAIN FORMAT=TREE", "EXPLAIN FORMAT=TRADITIONAL",
+    "DESCRIBE", "DESC", "SHOW",
+    "SHOW TABLES", "SHOW DATABASES", "SHOW COLUMNS FROM",
+    "SHOW CREATE TABLE", "SHOW INDEX FROM", "SHOW PROCESSLIST",
+    "SHOW VARIABLES", "SHOW STATUS",
+    "USE", "CALL",
+    "WITH", "WITH RECURSIVE",
+    # ── Clauses ──────────────────────────────────────────────────────────────
+    "FROM", "WHERE", "HAVING", "ON", "USING",
+    "ORDER BY", "GROUP BY", "PARTITION BY",
+    "LIMIT", "OFFSET", "FETCH FIRST",
+    "DISTINCT", "ALL",
+    "AS",
+    # ── Joins ────────────────────────────────────────────────────────────────
     "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN",
-    "OUTER JOIN", "FULL JOIN", "CROSS JOIN",
-    "ON", "USING", "ORDER BY", "GROUP BY", "HAVING",
-    "LIMIT", "OFFSET", "DISTINCT", "AS",
-    "AND", "OR", "NOT", "IN", "LIKE", "ILIKE", "BETWEEN",
-    "IS", "IS NOT", "NULL", "IS NULL", "IS NOT NULL",
-    "ASC", "DESC", "VALUES", "SET",
-    "UNION", "UNION ALL", "EXCEPT", "INTERSECT",
-    "EXISTS", "ANY", "ALL", "SOME",
+    "LEFT OUTER JOIN", "RIGHT OUTER JOIN",
+    "FULL JOIN", "FULL OUTER JOIN", "CROSS JOIN", "STRAIGHT_JOIN",
+    "NATURAL JOIN", "NATURAL LEFT JOIN", "NATURAL RIGHT JOIN",
+    # ── Logical / comparison ─────────────────────────────────────────────────
+    "AND", "OR", "NOT", "XOR",
+    "IN", "NOT IN", "LIKE", "NOT LIKE", "ILIKE",
+    "BETWEEN", "NOT BETWEEN",
+    "IS NULL", "IS NOT NULL", "IS TRUE", "IS FALSE",
+    "IS", "IS NOT",
+    "EXISTS", "NOT EXISTS",
+    "ANY", "ALL", "SOME",
+    "REGEXP", "NOT REGEXP", "RLIKE",
+    # ── Set ops ──────────────────────────────────────────────────────────────
+    "UNION", "UNION ALL", "INTERSECT", "EXCEPT", "MINUS",
+    # ── DML extras ──────────────────────────────────────────────────────────
+    "INTO", "VALUES", "SET", "DEFAULT",
+    "ON DUPLICATE KEY UPDATE",
+    "INSERT IGNORE", "INSERT INTO",
+    # ── DDL ──────────────────────────────────────────────────────────────────
+    "TABLE", "DATABASE", "SCHEMA", "INDEX", "VIEW",
+    "PROCEDURE", "FUNCTION", "TRIGGER", "EVENT",
     "PRIMARY KEY", "FOREIGN KEY", "REFERENCES",
-    "DEFAULT", "CHECK", "UNIQUE", "AUTO_INCREMENT",
-    "WITH", "RECURSIVE",
+    "UNIQUE", "CHECK", "AUTO_INCREMENT", "NOT NULL", "NULL",
+    "DEFAULT", "COMMENT", "CHARSET", "COLLATE",
+    "IF EXISTS", "IF NOT EXISTS",
+    "ADD COLUMN", "DROP COLUMN", "MODIFY COLUMN", "CHANGE COLUMN",
+    "ADD INDEX", "DROP INDEX",
+    # ── Control flow ─────────────────────────────────────────────────────────
     "CASE", "WHEN", "THEN", "ELSE", "END",
-    "CAST", "CONVERT",
+    "IF", "IFNULL", "NULLIF", "COALESCE",
+    # ── Sort / window ────────────────────────────────────────────────────────
+    "ASC", "DESC", "NULLS FIRST", "NULLS LAST",
+    "OVER", "ROWS BETWEEN", "RANGE BETWEEN",
+    "UNBOUNDED PRECEDING", "CURRENT ROW", "UNBOUNDED FOLLOWING",
+    # ── Transaction ──────────────────────────────────────────────────────────
+    "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE SAVEPOINT",
+    "START TRANSACTION", "SET AUTOCOMMIT",
+    "LOCK TABLES", "UNLOCK TABLES",
+    # ── Misc ─────────────────────────────────────────────────────────────────
+    "CAST", "CONVERT", "INTERVAL",
+    "FORCE INDEX", "USE INDEX", "IGNORE INDEX",
+    "SQL_CALC_FOUND_ROWS", "FOUND_ROWS",
+    "ROW_COUNT", "LAST_INSERT_ID",
 ]
 
 SQL_FUNCTIONS = [
@@ -65,22 +110,30 @@ SQL_FUNCTIONS = [
 
 # (keyword, context_name) — checked from most-specific to least
 _CONTEXT_MARKERS = [
-    ("ORDER BY",   "AFTER_ORDER_BY"),
-    ("GROUP BY",   "AFTER_GROUP_BY"),
-    ("LEFT JOIN",  "AFTER_JOIN"),
-    ("RIGHT JOIN", "AFTER_JOIN"),
-    ("INNER JOIN", "AFTER_JOIN"),
-    ("FULL JOIN",  "AFTER_JOIN"),
-    ("CROSS JOIN", "AFTER_JOIN"),
-    ("JOIN",       "AFTER_JOIN"),
-    ("INSERT INTO","AFTER_FROM"),
-    ("FROM",       "AFTER_FROM"),
-    ("UPDATE",     "AFTER_FROM"),
-    ("HAVING",     "AFTER_WHERE"),
-    ("WHERE",      "AFTER_WHERE"),
-    ("ON",         "AFTER_ON"),
-    ("SET",        "AFTER_SET"),
-    ("SELECT",     "AFTER_SELECT"),
+    ("EXPLAIN ANALYZE", "AFTER_EXPLAIN"),
+    ("EXPLAIN FORMAT",  "AFTER_EXPLAIN"),
+    ("EXPLAIN",         "AFTER_EXPLAIN"),
+    ("ORDER BY",        "AFTER_ORDER_BY"),
+    ("GROUP BY",        "AFTER_GROUP_BY"),
+    ("HAVING",          "AFTER_HAVING"),
+    ("LEFT JOIN",       "AFTER_JOIN"),
+    ("RIGHT JOIN",      "AFTER_JOIN"),
+    ("INNER JOIN",      "AFTER_JOIN"),
+    ("FULL JOIN",       "AFTER_JOIN"),
+    ("CROSS JOIN",      "AFTER_JOIN"),
+    ("STRAIGHT_JOIN",   "AFTER_JOIN"),
+    ("JOIN",            "AFTER_JOIN"),
+    ("INSERT INTO",     "AFTER_INSERT"),
+    ("INSERT IGNORE",   "AFTER_INSERT"),
+    ("INSERT",          "AFTER_INSERT"),
+    ("FROM",            "AFTER_FROM"),
+    ("UPDATE",          "AFTER_FROM"),
+    ("WHERE",           "AFTER_WHERE"),
+    ("ON",              "AFTER_ON"),
+    ("SET",             "AFTER_SET"),
+    ("SELECT",          "AFTER_SELECT"),
+    ("WITH",            "AFTER_WITH"),
+    ("LIMIT",           "AFTER_LIMIT"),
 ]
 
 
@@ -484,9 +537,16 @@ class SqlCompleter:
         best_ctx = "GENERAL"
         for kw, ctx in _CONTEXT_MARKERS:
             p = before.rfind(kw)
-            # Make sure the keyword is followed by a word boundary (space/end)
+            if p < 0:
+                continue
             end = p + len(kw)
-            if p > best_pos and (end >= len(before) or not before[end].isalpha()):
+            # Keyword must be at end of `before` or followed by whitespace/non-alpha
+            if end < len(before) and before[end].isalpha():
+                continue
+            # Must be preceded by start or non-alpha (word boundary)
+            if p > 0 and before[p - 1].isalpha():
+                continue
+            if p > best_pos:
                 best_pos = p
                 best_ctx = ctx
         return best_ctx
@@ -561,40 +621,73 @@ class SqlCompleter:
             results += self._score(pl, SQL_KEYWORDS,   SuggestionItem.KEYWORD,  600)
 
         elif context == "AFTER_SELECT":
-            # Columns from query tables first, then functions, then all keywords
+            # Columns from query tables first, then functions, then tables (for subquery)
             results += self._score(pl, query_columns,  SuggestionItem.COLUMN,  1000)
+            results += self._alias_col_items(pl)
             results += self._score(pl, SQL_FUNCTIONS,  SuggestionItem.FUNC,     850)
-            results += self._score(pl, self._tables,   SuggestionItem.TABLE,    800, fuzzy=True)
-            results += self._score(pl, SQL_KEYWORDS,   SuggestionItem.KEYWORD,  750)
+            results += self._score(pl, self._tables,   SuggestionItem.TABLE,    780, fuzzy=True)
+            results += self._score(pl, SQL_KEYWORDS,   SuggestionItem.KEYWORD,  700)
 
-        elif context in ("AFTER_WHERE", "AFTER_ON"):
+        elif context in ("AFTER_WHERE", "AFTER_ON", "AFTER_HAVING"):
             results += self._score(pl, query_columns, SuggestionItem.COLUMN,  1000)
             results += self._alias_col_items(pl)
+            results += self._score(pl, SQL_FUNCTIONS, SuggestionItem.FUNC,     900)
             results += self._score(pl,
-                ["AND", "OR", "NOT", "IN", "LIKE", "ILIKE", "BETWEEN",
-                 "IS NULL", "IS NOT NULL", "EXISTS", "NULL",
+                ["AND", "OR", "NOT", "IN", "NOT IN", "LIKE", "NOT LIKE",
+                 "ILIKE", "BETWEEN", "NOT BETWEEN",
+                 "IS NULL", "IS NOT NULL", "IS TRUE", "IS FALSE",
+                 "EXISTS", "NOT EXISTS", "REGEXP", "RLIKE",
                  "ORDER BY", "GROUP BY", "HAVING", "LIMIT"],
                 SuggestionItem.KEYWORD, 900)
             results += self._score(pl, SQL_KEYWORDS, SuggestionItem.KEYWORD, 650)
 
         elif context == "AFTER_ORDER_BY":
-            results += self._score(pl, query_columns,         SuggestionItem.COLUMN,  1000)
-            results += self._score(pl, ["ASC", "DESC"],       SuggestionItem.KEYWORD,  950)
-            results += self._score(pl, SQL_KEYWORDS,          SuggestionItem.KEYWORD,  650)
+            results += self._score(pl, query_columns,          SuggestionItem.COLUMN,  1000)
+            results += self._alias_col_items(pl)
+            results += self._score(pl, ["ASC", "DESC", "NULLS FIRST", "NULLS LAST",
+                                        "LIMIT"],
+                                   SuggestionItem.KEYWORD, 950)
+            results += self._score(pl, SQL_KEYWORDS,           SuggestionItem.KEYWORD,  650)
 
         elif context == "AFTER_GROUP_BY":
             results += self._score(pl, query_columns, SuggestionItem.COLUMN,  1000)
+            results += self._alias_col_items(pl)
             results += self._score(pl,
-                ["HAVING", "ORDER BY", "LIMIT"],
+                ["HAVING", "ORDER BY", "LIMIT", "WITH ROLLUP"],
                 SuggestionItem.KEYWORD, 900)
             results += self._score(pl, SQL_KEYWORDS, SuggestionItem.KEYWORD, 650)
 
         elif context == "AFTER_SET":
             results += self._score(pl, query_columns, SuggestionItem.COLUMN,  1000)
+            results += self._score(pl, SQL_FUNCTIONS, SuggestionItem.FUNC,     850)
             results += self._score(pl, SQL_KEYWORDS,  SuggestionItem.KEYWORD,  650)
 
+        elif context == "AFTER_EXPLAIN":
+            # After EXPLAIN, suggest SELECT / WITH / table names
+            results += self._score(pl,
+                ["SELECT", "WITH", "INSERT", "UPDATE", "DELETE",
+                 "FORMAT=JSON", "FORMAT=TREE", "FORMAT=TRADITIONAL",
+                 "ANALYZE"],
+                SuggestionItem.KEYWORD, 1000)
+            results += self._score(pl, self._tables, SuggestionItem.TABLE, 900, fuzzy=True)
+
+        elif context == "AFTER_INSERT":
+            # After INSERT INTO, suggest table names
+            results += self._score(pl, self._tables,   SuggestionItem.TABLE,   1000, fuzzy=True)
+            results += self._score(pl, SQL_KEYWORDS,   SuggestionItem.KEYWORD,  600)
+
+        elif context == "AFTER_WITH":
+            # CTE name being defined or SELECT after WITH block
+            results += self._score(pl, ["SELECT", "RECURSIVE"],
+                                   SuggestionItem.KEYWORD, 1000)
+            results += self._score(pl, SQL_KEYWORDS, SuggestionItem.KEYWORD, 700)
+
+        elif context == "AFTER_LIMIT":
+            results += self._score(pl, ["OFFSET"], SuggestionItem.KEYWORD, 1000)
+            results += self._score(pl, SQL_KEYWORDS, SuggestionItem.KEYWORD, 600)
+
         else:  # GENERAL — start of query or unknown position
-            # Keywords first — user is most likely typing SELECT/INSERT/UPDATE/…
+            # Keywords first — user is most likely typing SELECT/EXPLAIN/INSERT/…
             results += self._score(pl, SQL_KEYWORDS,  SuggestionItem.KEYWORD, 1000)
             results += self._score(pl, self._tables,  SuggestionItem.TABLE,    900, fuzzy=True)
             results += self._score(pl, SQL_FUNCTIONS, SuggestionItem.FUNC,     800)

@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QLabel,
     QCheckBox,
-    QFileDialog
+    QFileDialog,
+    QMenu,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QFont, QColor
 from PySide6.QtCore import Qt
@@ -42,6 +43,8 @@ class ConnectionDialog(QDialog):
 
         close_shortcut = QShortcut(QKeySequence("Ctrl+W"), self)
         close_shortcut.activated.connect(self.reject)
+        save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        save_shortcut.activated.connect(self.save_connection)
 
         self.init_ui()
         self.load_connections()
@@ -77,6 +80,15 @@ class ConnectionDialog(QDialog):
         self.connection_tree.setIndentation(20)
         self.connection_tree.setRootIsDecorated(True)
         self.connection_tree.setAnimated(True)
+        # ── Drag-to-reorder ─────────────────────────────────────
+        self.connection_tree.setDragEnabled(True)
+        self.connection_tree.setAcceptDrops(True)
+        self.connection_tree.setDropIndicatorShown(True)
+        self.connection_tree.setDragDropMode(QTreeWidget.InternalMove)
+        self.connection_tree.model().rowsMoved.connect(self._on_tree_rows_moved)
+        # ── Right-click context menu ─────────────────────────────
+        self.connection_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.connection_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         left_layout.addWidget(self.connection_tree)
 
         new_conn_btn = QPushButton("+ New Connection")
@@ -103,8 +115,12 @@ class ConnectionDialog(QDialog):
         self.type_input.currentTextChanged.connect(self.on_type_changed)
 
         self.name_input = QLineEdit()
-        self.group_input = QLineEdit()
-        self.group_input.setPlaceholderText("e.g. Production, Staging, Local…")
+        # Editable combo that lists existing groups; typing a new name is allowed
+        self.group_input = QComboBox()
+        self.group_input.setEditable(True)
+        self.group_input.setInsertPolicy(QComboBox.NoInsert)
+        self.group_input.lineEdit().setPlaceholderText("e.g. Production, Staging, Local…")
+        self.group_input.lineEdit().textEdited.connect(self._on_group_text_edited)
         self.host_input = QLineEdit()
         self.port_input = QLineEdit("3306")
         self.database_input = QLineEdit()
@@ -254,6 +270,39 @@ class ConnectionDialog(QDialog):
         self.connection_tree.clearSelection()
         self.clear_form()
         self.name_input.setFocus()
+
+    def _on_tree_rows_moved(self):
+        """Rebuild self.connections order to match the new drag-dropped tree order."""
+        new_order = []
+        for g_idx in range(self.connection_tree.topLevelItemCount()):
+            group_item = self.connection_tree.topLevelItem(g_idx)
+            for c_idx in range(group_item.childCount()):
+                child = group_item.child(c_idx)
+                conn_idx = child.data(0, Qt.UserRole)
+                if conn_idx is not None and 0 <= conn_idx < len(self.connections):
+                    new_order.append(self.connections[conn_idx])
+        if len(new_order) == len(self.connections):
+            self.connections = new_order
+            self.save_connections()
+            self.load_connections()  # re-index UserRole data
+
+    def _on_tree_context_menu(self, pos):
+        """Show context menu on right-click over a connection item."""
+        item = self.connection_tree.itemAt(pos)
+        if item is None or item.parent() is None:
+            return  # clicked on group header or empty area
+        menu = QMenu(self)
+        dup_action = menu.addAction("Duplicate Connection")
+        action = menu.exec(self.connection_tree.viewport().mapToGlobal(pos))
+        if action == dup_action:
+            conn_idx = item.data(0, Qt.UserRole)
+            if conn_idx is not None:
+                import copy
+                new_conn = copy.deepcopy(self.connections[conn_idx])
+                new_conn["name"] = new_conn["name"] + " Copy"
+                self.connections.append(new_conn)
+                self.save_connections()
+                self.load_connections()
 
     def on_tree_item_clicked(self, item, column):
         """Load connection form when a connection item (not a group) is clicked."""
@@ -406,10 +455,57 @@ class ConnectionDialog(QDialog):
                 child.setData(0, Qt.UserRole, conn_idx)
                 child.setToolTip(0, f"{db_type} — {host}")
 
+        # Refresh the group combo with all known group names
+        self._populate_group_combo()
+
+    def _populate_group_combo(self):
+        """Rebuild the group combo items from all saved connections."""
+        seen_groups: list[str] = []
+        for conn in getattr(self, 'connections', []):
+            g = (conn.get("group") or "Default").strip()
+            if g and g not in seen_groups:
+                seen_groups.append(g)
+        current_text = self.group_input.lineEdit().text()
+        self.group_input.blockSignals(True)
+        self.group_input.clear()
+        self.group_input.addItems(seen_groups)
+        self.group_input.lineEdit().setText(current_text)
+        self.group_input.blockSignals(False)
+
+    def _on_group_text_edited(self, text: str):
+        """While the user types, show existing groups that match + a 'create' hint."""
+        text = text.strip()
+        all_groups = [self.group_input.itemText(i) for i in range(self.group_input.count())
+                      if not self.group_input.itemText(i).startswith("＋ Create")]
+        # Build filtered list
+        matches = [g for g in all_groups if text.lower() in g.lower()] if text else all_groups
+        self.group_input.blockSignals(True)
+        self.group_input.clear()
+        self.group_input.addItems(matches)
+        # If typed text doesn't exactly match any existing group, offer to create it
+        exact = any(g.lower() == text.lower() for g in matches)
+        if text and not exact:
+            self.group_input.addItem(f"＋ Create new group: \"{text}\"")
+        self.group_input.lineEdit().setText(text)
+        self.group_input.blockSignals(False)
+        # Open the drop-down so suggestions are visible
+        if matches or (text and not exact):
+            self.group_input.showPopup()
+
     def save_connections(self):
         os.makedirs(os.path.dirname(self.CONNECTION_FILE), exist_ok=True)
         with open(self.CONNECTION_FILE, "w") as f:
             json.dump(self.connections, f, indent=4)
+
+    def _get_group_value(self) -> str:
+        """Return the clean group name, stripping the '＋ Create new group:' prefix."""
+        raw = self.group_input.lineEdit().text().strip()
+        if raw.startswith("＋ Create new group:"):
+            # Extract the quoted name
+            import re
+            m = re.search(r'"(.+?)"', raw)
+            return m.group(1).strip() if m else raw
+        return raw or "Default"
 
     # ── Form helpers ─────────────────────────────────────────────
 
@@ -423,7 +519,7 @@ class ConnectionDialog(QDialog):
         data = {
             "type": db_type,
             "name": name,
-            "group": self.group_input.text().strip(),
+            "group": self._get_group_value(),
             "database": self.database_input.text().strip(),
         }
 
@@ -547,7 +643,7 @@ class ConnectionDialog(QDialog):
         type_map = {"mysql": "MySQL", "postgresql": "PostgreSQL", "sqlite": "SQLite"}
         self.type_input.setCurrentText(type_map.get(db_type, "MySQL"))
         self.name_input.setText(connection["name"])
-        self.group_input.setText(connection.get("group", ""))
+        self.group_input.lineEdit().setText(connection.get("group", ""))
         self.database_input.setText(connection.get("database", ""))
 
         if db_type != "sqlite":

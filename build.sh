@@ -5,7 +5,14 @@
 
 set -e  # Exit on error
 
-echo "🚀 Building QForge..."
+# ─── Read version from updater.py ───────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_VERSION=$(grep '^APP_VERSION' "$SCRIPT_DIR/utils/updater.py" | sed "s/.*= *\"//;s/\".*//"  )
+if [ -z "$APP_VERSION" ]; then
+    echo "❌ Could not read APP_VERSION from utils/updater.py"
+    exit 1
+fi
+echo "🚀 Building QForge v${APP_VERSION}..."
 
 # Colors
 GREEN='\033[0;32m'
@@ -119,6 +126,12 @@ app = BUNDLE(
     },
 )
 EOF
+
+# Patch the version number into the spec (heredoc uses single quotes so vars don't expand)
+sed -i '' "s/version='1.0.0'/version='${APP_VERSION}'/g" QForge.spec
+sed -i '' "s/CFBundleShortVersionString': '1.0.0'/CFBundleShortVersionString': '${APP_VERSION}'/g" QForge.spec
+sed -i '' "s/CFBundleVersion': '1.0.0'/CFBundleVersion': '${APP_VERSION}'/g" QForge.spec
+echo "${GREEN}   version ${APP_VERSION} injected into spec${NC}"
 
 # Build the application
 echo "${BLUE}🔨 Building application...${NC}"

@@ -67,6 +67,9 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(
             lambda: self._prompt_new_connection()
         )
+        QShortcut(QKeySequence("Ctrl+Q"), self).activated.connect(
+            QApplication.quit
+        )
 
         self.restore_session()
         self._start_update_check()
@@ -257,6 +260,11 @@ class MainWindow(QMainWindow):
                     parent=self
                 )
                 panel.update_theme(self.current_theme == "dark")
+                # Fetch and cache the server version for display in the tab bar
+                try:
+                    panel._server_version = db_service.get_server_version()
+                except Exception:
+                    panel._server_version = ""
                 progress.close()
 
                 self._add_panel(panel)
@@ -271,11 +279,10 @@ class MainWindow(QMainWindow):
     # ─── Close connection tab ────────────────────────────────────────────────
 
     def _close_connection_tab(self, index: int):
-        if len(self._panels) <= 1:
-            QMessageBox.warning(self, "Warning",
-                                "Cannot close the last connection.")
-            return
         self._close_connection_at(index)
+        # If we closed the last panel, show connection dialog so app is never empty
+        if not self._panels:
+            self._prompt_new_connection(allow_cancel_quit=True)
 
     def _close_connection_at(self, index: int):
         """Close the connection panel at *index* without confirmation."""
@@ -314,16 +321,21 @@ class MainWindow(QMainWindow):
         if idx < 0:
             return
         menu = QMenu(self)
-        close_act = menu.addAction("Close Connection")
-        close_others_act = menu.addAction("Close Other Connections")
+        refresh_schema_act  = menu.addAction("↺  Refresh Schema")
+        reconnect_act       = menu.addAction("⟳  Reconnect")
+        menu.addSeparator()
+        close_act           = menu.addAction("Close Connection")
+        close_others_act    = menu.addAction("Close Other Connections")
         close_others_act.setEnabled(len(self._panels) > 1)
         action = menu.exec(self.conn_tab_bar.mapToGlobal(pos))
-        if action == close_act:
-            if len(self._panels) <= 1:
-                QMessageBox.warning(self, "Warning",
-                                    "Cannot close the last connection.")
-            else:
-                self._close_connection_at(idx)
+        if action == refresh_schema_act:
+            if 0 <= idx < len(self._panels):
+                self._panels[idx].load_schema()
+        elif action == reconnect_act:
+            if 0 <= idx < len(self._panels):
+                self._panels[idx]._do_reconnect()
+        elif action == close_act:
+            self._close_connection_tab(idx)
         elif action == close_others_act:
             self._close_other_connections(keep_index=idx)
 

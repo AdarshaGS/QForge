@@ -59,8 +59,27 @@ ok "$SHA256"
 # ─── Step 3: Create GitHub release (no attachment yet) ──────────
 step "[3/4] Creating GitHub release"
 
+# ─── Step 3: Create GitHub release (no attachment yet) ──────────
+step "[3/4] Creating GitHub release"
+
 if gh release view "$TAG" --repo "${GITHUB_USER}/${GITHUB_REPO}" >/dev/null 2>&1; then
-    warn "Release $TAG already exists — removing it first"
+    echo ""
+    echo -e "  ${RED}✘  Release $TAG already exists on GitHub.${NC}"
+    echo -e "  ${YELLOW}Re-releasing the same version confuses Homebrew — users already on${NC}"
+    echo -e "  ${YELLOW}$TAG won't get the update because brew compares version strings only.${NC}"
+    echo ""
+    echo -e "  Options:"
+    echo -e "    ${BOLD}y${NC} — delete and overwrite $TAG  (use only for hotfixes; run 'brew reinstall --cask qforge' manually after)"
+    echo -e "    ${BOLD}n${NC} — abort so you can bump the version number first  ${GREEN}(recommended)${NC}"
+    echo ""
+    read -rp "  Overwrite $TAG? [y/n] " _OVERWRITE
+    if [ "${_OVERWRITE,,}" != "y" ]; then
+        echo ""
+        echo -e "  ${YELLOW}Aborted. Bump APP_VERSION in utils/updater.py, re-run build.sh, then deploy.sh.${NC}"
+        echo ""
+        exit 0
+    fi
+    warn "Overwriting $TAG..."
     substep "Deleting existing release $TAG..."
     gh release delete "$TAG" --repo "${GITHUB_USER}/${GITHUB_REPO}" --yes
     ok "Release deleted"
@@ -69,6 +88,9 @@ if gh release view "$TAG" --repo "${GITHUB_USER}/${GITHUB_REPO}" >/dev/null 2>&1
     substep "Removing remote git tag $TAG..."
     git push origin ":refs/tags/$TAG" 2>/dev/null || true
     ok "Tags cleared"
+    echo ""
+    echo -e "  ${YELLOW}NOTE: existing brew users on $TAG must run:  brew reinstall --cask qforge${NC}"
+    echo ""
 fi
 
 substep "Creating release $TAG on GitHub..."
@@ -127,6 +149,49 @@ fi
 echo ""
 ok "Upload complete!"
 [ -n "$DOWNLOAD_URL" ] && ok "Download URL: $DOWNLOAD_URL"
+
+# ─── Step 5: Update Homebrew tap formula ────────────────────────
+step "[5/5] Updating Homebrew tap (adarshags/homebrew-qforge)"
+
+TAP_DIR="/opt/homebrew/Library/Taps/adarshags/homebrew-qforge"
+TAP_FILE="$TAP_DIR/Casks/qforge.rb"
+
+if [ ! -f "$TAP_FILE" ]; then
+    warn "Tap not found at $TAP_FILE — skipping Homebrew update"
+    warn "Run: brew tap adarshags/qforge  then re-run deploy.sh"
+else
+    substep "Patching $TAP_FILE..."
+    # Replace version and sha256 lines
+    sed -i '' "s/  version \".*\"/  version \"${VERSION}\"/" "$TAP_FILE"
+    sed -i '' "s/  sha256 \".*\"/  sha256 \"${SHA256}\"/" "$TAP_FILE"
+    ok "Formula updated to ${VERSION} with correct SHA256"
+
+    substep "Committing and pushing tap..."
+    cd "$TAP_DIR"
+    git add Casks/qforge.rb
+    git commit -m "qforge ${TAG}"
+    git pull --rebase --quiet
+    git push
+    ok "Tap pushed — brew upgrade --cask qforge will now work"
+    cd "$REPO_DIR"
+fi
+
+# Also patch the in-repo copy of qforge.rb
+substep "Patching repo copy of qforge.rb..."
+sed -i '' "s/  version \".*\"/  version \"${VERSION}\"/" "$REPO_DIR/qforge.rb"
+sed -i '' "s/  sha256 \".*\"/  sha256 \"${SHA256}\"/" "$REPO_DIR/qforge.rb"
+ok "Repo qforge.rb updated"
+
+# Patch APP_VERSION in utils/updater.py
+substep "Patching utils/updater.py APP_VERSION..."
+sed -i '' "s/^APP_VERSION  = \".*\"/APP_VERSION  = \"${VERSION}\"/" "$REPO_DIR/utils/updater.py"
+ok "APP_VERSION set to ${VERSION}"
+
+# Commit the main repo changes
+substep "Committing version bump to main repo..."
+cd "$REPO_DIR"
+git add qforge.rb utils/updater.py
+git commit -m "v${VERSION}: bump APP_VERSION and cask formula" 2>/dev/null || ok "(nothing new to commit in main repo)"
 
 # ─── Done ───────────────────────────────────────────────────────
 echo ""

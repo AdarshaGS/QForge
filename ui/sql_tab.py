@@ -1,3 +1,4 @@
+import re as _re
 import pandas as pd
 import sqlparse
 
@@ -16,9 +17,12 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QSplitter,
     QComboBox,
-    QLineEdit
+    QLineEdit,
+    QPlainTextEdit,
+    QAbstractItemView,
+    QSizePolicy,
 )
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat
 
 from ui.code_editor import CodeEditor
 from PySide6.QtGui import QTextCursor, QKeyEvent, QShortcut, QKeySequence
@@ -221,6 +225,25 @@ class SqlTab(QWidget):
         self.diff_btn.toggled.connect(self._on_diff_toggled)
         run_layout.addWidget(self.diff_btn)
 
+        # ── Verify Query button ──
+        self.verify_btn = QPushButton("⚖ Verify")
+        self.verify_btn.setFixedHeight(28)
+        self.verify_btn.setToolTip(
+            "Compare this query against another query to verify result correctness"
+        )
+        self.verify_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #8e8e93;
+                border: 1px solid #3a3a3c;
+                border-radius: 5px;
+                padding: 0 10px;
+                font-size: 12px;
+            }
+            QPushButton:hover { color: #0A84FF; border-color: #0A84FF; }
+        """)
+        run_layout.addWidget(self.verify_btn)
+
         # ── Pin / favourite toggle ──
         self.pin_btn = QPushButton("★")
         self.pin_btn.setFixedSize(28, 28)
@@ -276,42 +299,133 @@ class SqlTab(QWidget):
         """)
         run_layout.addWidget(self.run_btn)
 
-        # ── Find / Replace bar (Cmd+H, hidden by default) ────────────────────
+        # ── Find / Replace bar (Cmd+F = find, Cmd+H = find+replace) ─────────
         self._find_bar = QWidget()
         self._find_bar.hide()
+        self._find_matches: list = []     # list of QTextCursor positions
+        self._find_match_idx: int = -1
+
         fb_layout = QHBoxLayout(self._find_bar)
         fb_layout.setContentsMargins(6, 4, 6, 4)
         fb_layout.setSpacing(6)
-        self._find_input   = QLineEdit()
+
+        _inp_style = (
+            "QLineEdit{background:#2c2c2e;color:#e5e5ea;border:1px solid #3a3a3c;"
+            "border-radius:4px;padding:0 6px;font-size:12px;height:26px;}"
+            "QLineEdit:focus{border-color:#0A84FF;}"
+        )
+        _toggle_style = (
+            "QPushButton{padding:0 6px;height:22px;border:1px solid #3a3a3c;"
+            "border-radius:3px;background:transparent;color:#8e8e93;font-size:11px;}"
+            "QPushButton:hover{background:#3a3a3c;color:#e5e5ea;}"
+            "QPushButton:checked{background:#0A84FF;color:#fff;border-color:#0A84FF;}"
+        )
+        _action_style = (
+            "QPushButton{padding:0 10px;height:26px;border:1px solid #3a3a3c;"
+            "border-radius:4px;background:transparent;color:#e5e5ea;font-size:12px;}"
+            "QPushButton:hover{background:#3a3a3c;}"
+        )
+
+        # Find row
+        self._find_input = QLineEdit()
         self._find_input.setPlaceholderText("Find…")
         self._find_input.setFixedHeight(26)
+        self._find_input.setStyleSheet(_inp_style)
+        self._find_input.setMinimumWidth(180)
+
+        self._find_match_lbl = QLabel("")
+        self._find_match_lbl.setStyleSheet("color:#8e8e93;font-size:11px;min-width:60px;")
+
+        # Toggle buttons: Aa (case), \b (whole word), .* (regex)
+        self._fb_case_btn = QPushButton("Aa")
+        self._fb_case_btn.setCheckable(True)
+        self._fb_case_btn.setToolTip("Match Case")
+        self._fb_case_btn.setFixedSize(26, 22)
+        self._fb_case_btn.setStyleSheet(_toggle_style)
+
+        self._fb_word_btn = QPushButton("\\b")
+        self._fb_word_btn.setCheckable(True)
+        self._fb_word_btn.setToolTip("Whole Word")
+        self._fb_word_btn.setFixedSize(26, 22)
+        self._fb_word_btn.setStyleSheet(_toggle_style)
+
+        self._fb_regex_btn = QPushButton(".*")
+        self._fb_regex_btn.setCheckable(True)
+        self._fb_regex_btn.setToolTip("Regular Expression")
+        self._fb_regex_btn.setFixedSize(26, 22)
+        self._fb_regex_btn.setStyleSheet(_toggle_style)
+
+        _prev_btn = QPushButton("▲")
+        _prev_btn.setFixedSize(22, 26)
+        _prev_btn.setStyleSheet(_action_style)
+        _prev_btn.setToolTip("Previous match (Shift+Enter)")
+
+        _next_btn = QPushButton("▼")
+        _next_btn.setFixedSize(22, 26)
+        _next_btn.setStyleSheet(_action_style)
+        _next_btn.setToolTip("Next match (Enter)")
+
+        # Replace row (hidden unless Cmd+H)
+        self._replace_row = QWidget()
+        self._replace_row.hide()
+        rr_layout = QHBoxLayout(self._replace_row)
+        rr_layout.setContentsMargins(0, 0, 0, 0)
+        rr_layout.setSpacing(6)
         self._replace_input = QLineEdit()
         self._replace_input.setPlaceholderText("Replace with…")
         self._replace_input.setFixedHeight(26)
-        _btn_style = "QPushButton{padding:0 10px;height:26px;border:1px solid #3a3a3c;border-radius:4px;background:transparent;color:#e5e5ea;font-size:12px;}QPushButton:hover{background:#3a3a3c;}"
-        _find_next_btn    = QPushButton("Next")
-        _find_next_btn.setStyleSheet(_btn_style)
-        _replace_btn      = QPushButton("Replace")
-        _replace_btn.setStyleSheet(_btn_style)
-        _replace_all_btn  = QPushButton("All")
-        _replace_all_btn.setStyleSheet(_btn_style)
-        _close_find_btn   = QPushButton("✕")
+        self._replace_input.setStyleSheet(_inp_style)
+        self._replace_input.setMinimumWidth(180)
+        _replace_btn     = QPushButton("Replace")
+        _replace_btn.setStyleSheet(_action_style)
+        _replace_all_btn = QPushButton("Replace All")
+        _replace_all_btn.setStyleSheet(_action_style)
+        rr_layout.addWidget(QLabel("Replace:"))
+        rr_layout.addWidget(self._replace_input, 2)
+        rr_layout.addWidget(_replace_btn)
+        rr_layout.addWidget(_replace_all_btn)
+        rr_layout.addStretch()
+
+        _close_find_btn = QPushButton("✕")
         _close_find_btn.setFixedSize(22, 22)
-        _close_find_btn.setStyleSheet("QPushButton{border:none;background:transparent;color:#8e8e93;font-size:14px;}")
-        fb_layout.addWidget(QLabel("Find:"))
-        fb_layout.addWidget(self._find_input, 2)
-        fb_layout.addWidget(QLabel("Replace:"))
-        fb_layout.addWidget(self._replace_input, 2)
-        fb_layout.addWidget(_find_next_btn)
-        fb_layout.addWidget(_replace_btn)
-        fb_layout.addWidget(_replace_all_btn)
-        fb_layout.addStretch()
+        _close_find_btn.setStyleSheet(
+            "QPushButton{border:none;background:transparent;color:#8e8e93;font-size:14px;}"
+        )
+
+        # Assemble find row
+        fb_rows = QVBoxLayout()
+        fb_rows.setContentsMargins(0, 0, 0, 0)
+        fb_rows.setSpacing(3)
+        find_row_w = QWidget()
+        find_row_l = QHBoxLayout(find_row_w)
+        find_row_l.setContentsMargins(0, 0, 0, 0)
+        find_row_l.setSpacing(6)
+        find_row_l.addWidget(QLabel("Find:"))
+        find_row_l.addWidget(self._find_input, 2)
+        find_row_l.addWidget(self._fb_case_btn)
+        find_row_l.addWidget(self._fb_word_btn)
+        find_row_l.addWidget(self._fb_regex_btn)
+        find_row_l.addWidget(self._find_match_lbl)
+        find_row_l.addWidget(_prev_btn)
+        find_row_l.addWidget(_next_btn)
+        fb_rows.addWidget(find_row_w)
+        fb_rows.addWidget(self._replace_row)
+
+        fb_layout.addLayout(fb_rows, 1)
         fb_layout.addWidget(_close_find_btn)
-        _find_next_btn.clicked.connect(self._find_next)
+
+        # Wire signals
+        self._find_input.textChanged.connect(self._find_live_update)
+        self._find_input.returnPressed.connect(self._find_next)
+        self._find_input.installEventFilter(self)   # catch Shift+Enter for prev
+        self._fb_case_btn.toggled.connect(self._find_live_update)
+        self._fb_word_btn.toggled.connect(self._find_live_update)
+        self._fb_regex_btn.toggled.connect(self._find_live_update)
+        _next_btn.clicked.connect(self._find_next)
+        _prev_btn.clicked.connect(self._find_prev)
+        _close_find_btn.clicked.connect(self._hide_find_bar)
         _replace_btn.clicked.connect(self._replace_current)
         _replace_all_btn.clicked.connect(self._replace_all)
-        _close_find_btn.clicked.connect(self._hide_find_bar)
-        self._find_input.returnPressed.connect(self._find_next)
 
         # ── Top widget assembly ───────────────────────────────────────────────
         
@@ -393,14 +507,21 @@ class SqlTab(QWidget):
         # STATUS (Hidden by default)
         # ==================================
 
-        self.status_label = QLabel("")
+        # Status / error area — QPlainTextEdit so errors are selectable & copyable
+        self.status_label = QPlainTextEdit()
+        self.status_label.setReadOnly(True)
+        self.status_label.setFixedHeight(0)   # hidden until needed
         self.status_label.setStyleSheet("""
-            QLabel {
+            QPlainTextEdit {
                 color: #888888;
                 padding: 3px 5px;
-                font-size: 11px;
+                font-size: 12px;
+                background: transparent;
+                border: none;
             }
         """)
+        self.status_label.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.status_label.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         # ==================================
         # RESULT GRID
@@ -433,8 +554,8 @@ class SqlTab(QWidget):
         # Wire structure viewer signal (routed up to parent ConnectionPanel)
         self.result_table.show_structure.connect(self._on_result_show_structure)
 
-        # Hide results table by default - only show after query execution
-        self.result_table.hide()
+        # Hide results table by default - show empty Excel grid instead
+        self._show_excel_grid()
 
         # ── Pagination bar ─────────────────────────────────────────────
         self._pagination_bar = QWidget()
@@ -507,9 +628,13 @@ class SqlTab(QWidget):
         self.minify_shortcut = QShortcut(QKeySequence("Ctrl+Shift+I"), self)
         self.minify_shortcut.activated.connect(self.minify_sql)
 
-        # Ctrl+H — find & replace
+        # Ctrl+H — find & replace (shows replace row)
         self.find_shortcut = QShortcut(QKeySequence("Ctrl+H"), self)
-        self.find_shortcut.activated.connect(self._toggle_find_bar)
+        self.find_shortcut.activated.connect(self._toggle_find_replace)
+
+        # Ctrl+F — find only (hides replace row)
+        self.find_only_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        self.find_only_shortcut.activated.connect(self._toggle_find_bar)
 
         # Ctrl+Shift+F — toggle format-on-run
         self.fmt_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
@@ -518,11 +643,7 @@ class SqlTab(QWidget):
         # Add keyboard shortcut for save (Cmd+S)
         self.save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         self.save_shortcut.activated.connect(self.save_changes)
-        
-        # Add Cmd+F shortcut for filter
-        self.filter_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
-        self.filter_shortcut.activated.connect(self.toggle_filter)
-        
+
         # Add Esc shortcut to hide filter
         self.esc_shortcut = QShortcut(QKeySequence("Esc"), self)
         self.esc_shortcut.activated.connect(self.hide_filter)
@@ -578,6 +699,18 @@ class SqlTab(QWidget):
 
     def eventFilter(self, obj, event):
         """Route key events: popup navigation first, then auto-trigger."""
+        # Handle key events in the find input
+        if obj is self._find_input and event.type() == event.Type.KeyPress:
+            key = event.key()
+            mod = event.modifiers()
+            if key == Qt.Key_Return and (mod & Qt.ShiftModifier):
+                self._find_prev()
+                return True
+            if key == Qt.Key_Escape:
+                self._hide_find_bar()
+                return True
+            return False   # let QLineEdit handle other keys
+
         if obj != self.editor or event.type() != event.Type.KeyPress:
             return super().eventFilter(obj, event)
 
@@ -590,6 +723,7 @@ class SqlTab(QWidget):
         if key == Qt.Key_Escape:
             if self.completer.popup_visible:
                 self.completer.hide_popup()
+                self._completer_suppressed = True   # don't re-show on next backspace
                 return True          # consumed — don't also close the filter bar
             # popup not visible → let the existing Esc shortcut hide the filter
             return super().eventFilter(obj, event)
@@ -600,7 +734,18 @@ class SqlTab(QWidget):
 
         # 3. Ctrl+Space: force-show suggestions without inserting a space
         if key == Qt.Key_Space and mod == Qt.ControlModifier:
+            self._completer_suppressed = False
             self.completer.update(force=True)
+            return True
+
+        # Ctrl+/ — toggle line comment (-- ) on selected lines or current line
+        if key == Qt.Key_Slash and mod == Qt.ControlModifier:
+            self._toggle_line_comment()
+            return True
+
+        # Ctrl+D — select next occurrence of current word / selection
+        if key == Qt.Key_D and mod == Qt.ControlModifier:
+            self._select_next_occurrence()
             return True
 
         # 3. Cursor-movement keys: hide popup, pass to editor normally
@@ -614,17 +759,28 @@ class SqlTab(QWidget):
             self._delete_current_line()
             return True
 
+        # Auto-close quotes: ' and "
+        if key in (Qt.Key_Apostrophe, Qt.Key_QuoteDbl):
+            self._auto_close_quote(key)
+            return True
+
         # 5. Backspace / Delete: process first, then update
         if key in (Qt.Key_Backspace, Qt.Key_Delete):
             result = super().eventFilter(obj, event)
-            self.completer.update()
+            if not getattr(self, '_completer_suppressed', False):
+                self.completer.update()
             return result
 
         # 5. Printable word characters: process first, then update
         text = event.text()
         if text and (text.isalnum() or text in ('_', '.')):
+            self._completer_suppressed = False   # typing a letter re-enables suggestions
             result = super().eventFilter(obj, event)
-            self.completer.update()
+            # Don't show suggestions when cursor is inside a string literal
+            if not self._cursor_inside_string():
+                self.completer.update()
+            else:
+                self.completer.hide_popup()
             return result
 
         # 6. Any other key (Enter for new line, space, punctuation…): hide popup
@@ -633,6 +789,139 @@ class SqlTab(QWidget):
             self.completer.hide_popup()
 
         return super().eventFilter(obj, event)
+
+    def _auto_close_quote(self, key):
+        """Insert a matching closing quote and place the cursor between them.
+        If the cursor is already just before the closing quote, skip over it."""
+        char = "'" if key == Qt.Key_Apostrophe else '"'
+        cursor = self.editor.textCursor()
+        doc = self.editor.toPlainText()
+        pos = cursor.position()
+
+        # If selection exists, wrap the selection with quotes
+        if cursor.hasSelection():
+            sel = cursor.selectedText()
+            cursor.insertText(char + sel + char)
+            return
+
+        # If next character is already the same quote, just move past it
+        if pos < len(doc) and doc[pos] == char:
+            cursor.movePosition(QTextCursor.NextCharacter)
+            self.editor.setTextCursor(cursor)
+            return
+
+        # Otherwise insert both and position cursor between them
+        cursor.insertText(char + char)
+        cursor.movePosition(QTextCursor.PreviousCharacter)
+        self.editor.setTextCursor(cursor)
+        # A quote opens a string — suppress suggestions immediately
+        self._completer_suppressed = True
+        self.completer.hide_popup()
+
+    def _cursor_inside_string(self) -> bool:
+        """Return True if the editor cursor is currently inside a quoted string literal."""
+        text = self.editor.toPlainText()
+        pos = self.editor.textCursor().position()
+        in_single = False
+        in_double = False
+        i = 0
+        while i < pos:
+            ch = text[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif ch == '\\' and (in_single or in_double):
+                i += 1  # skip escaped character
+            i += 1
+        return in_single or in_double
+
+    def _toggle_line_comment(self):
+        """Toggle -- comment on each selected line (or current line)."""
+        cursor = self.editor.textCursor()
+        cursor.beginEditBlock()
+        if cursor.hasSelection():
+            start = cursor.selectionStart()
+            end   = cursor.selectionEnd()
+        else:
+            start = end = cursor.position()
+
+        # Work on a copy to get block positions
+        c = QTextCursor(self.editor.document())
+        c.setPosition(start)
+        c.movePosition(QTextCursor.StartOfBlock)
+        first_block = c.blockNumber()
+
+        c.setPosition(end)
+        if c.atBlockStart() and end > start:
+            c.movePosition(QTextCursor.PreviousBlock)
+        last_block = c.blockNumber()
+
+        # Determine if ALL lines are commented (to decide add vs remove)
+        doc = self.editor.document()
+        all_commented = all(
+            doc.findBlockByNumber(b).text().lstrip().startswith('--')
+            for b in range(first_block, last_block + 1)
+        )
+
+        for b in range(first_block, last_block + 1):
+            block = doc.findBlockByNumber(b)
+            bc = QTextCursor(block)
+            line = block.text()
+            if all_commented:
+                # Remove first occurrence of -- (with optional space)
+                stripped = line.lstrip()
+                indent = len(line) - len(stripped)
+                if stripped.startswith('-- '):
+                    bc.movePosition(QTextCursor.StartOfBlock)
+                    bc.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, indent)
+                    bc.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 3)
+                    bc.removeSelectedText()
+                elif stripped.startswith('--'):
+                    bc.movePosition(QTextCursor.StartOfBlock)
+                    bc.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, indent)
+                    bc.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 2)
+                    bc.removeSelectedText()
+            else:
+                # Add -- at the start of the line (after indent)
+                indent = len(line) - len(line.lstrip())
+                bc.movePosition(QTextCursor.StartOfBlock)
+                bc.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, indent)
+                bc.insertText('-- ')
+
+        cursor.endEditBlock()
+
+    def _select_next_occurrence(self):
+        """Cmd+D: expand selection to current word, then find and select next match."""
+        cursor = self.editor.textCursor()
+        doc    = self.editor.document()
+
+        # If no selection, select the word under the cursor first
+        if not cursor.hasSelection():
+            cursor.select(QTextCursor.WordUnderCursor)
+            self.editor.setTextCursor(cursor)
+            return
+
+        word = cursor.selectedText()
+        if not word:
+            return
+
+        # Search forward from current selection end
+        search_start = cursor.selectionEnd()
+        full_text = self.editor.toPlainText()
+
+        idx = full_text.find(word, search_start)
+        if idx == -1:
+            # Wrap around from the beginning
+            idx = full_text.find(word, 0)
+        if idx == -1 or idx == cursor.selectionStart():
+            return  # only one occurrence
+
+        new_cursor = QTextCursor(doc)
+        new_cursor.setPosition(idx)
+        new_cursor.setPosition(idx + len(word), QTextCursor.KeepAnchor)
+        self.editor.setTextCursor(new_cursor)
+        self.editor.ensureCursorVisible()
     
     def _delete_current_line(self):
         """Delete the entire line the cursor is on (Cmd+Backspace / ⌘⌫)."""
@@ -707,8 +996,12 @@ class SqlTab(QWidget):
         query = self.editor.toPlainText()
         if not query.strip():
             return
-        formatted = sqlparse.format(query, reindent=True, keyword_case="upper")
-        self.editor.setPlainText(formatted)
+        try:
+            formatted = sqlparse.format(query, reindent=True, keyword_case="upper")
+            self.editor.setPlainText(formatted)
+        except Exception:
+            # Query too large for sqlparse (>10 000 tokens) — skip silently
+            pass
 
     def minify_sql(self):
         """Minify/compress SQL query."""
@@ -716,10 +1009,13 @@ class SqlTab(QWidget):
         if not query.strip():
             return
         import re
-        minified = sqlparse.format(
-            query, reindent=False, keyword_case="upper", strip_comments=True)
-        minified = re.sub(r'\s+', ' ', minified).strip()
-        self.editor.setPlainText(minified)    
+        try:
+            minified = sqlparse.format(
+                query, reindent=False, keyword_case="upper", strip_comments=True)
+            minified = re.sub(r'\s+', ' ', minified).strip()
+            self.editor.setPlainText(minified)
+        except Exception:
+            pass    
     def show_filter_dialog(self):
         """Show filter dialog for current results"""
         if self.current_df is None or self.current_df.empty:
@@ -877,6 +1173,9 @@ class SqlTab(QWidget):
         page_df = df.iloc[start:end].reset_index(drop=True)
 
         self.result_table.load_data(page_df, self.current_table_name)
+        # Restore interactive resize mode (overrides the Stretch set by the placeholder grid)
+        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.result_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
 
         # Re-apply sort indicator so it survives load_data reset
         if self._result_sort_col >= 0:
@@ -934,10 +1233,12 @@ class SqlTab(QWidget):
         filter_status = self.result_table.get_filter_status()
         if filter_status:
             row_count = self.result_table.rowCount()
-            self.status_label.setText(f"Filtered: {row_count} rows | {filter_status}")
+            self.status_label.setPlainText(f"Filtered: {row_count} rows | {filter_status}")
+            self.status_label.setFixedHeight(28)
         else:
             row_count = self.result_table.rowCount()
-            self.status_label.setText(f"Rows: {row_count}")
+            self.status_label.setPlainText(f"Rows: {row_count}")
+            self.status_label.setFixedHeight(28)
 
     def _on_result_filter_chip(self, col_name: str, operator: str, value: str):
         """Pre-populate the filter bar with the clicked cell value and show it."""
@@ -970,42 +1271,65 @@ class SqlTab(QWidget):
 
 
 
-    def update_status(
-        self,
-        rows,
-        execution_time
-    ):
-
-        self.status_label.setText(
-            f"{rows} rows | {execution_time:.3f}s"
+    def _show_excel_grid(self, cols: int = 8, rows: int = 20):
+        """Show an empty Excel-like placeholder grid."""
+        self.result_table.setColumnCount(cols)
+        self.result_table.setRowCount(rows)
+        self.result_table.setHorizontalHeaderLabels(
+            [chr(65 + i) for i in range(cols)]
         )
-        self.status_label.setStyleSheet("""
-            QLabel {
+        self.result_table.clearContents()
+        # Stretch all columns equally to fill the full available width
+        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # Make sure the grid is visible and not clickable to cause confusion
+        self.result_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.result_table.show()
+        # Clear status
+        self.status_label.setFixedHeight(0)
+        self.status_label.setPlainText("")
+
+    def _set_status(self, text: str, style: str = "", height: int = 28):
+        """Helper: show text in the status_label (QPlainTextEdit)."""
+        lines = text.count('\n') + 1
+        h = min(max(height, lines * 20 + 16), 150)
+        self.status_label.setFixedHeight(h)
+        self.status_label.setPlainText(text)
+        if style:
+            self.status_label.setStyleSheet(style)
+        self.status_label.show()
+
+    def update_status(self, rows, execution_time):
+        self._set_status(
+            f"{rows} rows | {execution_time:.3f}s",
+            """
+            QPlainTextEdit {
                 color: #0078d4;
                 padding: 5px;
                 font-size: 12px;
                 font-weight: 500;
+                background: transparent;
+                border: none;
             }
-        """)
+            """,
+        )
 
     def show_error(self, message: str, query: str = "", elapsed: float = 0.0):
-        """Display a SQL error inline with actionable hints."""
+        """Display a SQL error inline with actionable hints — always selectable."""
         self.result_table.clearContents()
         self.result_table.setRowCount(0)
         self.result_table.setColumnCount(0)
-        self.result_table.show()
+        self._show_excel_grid()   # keep the empty grid visible
 
-        # ── Parse error into a human-friendly hint ────────────────────────────
         hint = _sql_error_hint(message, query)
         time_str = f"  ({elapsed:.2f}s)" if elapsed > 0 else ""
         display = f"❌  {message}{time_str}"
         if hint:
             display += f"\n💡  {hint}"
 
-        self.status_label.setText(display)
-        self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("""
-            QLabel {
+        self._set_status(
+            display,
+            """
+            QPlainTextEdit {
                 color: #f48771;
                 padding: 8px 10px;
                 font-size: 12px;
@@ -1013,25 +1337,31 @@ class SqlTab(QWidget):
                 background-color: #3a1a1a;
                 border-radius: 4px;
                 border-left: 3px solid #f48771;
+                selection-background-color: #6a3a3a;
+                border: none;
             }
-        """)
+            """,
+        )
 
     def show_cancelled(self):
         """Show a neutral 'query cancelled' status."""
         self.result_table.clearContents()
         self.result_table.setRowCount(0)
         self.result_table.setColumnCount(0)
-        self.status_label.setText("⊘  Query cancelled")
-        self.status_label.setWordWrap(False)
-        self.status_label.setStyleSheet("""
-            QLabel {
+        self._show_excel_grid()
+        self._set_status(
+            "⊘  Query cancelled",
+            """
+            QPlainTextEdit {
                 color: #8e8e93;
                 padding: 6px 10px;
                 font-size: 12px;
                 background-color: #2c2c2e;
                 border-radius: 4px;
+                border: none;
             }
-        """)
+            """,
+        )
 
     # ======================================
     # EXPORT DATA
@@ -1141,7 +1471,8 @@ class SqlTab(QWidget):
 
             # Load the imported data into the table
             self.load_dataframe(df)
-            self.status_label.setText(f"Imported {len(df)} rows from {format_name} file")
+            self.status_label.setPlainText(f"Imported {len(df)} rows from {format_name} file")
+            self.status_label.setFixedHeight(28)
 
             QMessageBox.information(
                 self,
@@ -1354,7 +1685,8 @@ class SqlTab(QWidget):
 
         # Update status
         total = len(self.original_df) if self.original_df is not None else 0
-        self.status_label.setText(f"{len(filtered_df)} rows (filtered from {total})")
+        self.status_label.setPlainText(f"{len(filtered_df)} rows (filtered from {total})")
+        self.status_label.setFixedHeight(28)
     
     def clear_all_filters(self):
         """Clear all filters and show original data"""
@@ -1363,7 +1695,8 @@ class SqlTab(QWidget):
             self._result_page = 0
             self._refresh_result_view()
             self.result_table.show()
-            self.status_label.setText(f"{len(self.original_df)} rows")
+            self.status_label.setPlainText(f"{len(self.original_df)} rows")
+            self.status_label.setFixedHeight(28)
         
         # Clear all filter rows except first one
         while self.filter_rows_layout.count() > 1:
@@ -1460,49 +1793,169 @@ class SqlTab(QWidget):
 
     # ── Find / Replace ────────────────────────────────────────────────────────
 
+    # ─── Find / Replace ───────────────────────────────────────────────────────
+
     def _toggle_find_bar(self):
+        """Cmd+F: show find bar (replace row hidden)."""
         if self._find_bar.isHidden():
+            self._replace_row.hide()
             self._find_bar.show()
             self._find_input.setFocus()
             self._find_input.selectAll()
+            self._find_live_update()
         else:
             self._hide_find_bar()
 
+    def _toggle_find_replace(self):
+        """Cmd+H: show find+replace bar."""
+        self._replace_row.show()
+        self._find_bar.show()
+        self._find_input.setFocus()
+        self._find_input.selectAll()
+        self._find_live_update()
+
     def _hide_find_bar(self):
         self._find_bar.hide()
+        self._find_matches.clear()
+        self._find_match_idx = -1
+        self._find_match_lbl.setText("")
+        self._clear_find_highlights()
         self.editor.setFocus()
 
-    def _find_next(self):
-        text = self._find_input.text()
+    # ── Smart search helpers ──────────────────────────────────────────────────
+
+    def _find_build_pattern(self, text: str):
+        """Build a regex pattern from the current search text + toggles.
+        Smart-case: if text has no uppercase → case-insensitive.
+        Returns compiled re.Pattern or None."""
         if not text:
+            return None
+        use_case  = self._fb_case_btn.isChecked()
+        use_word  = self._fb_word_btn.isChecked()
+        use_regex = self._fb_regex_btn.isChecked()
+
+        # Smart-case: override case toggle when text has no uppercase
+        if not use_case and not any(c.isupper() for c in text):
+            flags = _re.IGNORECASE
+        else:
+            flags = 0 if use_case else _re.IGNORECASE
+
+        try:
+            pattern = text if use_regex else _re.escape(text)
+            if use_word:
+                pattern = r"\b" + pattern + r"\b"
+            return _re.compile(pattern, flags)
+        except _re.error:
+            return None
+
+    def _clear_find_highlights(self):
+        """Remove all orange match highlights from the editor."""
+        fmt_clr = QTextCharFormat()
+        cur = QTextCursor(self.editor.document())
+        cur.select(QTextCursor.Document)
+        cur.setCharFormat(fmt_clr)
+        cur.clearSelection()
+        self.editor.setExtraSelections(self.editor.extraSelections()[:1])  # keep line hl
+
+    def _find_live_update(self, *_):
+        """Re-run search on every keystroke or toggle change."""
+        text = self._find_input.text()
+        self._find_matches.clear()
+        self._find_match_idx = -1
+        self._clear_find_highlights()
+
+        pat = self._find_build_pattern(text)
+        if pat is None:
+            self._find_match_lbl.setText("")
+            self._find_input.setStyleSheet(
+                self._find_input.styleSheet().replace("border-color:#ff453a;", "")
+            )
             return
-        found = self.editor.find(text)
-        if not found:
-            # Wrap around
-            cursor = self.editor.textCursor()
-            cursor.movePosition(cursor.Start)
-            self.editor.setTextCursor(cursor)
-            self.editor.find(text)
+
+        content = self.editor.toPlainText()
+        cursors = []
+        fmt_hi = QTextCharFormat()
+        fmt_hi.setBackground(QColor("#ff9f0a"))
+        fmt_hi.setForeground(QColor("#000000"))
+
+        for m in pat.finditer(content):
+            c = QTextCursor(self.editor.document())
+            c.setPosition(m.start())
+            c.setPosition(m.end(), QTextCursor.KeepAnchor)
+            self._find_matches.append(c)
+            sel = self.editor.ExtraSelection() if hasattr(self.editor, "ExtraSelection") else None
+            # Use QTextEdit.ExtraSelection approach via setExtraSelections
+            from PySide6.QtWidgets import QTextEdit
+            es = QTextEdit.ExtraSelection()
+            es.cursor = c
+            es.format = fmt_hi
+            cursors.append(es)
+
+        # Keep current-line highlight (index 0) and add match highlights
+        base = self.editor.extraSelections()[:1]
+        self.editor.setExtraSelections(base + cursors)
+
+        count = len(self._find_matches)
+        if count == 0:
+            self._find_match_lbl.setText("not found")
+            self._find_match_lbl.setStyleSheet("color:#ff453a;font-size:11px;min-width:60px;")
+        else:
+            self._find_match_lbl.setText(f"1 of {count}")
+            self._find_match_lbl.setStyleSheet("color:#8e8e93;font-size:11px;min-width:60px;")
+            # Jump to first match
+            self._find_match_idx = 0
+            self._jump_to_match(0)
+
+    def _jump_to_match(self, idx: int):
+        if not self._find_matches:
+            return
+        idx = idx % len(self._find_matches)
+        self._find_match_idx = idx
+        c = QTextCursor(self._find_matches[idx])
+        self.editor.setTextCursor(c)
+        self.editor.ensureCursorVisible()
+        self._find_match_lbl.setText(
+            f"{idx + 1} of {len(self._find_matches)}")
+        self._find_match_lbl.setStyleSheet("color:#8e8e93;font-size:11px;min-width:60px;")
+
+    def _find_next(self):
+        if not self._find_matches:
+            self._find_live_update()
+            return
+        self._jump_to_match(self._find_match_idx + 1)
+
+    def _find_prev(self):
+        if not self._find_matches:
+            self._find_live_update()
+            return
+        self._jump_to_match(self._find_match_idx - 1)
 
     def _replace_current(self):
         text = self._find_input.text()
         repl = self._replace_input.text()
-        if not text:
+        if not text or not self._find_matches:
             return
-        cursor = self.editor.textCursor()
-        if cursor.hasSelection() and cursor.selectedText() == text:
-            cursor.insertText(repl)
-        self._find_next()
+        idx  = self._find_match_idx
+        if 0 <= idx < len(self._find_matches):
+            c = QTextCursor(self._find_matches[idx])
+            c.beginEditBlock()
+            c.removeSelectedText()
+            c.insertText(repl)
+            c.endEditBlock()
+        self._find_live_update()
 
     def _replace_all(self):
         text = self._find_input.text()
         repl = self._replace_input.text()
         if not text:
             return
-        content = self.editor.toPlainText()
-        new_content = content.replace(text, repl)
-        if new_content != content:
+        pat = self._find_build_pattern(text)
+        if pat is None:
+            return
+        new_content = pat.sub(repl, self.editor.toPlainText())
+        if new_content != self.editor.toPlainText():
             self.editor.setPlainText(new_content)
+        self._find_live_update()
 
     # ── Diff ──────────────────────────────────────────────────────────────────
 

@@ -142,8 +142,27 @@ class TableViewWidget(QWidget):
             }
         """)
 
-        self.page_label = QLabel("Page 1")
-        self.page_label.setStyleSheet("color: #cccccc; font-size: 11px; margin: 0 8px;")
+        self.page_label = QLineEdit("1")
+        self.page_label.setReadOnly(True)
+        self.page_label.setFixedWidth(72)
+        self.page_label.setAlignment(Qt.AlignCenter)
+        self.page_label.setStyleSheet(
+            "QLineEdit { color:#cccccc; font-size:11px; background:transparent;"
+            " border:none; margin:0 4px; }"
+            "QLineEdit:focus { background:#2d2d2d; border:1px solid #505050;"
+            " border-radius:3px; color:#ffffff; }"
+        )
+        self.page_label.setToolTip("Click and type a page number, then press Enter to jump")
+        self.page_label.returnPressed.connect(self._jump_to_page)
+        self.page_label.mousePressEvent = lambda e: (
+            self.page_label.setReadOnly(False),
+            self.page_label.selectAll(),
+            type(self.page_label).mousePressEvent(self.page_label, e)
+        )
+        self.page_label.focusOutEvent = lambda e: (
+            self.page_label.setReadOnly(True),
+            type(self.page_label).focusOutEvent(self.page_label, e)
+        )
 
         self.next_btn = QPushButton(">")
         self.next_btn.clicked.connect(self.next_page)
@@ -332,22 +351,47 @@ class TableViewWidget(QWidget):
         self.load_table_structure()
 
     def create_structure_tab(self):
-        """Create the structure viewing tab"""
+        """Create the structure viewing tab with Columns / Indexes / FK sub-tabs."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Structure table
+        layout.setSpacing(0)
+
+        self._struct_tabs = QTabWidget()
+        self._struct_tabs.setDocumentMode(True)
+
+        # ── Columns ─────────────────────────────────────────────────────────
         self.structure_table = QTableWidget()
         self.structure_table.setColumnCount(6)
-        self.structure_table.setHorizontalHeaderLabels([
-            "Column", "Type", "Nullable", "Key", "Default", "Extra"
-        ])
+        self.structure_table.setHorizontalHeaderLabels(
+            ["Column", "Type", "Nullable", "Key", "Default", "Extra"])
         self.structure_table.horizontalHeader().setStretchLastSection(True)
         self.structure_table.setAlternatingRowColors(True)
-        
-        layout.addWidget(self.structure_table)
-        
+        self.structure_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.structure_table.verticalHeader().setVisible(False)
+        self._struct_tabs.addTab(self.structure_table, "Columns")
+
+        # ── Indexes ─────────────────────────────────────────────────────────
+        self._index_table = QTableWidget()
+        self._index_table.setColumnCount(4)
+        self._index_table.setHorizontalHeaderLabels(["Name", "Columns", "Unique", "Type"])
+        self._index_table.horizontalHeader().setStretchLastSection(True)
+        self._index_table.setAlternatingRowColors(True)
+        self._index_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._index_table.verticalHeader().setVisible(False)
+        self._struct_tabs.addTab(self._index_table, "Indexes")
+
+        # ── Foreign Keys ────────────────────────────────────────────────────
+        self._fk_table = QTableWidget()
+        self._fk_table.setColumnCount(3)
+        self._fk_table.setHorizontalHeaderLabels(["Column", "References Table", "References Column"])
+        self._fk_table.horizontalHeader().setStretchLastSection(True)
+        self._fk_table.setAlternatingRowColors(True)
+        self._fk_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._fk_table.verticalHeader().setVisible(False)
+        self._struct_tabs.addTab(self._fk_table, "Foreign Keys")
+
+        layout.addWidget(self._struct_tabs)
         return widget
     
     def load_table_data(self):
@@ -432,7 +476,7 @@ class TableViewWidget(QWidget):
             self.data_table.load_data(df, table_name=self.table_name)
             self._restore_col_widths()
             total_pages = (self.total_rows + self.page_size - 1) // self.page_size
-            self.page_label.setText(f"Page {self.current_page}/{max(1, total_pages)}")
+            self.page_label.setText(f"{self.current_page}/{max(1, total_pages)}")
             
             start_row = offset + 1 if self.total_rows > 0 else 0
             end_row = min(offset + self.page_size, self.total_rows)
@@ -466,7 +510,25 @@ class TableViewWidget(QWidget):
         if self.current_page < total_pages:
             self.current_page += 1
             self.load_table_data()
-    
+
+    def _jump_to_page(self):
+        """Jump to the page number typed in page_label."""
+        total_pages = max(1, (self.total_rows + self.page_size - 1) // self.page_size)
+        raw = self.page_label.text().strip().split("/")[0].strip()
+        try:
+            page = int(raw)
+        except ValueError:
+            self.page_label.setText(f"{self.current_page}/{total_pages}")
+            self.page_label.setReadOnly(True)
+            return
+        page = max(1, min(total_pages, page))
+        self.page_label.setReadOnly(True)
+        if page != self.current_page:
+            self.current_page = page
+            self.load_table_data()
+        else:
+            self.page_label.setText(f"{self.current_page}/{total_pages}")
+
     def add_filter_row(self):
         """Add a new filter row"""
         row_widget = QWidget()
@@ -671,25 +733,44 @@ class TableViewWidget(QWidget):
                 self.load_table_data()
     
     def load_table_structure(self):
-        """Load table structure"""
+        """Load columns, indexes, and foreign keys into the structure sub-tabs."""
         try:
             columns = self.db_service.get_columns(self.table_name)
-            
             self.structure_table.setRowCount(len(columns))
-            
             for i, col in enumerate(columns):
-                # MySQL uses: Field, Type, Null, Key, Default, Extra
-                # PostgreSQL/SQLite converted to similar format
                 self.structure_table.setItem(i, 0, QTableWidgetItem(str(col.get('Field', ''))))
                 self.structure_table.setItem(i, 1, QTableWidgetItem(str(col.get('Type', ''))))
                 self.structure_table.setItem(i, 2, QTableWidgetItem(str(col.get('Null', ''))))
                 self.structure_table.setItem(i, 3, QTableWidgetItem(str(col.get('Key', ''))))
                 self.structure_table.setItem(i, 4, QTableWidgetItem(str(col.get('Default', ''))))
                 self.structure_table.setItem(i, 5, QTableWidgetItem(str(col.get('Extra', ''))))
-            
+            self._struct_tabs.setTabText(0, f"Columns ({len(columns)})")
             logger.info(f"Loaded structure for {self.table_name}: {len(columns)} columns")
         except Exception as ex:
-            logger.error(f"Failed to load table structure: {str(ex)}")
+            logger.error(f"Failed to load columns: {ex}")
+
+        try:
+            indexes = self.db_service.get_indexes(self.table_name)
+            self._index_table.setRowCount(len(indexes))
+            for i, idx in enumerate(indexes):
+                self._index_table.setItem(i, 0, QTableWidgetItem(str(idx.get('name', ''))))
+                self._index_table.setItem(i, 1, QTableWidgetItem(str(idx.get('columns', ''))))
+                self._index_table.setItem(i, 2, QTableWidgetItem("Yes" if idx.get('unique') else "No"))
+                self._index_table.setItem(i, 3, QTableWidgetItem(str(idx.get('type', ''))))
+            self._struct_tabs.setTabText(1, f"Indexes ({len(indexes)})")
+        except Exception as ex:
+            logger.error(f"Failed to load indexes: {ex}")
+
+        try:
+            fks = self.db_service.get_foreign_keys(self.table_name)
+            self._fk_table.setRowCount(len(fks))
+            for i, fk in enumerate(fks):
+                self._fk_table.setItem(i, 0, QTableWidgetItem(str(fk.get('column', ''))))
+                self._fk_table.setItem(i, 1, QTableWidgetItem(str(fk.get('ref_table', ''))))
+                self._fk_table.setItem(i, 2, QTableWidgetItem(str(fk.get('ref_column', ''))))
+            self._struct_tabs.setTabText(2, f"Foreign Keys ({len(fks)})")
+        except Exception as ex:
+            logger.error(f"Failed to load foreign keys: {ex}")
     
     def execute_query_editor(self):
         """Execute query from the query editor tab - removed since no query tab"""

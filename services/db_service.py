@@ -55,7 +55,13 @@ class DbService:
             "user": config["user"],
             "password": config["password"],
             "cursorclass": pymysql.cursors.DictCursor,
-            "autocommit": True
+            "autocommit": True,
+            # Prevent pymysql from timing out long-running queries.
+            # read_timeout / write_timeout are the client-side socket limits.
+            # 3600 = 1 hour — matches what TablePlus and DBeaver use.
+            "read_timeout": 3600,
+            "write_timeout": 3600,
+            "connect_timeout": 30,
         }
         
         # Only add database if provided
@@ -63,6 +69,19 @@ class DbService:
             connect_params["database"] = config["database"]
         
         self.connection = pymysql.connect(**connect_params)
+
+        # Push session-level timeouts on the server side so net_read_timeout
+        # (default 30 s) and wait_timeout don't kill long queries.
+        try:
+            with self.connection.cursor() as cur:
+                cur.execute(
+                    "SET SESSION net_read_timeout=3600, "
+                    "net_write_timeout=3600, "
+                    "wait_timeout=28800, "
+                    "interactive_timeout=28800"
+                )
+        except Exception:
+            pass   # non-fatal: best-effort
     
     def _connect_postgresql(self, config):
         """Connect to PostgreSQL database"""
@@ -248,15 +267,37 @@ class DbService:
         logger.info("Reconnect successful")
 
     def is_connected(self):
-
-        try:
-
-            if self.connection:
-                self.connection.ping(reconnect=True)
-                return True
-
+        """Check if connected by opening a *separate* short-lived connection.
+        Never touches self.connection so it cannot corrupt a running query's
+        packet sequence."""
+        if not self._config or not self.connection:
             return False
-
+        try:
+            if self.db_type == "mysql":
+                import pymysql as _pm
+                kc = _pm.connect(
+                    host=self._config.get("host", "127.0.0.1"),
+                    port=int(self._config.get("port", 3306)),
+                    user=self._config.get("user", ""),
+                    password=self._config.get("password", ""),
+                    connect_timeout=5,
+                )
+                kc.close()
+                return True
+            elif self.db_type == "postgresql":
+                import psycopg2 as _pg
+                kc = _pg.connect(
+                    host=self._config.get("host", "127.0.0.1"),
+                    port=int(self._config.get("port", 5432)),
+                    user=self._config.get("user", ""),
+                    password=self._config.get("password", ""),
+                    connect_timeout=5,
+                )
+                kc.close()
+                return True
+            else:
+                # SQLite is always "connected" if we have a connection object
+                return self.connection is not None
         except Exception:
             return False
 
@@ -347,30 +388,52 @@ class DbService:
         return []
 
     def _execute_query_raw(self, query):
-        """Internal: run SELECT without reconnect logic."""
+        """Internal: run a SQL statement without reconnect logic.
+        For statements that return a result set (SELECT/SHOW/EXPLAIN/DESCRIBE),
+        returns a DataFrame.  For DML (UPDATE/INSERT/DELETE/…) returns an empty
+        DataFrame with an '_affected_rows' column so the UI can show the count."""
         if self.db_type == "mysql":
             cursor = self.connection.cursor()
             cursor.execute(query)
-            rows = cursor.fetchall()
-            cursor.close()
-            return pd.DataFrame(rows)
-        
+            if cursor.description:
+                cols = [d[0] for d in cursor.description]
+                rows = cursor.fetchall()
+                cursor.close()
+                return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+            else:
+                affected = cursor.rowcount
+                cursor.close()
+                return pd.DataFrame([{"Query OK, rows affected": affected}])
+
         elif self.db_type == "postgresql":
             import psycopg2.extras
             cursor = self.connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             cursor.execute(query)
-            rows = cursor.fetchall()
-            cursor.close()
-            return pd.DataFrame(rows)
-        
+            if cursor.description:
+                cols = [d[0] for d in cursor.description]
+                rows = cursor.fetchall()
+                cursor.close()
+                return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+            else:
+                affected = cursor.rowcount
+                cursor.close()
+                return pd.DataFrame([{"Query OK, rows affected": affected}])
+
         elif self.db_type == "sqlite":
             cursor = self.connection.cursor()
             cursor.execute(query)
-            rows = cursor.fetchall()
-            cursor.close()
-            data = [dict(row) for row in rows]
-            return pd.DataFrame(data)
-        
+            if cursor.description:
+                cols = [d[0] for d in cursor.description]
+                rows = cursor.fetchall()
+                cursor.close()
+                data = [dict(row) for row in rows]
+                return pd.DataFrame(data, columns=cols) if data else pd.DataFrame(columns=cols)
+            else:
+                affected = cursor.rowcount
+                self.connection.commit()
+                cursor.close()
+                return pd.DataFrame([{"Query OK, rows affected": affected}])
+
         else:
             raise Exception(f"Unsupported database type: {self.db_type}")
 
@@ -397,6 +460,29 @@ class DbService:
         cursor.close()
         self.connection.commit()
         return affected_rows
+
+    def get_server_version(self) -> str:
+        """Return a short version string like 'MySQL 8.0.41' or 'PostgreSQL 15.3'."""
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute("SELECT VERSION()")
+                row = cursor.fetchone()
+                cursor.close()
+                ver = list(row.values())[0] if isinstance(row, dict) else row[0]
+                return f"MySQL {ver}"
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute("SHOW server_version")
+                row = cursor.fetchone()
+                cursor.close()
+                return f"PostgreSQL {row[0]}"
+            elif self.db_type == "sqlite":
+                import sqlite3 as _sq
+                return f"SQLite {_sq.sqlite_version}"
+        except Exception:
+            pass
+        return self.db_type.title() if self.db_type else ""
 
     def get_tables(self):
         """Get list of tables based on database type"""
@@ -616,3 +702,69 @@ class DbService:
     def get_connection_name(self):
 
         return self.connection_name
+
+    def get_indexes(self, table_name: str) -> list[dict]:
+        """Return index definitions for *table_name*.
+        Each dict has: name, columns, unique, type.
+        """
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute(f"SHOW INDEX FROM `{table_name}`")
+                rows = cursor.fetchall()
+                cursor.close()
+                # Group columns by index name
+                indexes: dict[str, dict] = {}
+                for r in rows:
+                    r = dict(r)
+                    name = r.get("Key_name", "")
+                    if name not in indexes:
+                        indexes[name] = {
+                            "name": name,
+                            "columns": [],
+                            "unique": r.get("Non_unique", 1) == 0,
+                            "type": r.get("Index_type", "BTREE"),
+                        }
+                    indexes[name]["columns"].append(r.get("Column_name", ""))
+                for idx in indexes.values():
+                    idx["columns"] = ", ".join(idx["columns"])
+                return list(indexes.values())
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT i.relname AS index_name,
+                           ix.indisunique AS is_unique,
+                           am.amname AS index_type,
+                           array_to_string(array_agg(a.attname ORDER BY k.pos), ', ') AS columns
+                    FROM pg_class t
+                    JOIN pg_index ix ON t.oid = ix.indrelid
+                    JOIN pg_class i ON i.oid = ix.indexrelid
+                    JOIN pg_am am ON i.relam = am.oid
+                    JOIN pg_attribute a ON a.attrelid = t.oid
+                    JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, pos)
+                         ON a.attnum = k.attnum
+                    WHERE t.relname = %s AND t.relkind = 'r'
+                    GROUP BY i.relname, ix.indisunique, am.amname
+                    ORDER BY i.relname
+                """, (table_name,))
+                rows = cursor.fetchall()
+                cursor.close()
+                return [{"name": r[0], "unique": r[1], "type": r[2], "columns": r[3]} for r in rows]
+            elif self.db_type == "sqlite":
+                cursor = self.connection.cursor()
+                cursor.execute(f"PRAGMA index_list({table_name})")
+                idx_list = cursor.fetchall()
+                indexes = []
+                for row in idx_list:
+                    row = dict(row) if hasattr(row, 'keys') else row
+                    idx_name = row[1] if isinstance(row, (list, tuple)) else row.get("name", "")
+                    unique = bool(row[2] if isinstance(row, (list, tuple)) else row.get("unique", 0))
+                    cursor.execute(f"PRAGMA index_info({idx_name})")
+                    cols = ", ".join(str(r[2] if isinstance(r, (list, tuple)) else r.get("name", ""))
+                                    for r in cursor.fetchall())
+                    indexes.append({"name": idx_name, "columns": cols, "unique": unique, "type": "BTREE"})
+                cursor.close()
+                return indexes
+        except Exception:
+            pass
+        return []

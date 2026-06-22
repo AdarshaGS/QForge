@@ -40,7 +40,9 @@ logger = get_logger()
 # ── Background query worker (must be a top-level class for PySide6) ──────────
 
 class _QueryWorker(QObject):
-    """Runs one or more SQL statements on a QThread and emits the result."""
+    """Runs one or more SQL statements on a QThread and emits the result.
+    Receives a *dedicated* DbService connection so it never shares state
+    with the main connection used for schema browsing."""
     done       = Signal(object, float)   # (DataFrame, elapsed_seconds)
     multi_done = Signal(list,  float)    # ([(label, df|Exception), ...], elapsed)
     errored    = Signal(str,   float)    # (error_message, elapsed_seconds)
@@ -57,8 +59,13 @@ class _QueryWorker(QObject):
         import sqlparse as _sp
         t0 = time.time()
         try:
-            # Multi-statement: detect 2+ non-empty statements
-            stmts = [s.strip() for s in _sp.split(self._q) if s.strip()]
+            # Multi-statement: detect 2+ non-empty statements.
+            # sqlparse.split raises SQLParseError on very large queries (>10k tokens);
+            # fall back to treating the whole text as a single statement in that case.
+            try:
+                stmts = [s.strip() for s in _sp.split(self._q) if s.strip()]
+            except Exception:
+                stmts = [self._q.strip()]
             if self._multi or len(stmts) > 1:
                 results = self._db.execute_multi_query(self._q)
                 elapsed = time.time() - t0
@@ -79,6 +86,12 @@ class _QueryWorker(QObject):
                 self.cancelled.emit()
             else:
                 self.errored.emit(str(ex), elapsed)
+        finally:
+            # Close the dedicated query connection when done
+            try:
+                self._db.disconnect()
+            except Exception:
+                pass
 
 
 class ConnectionPanel(QWidget):
@@ -103,6 +116,9 @@ class ConnectionPanel(QWidget):
     health_changed = Signal(str)
     # brief human-readable message (e.g. "Reconnected to MySQL")
     reconnected    = Signal(str)
+    # Bridge signals for background schema load
+    _schema_done   = Signal(object)   # (schema_data dict)
+    _schema_error  = Signal(str)      # error message
     def __init__(self, config: dict, db_service: DbService,
                  query_history: QueryHistory, parent=None):
         super().__init__(parent)
@@ -124,6 +140,8 @@ class ConnectionPanel(QWidget):
         self._q_multi_done.connect(self._on_query_multi_done, Qt.QueuedConnection)
         self._q_errored.connect(self._on_query_errored, Qt.QueuedConnection)
         self._q_cancelled.connect(self._on_query_cancelled, Qt.QueuedConnection)
+        self._schema_done.connect(self._on_schema_loaded, Qt.QueuedConnection)
+        self._schema_error.connect(self._on_schema_error, Qt.QueuedConnection)
         self._column_cache: dict = {}   # {table: [col, ...]} for autocomplete
 
         self._build_ui()
@@ -161,6 +179,40 @@ class ConnectionPanel(QWidget):
 
         # Cmd+K shortcut (also works as Ctrl+K on non-mac)
         QShortcut(QKeySequence("Ctrl+K"), self).activated.connect(self.show_db_switcher)
+
+        # ── Refresh Schema + Reconnect row ───────────────────────────
+        _action_row = QWidget()
+        _ar_layout = QHBoxLayout(_action_row)
+        _ar_layout.setContentsMargins(0, 0, 0, 0)
+        _ar_layout.setSpacing(4)
+
+        _btn_style = """
+            QPushButton {
+                background: transparent;
+                color: #8e8e93;
+                border: 1px solid #3a3a3c;
+                border-radius: 4px;
+                padding: 2px 8px;
+                font-size: 11px;
+            }
+            QPushButton:hover { color: #e5e5ea; border-color: #636366; }
+        """
+        self._refresh_schema_btn = QPushButton("↺ Schema")
+        self._refresh_schema_btn.setToolTip("Refresh schema tree (Cmd+Shift+R)")
+        self._refresh_schema_btn.setStyleSheet(_btn_style)
+        self._refresh_schema_btn.clicked.connect(self.load_schema)
+        _ar_layout.addWidget(self._refresh_schema_btn)
+
+        self._reconnect_btn = QPushButton("⟳ Reconnect")
+        self._reconnect_btn.setToolTip("Reconnect to the database")
+        self._reconnect_btn.setStyleSheet(_btn_style)
+        self._reconnect_btn.clicked.connect(self._do_reconnect)
+        _ar_layout.addWidget(self._reconnect_btn)
+
+        left_layout.addWidget(_action_row)
+
+        # Cmd+Shift+R — refresh schema
+        QShortcut(QKeySequence("Ctrl+Shift+R"), self).activated.connect(self.load_schema)
 
         self.table_search = QLineEdit()
         self.table_search.setPlaceholderText("Search tables...")
@@ -294,68 +346,154 @@ class ConnectionPanel(QWidget):
     # ─── Schema loading ───────────────────────────────────────────────────────
 
     def load_schema(self):
+        # Don't attempt schema load if not connected
+        if not self.db_service or not self.db_service.connection:
+            self.schema_tree.clear()
+            self.all_tables.clear()
+            self.all_table_items.clear()
+            self.all_schema_items.clear()
+            return
+
+        # Clear immediately so the user sees empty tree straight away
         self.schema_tree.clear()
         self.all_tables.clear()
         self.all_table_items.clear()
         self.all_schema_items.clear()
 
-        self._load_databases()
+        # Show a loading indicator
+        loading_item = QTreeWidgetItem(["Loading…"])
+        self.schema_tree.addTopLevelItem(loading_item)
 
-        try:
-            tables_cat = QTreeWidgetItem(["Tables"])
-            tables_cat.setExpanded(True)
-            views_cat = QTreeWidgetItem(["Views"])
-            functions_cat = QTreeWidgetItem(["Functions/Procedures"])
+        # Run the DB I/O on a daemon thread; results come back via _schema_done
+        db   = self.db_service
+        conf = dict(self.config)
+        sig_done  = self._schema_done
+        sig_error = self._schema_error
 
-            tables = self.db_service.get_tables()
-            # Load all column names in one query for autocomplete
+        def _worker():
             try:
-                self._column_cache = self.db_service.get_all_columns()
-            except Exception:
-                self._column_cache = {}
+                import pandas as _pd
+                result = {}
 
-            for table_name in tables:
-                self.all_tables.append(table_name)
-                self.all_schema_items.append(("table", table_name))
+                # Databases list
+                db_type = db.db_type
+                try:
+                    if db_type == "mysql":
+                        df = db.execute_query("SHOW DATABASES")
+                        dbs = [d for d in df.iloc[:, 0].tolist()
+                               if d not in ("information_schema", "mysql",
+                                            "performance_schema", "sys")]
+                        result["dbs"] = dbs
+                        cur_db = conf.get("database", "")
+                        if cur_db not in dbs and dbs:
+                            db.connection.select_db(dbs[0])
+                            result["switched_db"] = dbs[0]
+                    elif db_type == "postgresql":
+                        df = db.execute_query(
+                            "SELECT datname FROM pg_database WHERE datistemplate = false")
+                        result["dbs"] = df["datname"].tolist()
+                    else:
+                        result["dbs"] = []
+                except Exception:
+                    result["dbs"] = []
 
-                if len(table_name) >= 3:
-                    prefix = table_name[:3].lower()
-                    self.table_index.setdefault(prefix, []).append(table_name)
+                # Tables, views, functions, columns — all in one pass
+                try:
+                    result["tables"] = db.get_tables()
+                except Exception:
+                    result["tables"] = []
+                try:
+                    result["columns"] = db.get_all_columns()
+                except Exception:
+                    result["columns"] = {}
+                try:
+                    result["views"] = db.get_views()
+                except Exception:
+                    result["views"] = []
+                try:
+                    result["functions"] = db.get_functions()
+                except Exception:
+                    result["functions"] = []
 
-                item = QTreeWidgetItem([table_name])
-                self.all_table_items[table_name] = item
-                tables_cat.addChild(item)
+                sig_done.emit(result)
+            except Exception as ex:
+                # Suppress silent "not connected" errors (e.g. (0, '') on startup)
+                msg = str(ex)
+                if msg in ("(0, '')", "0", "") or "not connected" in msg.lower():
+                    return  # connection not ready yet — no error shown
+                sig_error.emit(msg)
 
-            views = self.db_service.get_views()
-            for v in views:
-                self.all_schema_items.append(("view", v))
-                views_cat.addChild(QTreeWidgetItem([v]))
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
 
-            functions = self.db_service.get_functions()
-            for fn in functions:
-                self.all_schema_items.append(("function", fn))
-                functions_cat.addChild(QTreeWidgetItem([fn]))
+    def _on_schema_loaded(self, result: dict):
+        """Main-thread: populate the schema tree from background result."""
+        # Update DB list + pill
+        dbs = result.get("dbs", [])
+        self._available_dbs = dbs
+        if "switched_db" in result:
+            self.config["database"] = result["switched_db"]
+        self._update_pill_label()
 
-            self.schema_tree.addTopLevelItem(tables_cat)
-            if views:
-                self.schema_tree.addTopLevelItem(views_cat)
-            if functions:
-                self.schema_tree.addTopLevelItem(functions_cat)
-            tables_cat.setExpanded(True)
+        tables    = result.get("tables", [])
+        columns   = result.get("columns", {})
+        views     = result.get("views", [])
+        functions = result.get("functions", [])
 
-            # Update autocomplete in existing tabs
-            for i in range(self.tabs.count()):
-                tab = self.tabs.widget(i)
-                if isinstance(tab, SqlTab):
-                    tab.set_schema(tables, self._column_cache)
-                elif isinstance(tab, TableViewWidget):
-                    tab.set_schema((tables, self._column_cache))
+        self._column_cache = columns
 
-        except Exception as ex:
-            QMessageBox.critical(self, "Schema Error", str(ex))
+        # Rebuild tree
+        self.schema_tree.clear()
+        self.all_tables.clear()
+        self.all_table_items.clear()
+        self.all_schema_items.clear()
+        self.table_index.clear()
+
+        tables_cat    = QTreeWidgetItem(["Tables"])
+        views_cat     = QTreeWidgetItem(["Views"])
+        functions_cat = QTreeWidgetItem(["Functions/Procedures"])
+
+        for table_name in tables:
+            self.all_tables.append(table_name)
+            self.all_schema_items.append(("table", table_name))
+            if len(table_name) >= 3:
+                self.table_index.setdefault(
+                    table_name[:3].lower(), []).append(table_name)
+            item = QTreeWidgetItem([table_name])
+            self.all_table_items[table_name] = item
+            tables_cat.addChild(item)
+
+        for v in views:
+            self.all_schema_items.append(("view", v))
+            views_cat.addChild(QTreeWidgetItem([v]))
+
+        for fn in functions:
+            self.all_schema_items.append(("function", fn))
+            functions_cat.addChild(QTreeWidgetItem([fn]))
+
+        self.schema_tree.addTopLevelItem(tables_cat)
+        if views:
+            self.schema_tree.addTopLevelItem(views_cat)
+        if functions:
+            self.schema_tree.addTopLevelItem(functions_cat)
+        tables_cat.setExpanded(True)
+
+        # Update autocomplete in existing tabs
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if isinstance(tab, SqlTab):
+                tab.set_schema(tables, columns)
+            elif isinstance(tab, TableViewWidget):
+                tab.set_schema((tables, columns))
+
+    def _on_schema_error(self, msg: str):
+        self.schema_tree.clear()
+        err = QTreeWidgetItem([f"⚠ {msg}"])
+        self.schema_tree.addTopLevelItem(err)
+        logger.error(f"Schema load error: {msg}")
 
     def _load_databases(self):
-        """Fetch available databases and update pill label."""
+        """Sync fallback — only used from _do_reconnect path."""
         try:
             db_type = self.db_service.db_type
             if db_type == "mysql":
@@ -364,13 +502,11 @@ class ConnectionPanel(QWidget):
                        if d not in ("information_schema", "mysql",
                                     "performance_schema", "sys")]
                 self._available_dbs = dbs
-
                 current_db = self.config.get("database", "")
                 if current_db not in dbs and dbs:
                     current_db = dbs[0]
                     self.config["database"] = current_db
                     self.db_service.connection.select_db(current_db)
-
             elif db_type == "postgresql":
                 df = self.db_service.execute_query(
                     "SELECT datname FROM pg_database WHERE datistemplate = false")
@@ -380,7 +516,6 @@ class ConnectionPanel(QWidget):
         except Exception as ex:
             logger.error(f"Failed to load databases: {ex}")
             self._available_dbs = []
-
         self._update_pill_label()
 
     def _update_pill_label(self):
@@ -404,14 +539,67 @@ class ConnectionPanel(QWidget):
     def _switch_database(self, new_db: str):
         if new_db == self.config.get("database", ""):
             return
-        try:
-            from PySide6.QtCore import QCoreApplication
-            self.config["database"] = new_db
-            self.db_service.disconnect()
-            self.db_service.connect(self.config)
-            self.load_schema()
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", f"Failed to switch database: {ex}")
+        # Update pill immediately so the UI feels instant
+        self.config["database"] = new_db
+        self._update_pill_label()
+
+        sig_done  = self._schema_done
+        sig_error = self._schema_error
+        db        = self.db_service
+        conf      = dict(self.config)
+
+        def _reconnect_and_load():
+            try:
+                db.disconnect()
+                db.connect(conf)
+                # Reuse _worker logic inline
+                result = {}
+                db_type = db.db_type
+                try:
+                    if db_type == "mysql":
+                        df = db.execute_query("SHOW DATABASES")
+                        result["dbs"] = [d for d in df.iloc[:, 0].tolist()
+                                         if d not in ("information_schema", "mysql",
+                                                      "performance_schema", "sys")]
+                    elif db_type == "postgresql":
+                        df = db.execute_query(
+                            "SELECT datname FROM pg_database WHERE datistemplate = false")
+                        result["dbs"] = df["datname"].tolist()
+                    else:
+                        result["dbs"] = []
+                except Exception:
+                    result["dbs"] = []
+                try:
+                    result["tables"] = db.get_tables()
+                except Exception:
+                    result["tables"] = []
+                try:
+                    result["columns"] = db.get_all_columns()
+                except Exception:
+                    result["columns"] = {}
+                try:
+                    result["views"] = db.get_views()
+                except Exception:
+                    result["views"] = []
+                try:
+                    result["functions"] = db.get_functions()
+                except Exception:
+                    result["functions"] = []
+                sig_done.emit(result)
+            except Exception as ex:
+                msg = str(ex)
+                if msg in ("(0, '')", "0", "") or "not connected" in msg.lower():
+                    return
+                sig_error.emit(msg)
+
+        # Show spinner in schema tree
+        self.schema_tree.clear()
+        self.schema_tree.addTopLevelItem(QTreeWidgetItem(["Switching database…"]))
+        from PySide6.QtWidgets import QApplication as _QApp
+        _QApp.processEvents()
+
+        t = threading.Thread(target=_reconnect_and_load, daemon=True)
+        t.start()
 
     # ─── Schema tree interaction ──────────────────────────────────────────────
 
@@ -433,6 +621,8 @@ class ConnectionPanel(QWidget):
         menu.addSeparator()
         edit_action = menu.addAction("✏️ Edit Structure")
         menu.addSeparator()
+        import_action = menu.addAction("📥 Import CSV into Table…")
+        menu.addSeparator()
         refresh_action = menu.addAction("🔄 Refresh Schema")
 
         action = menu.exec_(self.schema_tree.mapToGlobal(position))
@@ -440,6 +630,8 @@ class ConnectionPanel(QWidget):
             self.open_table_view(item.text(0))
         elif action == edit_action:
             self.show_alter_table_editor(item.text(0))
+        elif action == import_action:
+            self._import_csv_into_table(item.text(0))
         elif action == refresh_action:
             self.load_schema()
 
@@ -514,6 +706,7 @@ class ConnectionPanel(QWidget):
         """Open a blank SQL query tab."""
         tab = SqlTab()
         tab.run_btn.clicked.connect(lambda: self._run_query_in_tab(tab))
+        tab.verify_btn.clicked.connect(lambda: self._open_verify_dialog(tab))
         # Wire inline-edit commit: execute SQL with our db_service
         tab.commit_sql.connect(lambda sqls, t=tab: self._execute_commit_sql(sqls, t))
         # Push current schema so autocomplete works immediately
@@ -550,10 +743,59 @@ class ConnectionPanel(QWidget):
 
     # ── Bridge signal handlers (always run on main thread) ────────────────
 
+    @staticmethod
+    def _restore_run_btn(tab):
+        """Restore the Run button to its default ready state."""
+        tab.run_btn.setText('▶  Run')
+        tab.run_btn.setEnabled(True)
+        tab.run_btn.setStyleSheet("""
+            QPushButton {
+                background: #0A84FF;
+                color: #fff;
+                border: none;
+                border-radius: 5px;
+                padding: 0 18px;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            QPushButton:hover  { background: #228BFF; }
+            QPushButton:pressed { background: #0066CC; }
+        """)
+
+    def _wire_result_fk(self, tab, table_name: str):
+        """Load FK map for *table_name* into the result grid and ensure the
+        navigate_fk signal is wired (idempotent — only connects once)."""
+        if not table_name or not hasattr(tab, 'result_table'):
+            return
+        try:
+            fk_list = self.db_service.get_foreign_keys(table_name)
+            tab.result_table.set_fk_map(fk_list)
+        except Exception:
+            fk_list = []
+
+        # Wire navigate_fk only once per tab (guard with a flag)
+        if getattr(tab, '_fk_nav_wired', False):
+            return
+        tab._fk_nav_wired = True
+
+        def _on_result_fk_nav(ref_table: str, ref_col: str, value: str, _tab=tab):
+            self.open_table_view(ref_table)
+            from PySide6.QtCore import QTimer
+            def _apply():
+                for i in range(self.tabs.count()):
+                    w = self.tabs.widget(i)
+                    if isinstance(w, TableViewWidget) and w.get_table_name() == ref_table:
+                        if hasattr(w, 'filter_by_column_value'):
+                            w.filter_by_column_value(ref_col, value)
+                        break
+            QTimer.singleShot(300, _apply)
+
+        tab.result_table.navigate_fk.connect(_on_result_fk_nav)
+
     def _on_query_done(self, tab, df, elapsed):
         """Receives worker `done` signal via bridge — guaranteed main thread."""
         tab._query_running = False
-        tab.run_btn.setEnabled(True)
+        self._restore_run_btn(tab)
         tab.cancel_btn.setEnabled(False)
         if hasattr(tab, '_query_thread'):
             tab._query_thread.quit()
@@ -561,6 +803,8 @@ class ConnectionPanel(QWidget):
         table_name = self._extract_table_name(query)
         tab.load_dataframe(df, table_name)
         tab.update_status(len(df), elapsed)
+        # Load FK map so right-click "Go to …" works in the result grid
+        self._wire_result_fk(tab, table_name)
         self.query_history.add_query(query, self.config["name"], len(df), elapsed)
         if self._sidebar_stack.currentIndex() == 1:
             self._reload_history_list(self._history_search.text())
@@ -572,7 +816,7 @@ class ConnectionPanel(QWidget):
     def _on_query_multi_done(self, tab, results: list, elapsed: float):
         """Multi-statement result handler — shows each SELECT in its own sub-tab."""
         tab._query_running = False
-        tab.run_btn.setEnabled(True)
+        self._restore_run_btn(tab)
         tab.cancel_btn.setEnabled(False)
         if hasattr(tab, '_query_thread'):
             tab._query_thread.quit()
@@ -610,7 +854,7 @@ class ConnectionPanel(QWidget):
     def _on_query_errored(self, tab, message, elapsed):
         """Receives worker `errored` signal via bridge — guaranteed main thread."""
         tab._query_running = False
-        tab.run_btn.setEnabled(True)
+        self._restore_run_btn(tab)
         tab.cancel_btn.setEnabled(False)
         if hasattr(tab, '_query_thread'):
             tab._query_thread.quit()
@@ -625,7 +869,7 @@ class ConnectionPanel(QWidget):
     def _on_query_cancelled(self, tab):
         """Receives worker `cancelled` signal via bridge — guaranteed main thread."""
         tab._query_running = False
-        tab.run_btn.setEnabled(True)
+        self._restore_run_btn(tab)
         tab.cancel_btn.setEnabled(False)
         if hasattr(tab, '_query_thread'):
             tab._query_thread.quit()
@@ -702,8 +946,11 @@ class ConnectionPanel(QWidget):
         # Format on run if user has the toggle active
         if getattr(tab, '_format_on_run', False):
             import sqlparse
-            query = sqlparse.format(query, reindent=True, keyword_case="upper")
-            tab.editor.setPlainText(query)
+            try:
+                query = sqlparse.format(query, reindent=True, keyword_case="upper")
+                tab.editor.setPlainText(query)
+            except Exception:
+                pass  # query too large for sqlparse — run as-is
 
         # ── Parameterised queries: prompt for {{var}} values ──────────────────
         resolved = self._prompt_params(query)
@@ -718,11 +965,55 @@ class ConnectionPanel(QWidget):
         tab._query_running = True
         tab._last_query    = query
         tab._cancel_flag   = threading.Event()
+        tab._query_start_time = time.time()
         tab.run_btn.setEnabled(False)
+        tab.run_btn.setText('⏳  0.0s')
+        tab.run_btn.setStyleSheet("""
+            QPushButton {
+                background: #2c4a2e;
+                color: #30d158;
+                border: 1px solid #30d158;
+                border-radius: 5px;
+                padding: 0 18px;
+                font-weight: 600;
+                font-size: 13px;
+            }
+        """)
         tab.cancel_btn.setEnabled(True)
         self.health_changed.emit('running')
 
-        worker = _QueryWorker(self.db_service, query, tab._cancel_flag)
+        # Flush the UI immediately so the button turns green before any
+        # blocking work (DB connect, sqlparse format) happens on this thread.
+        from PySide6.QtWidgets import QApplication as _QApp
+        _QApp.processEvents()
+
+        # ── Live elapsed-time ticker (updates run button every 100ms) ─────────
+        from PySide6.QtCore import QTimer as _QTimer
+        elapsed_timer = _QTimer(self)
+        elapsed_timer.setInterval(100)
+        def _tick():
+            if getattr(tab, '_query_running', False):
+                secs = time.time() - tab._query_start_time
+                tab.run_btn.setText(f'⏳  {secs:.1f}s')
+            else:
+                elapsed_timer.stop()
+                elapsed_timer.deleteLater()
+        elapsed_timer.timeout.connect(_tick)
+        elapsed_timer.start()
+        tab._elapsed_timer = elapsed_timer
+
+        # ── Dedicated connection for this query (prevents shared-connection races) ──
+        query_db = DbService()
+        try:
+            query_db.connect(self.config)
+        except Exception as ex:
+            tab._query_running = False
+            self._restore_run_btn(tab)
+            tab.cancel_btn.setEnabled(False)
+            tab.show_error(str(ex))
+            return
+
+        worker = _QueryWorker(query_db, query, tab._cancel_flag)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -743,7 +1034,7 @@ class ConnectionPanel(QWidget):
         worker.cancelled.connect(
             lambda: self._q_cancelled.emit(tab))
 
-        # Safely (re)connect Cancel button
+        # Safely (re)connect Cancel button — Cancel kills on the dedicated connection
         cancel_slot = getattr(tab, '_cancel_slot', None)
         if cancel_slot is not None:
             try:
@@ -754,7 +1045,7 @@ class ConnectionPanel(QWidget):
         def _cancel():
             tab._cancel_flag.set()
             try:
-                self.db_service.kill_current_query()
+                query_db.kill_current_query()
             except Exception:
                 pass
 
@@ -766,6 +1057,13 @@ class ConnectionPanel(QWidget):
         thread.finished.connect(thread.deleteLater)
 
         thread.start()
+
+    def _open_verify_dialog(self, tab):
+        """Open the Query Verifier dialog pre-populated with the current tab's query."""
+        from ui.query_verifier_dialog import QueryVerifierDialog
+        query = tab.get_query().strip()
+        dlg = QueryVerifierDialog(self.db_service, initial_query=query, parent=self)
+        dlg.show()
 
     @staticmethod
     def _extract_table_name(query: str):
@@ -820,7 +1118,7 @@ class ConnectionPanel(QWidget):
                 QMessageBox.critical(self, "Error", str(ex))
 
     def _show_table_structure(self, table_name: str):
-        """Show a read-only structure popup for *table_name*: columns, types, FKs."""
+        """Show a read-only structure popup for *table_name*: columns, indexes, FKs."""
         from PySide6.QtWidgets import (
             QDialog, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
             QTabWidget, QDialogButtonBox, QHeaderView
@@ -828,41 +1126,90 @@ class ConnectionPanel(QWidget):
         try:
             cols = self.db_service.get_columns(table_name)
             fks  = self.db_service.get_foreign_keys(table_name)
+            try:
+                idxs = self.db_service.get_indexes(table_name)
+            except Exception:
+                idxs = []
         except Exception as ex:
             QMessageBox.warning(self, "Structure", str(ex))
             return
 
         dlg = QDialog(self)
         dlg.setWindowTitle(f"📊 Structure — {table_name}")
-        dlg.resize(580, 400)
+        dlg.resize(680, 460)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(12, 10, 12, 10)
 
         tabs = QTabWidget()
+        tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+                background: #1e1e1e;
+            }
+            QTabBar::tab {
+                background: #2a2a2a;
+                color: #888888;
+                padding: 7px 18px;
+                border: 1px solid #3a3a3a;
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                font-size: 12px;
+                min-width: 100px;
+            }
+            QTabBar::tab:selected {
+                background: #1e1e1e;
+                color: #ffffff;
+                border-bottom: 2px solid #0078d4;
+                font-weight: 600;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #333333;
+                color: #cccccc;
+            }
+        """)
 
-        # ── Columns tab ──────────────────────────────────────────────────────
-        col_tbl = QTableWidget(len(cols), 4)
-        col_tbl.setHorizontalHeaderLabels(["Column", "Type", "Null", "Default"])
+        # ── Columns tab ────────────────────────────────────────────────────────────
+        col_tbl = QTableWidget(len(cols), 5)
+        col_tbl.setHorizontalHeaderLabels(["Column", "Type", "Null", "Key", "Default"])
         col_tbl.verticalHeader().setVisible(False)
         col_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        col_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        col_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        col_tbl.horizontalHeader().setStretchLastSection(True)
         for r, c in enumerate(cols):
             if isinstance(c, dict):
                 col_tbl.setItem(r, 0, QTableWidgetItem(str(c.get("Field", ""))))
                 col_tbl.setItem(r, 1, QTableWidgetItem(str(c.get("Type",  ""))))
                 col_tbl.setItem(r, 2, QTableWidgetItem(str(c.get("Null",  ""))))
-                col_tbl.setItem(r, 3, QTableWidgetItem(str(c.get("Default", ""))))
+                col_tbl.setItem(r, 3, QTableWidgetItem(str(c.get("Key",   ""))))
+                col_tbl.setItem(r, 4, QTableWidgetItem(str(c.get("Default", ""))))
             else:
-                for ci, val in enumerate(list(c)[:4]):
+                for ci, val in enumerate(list(c)[:5]):
                     col_tbl.setItem(r, ci, QTableWidgetItem(str(val)))
-        tabs.addTab(col_tbl, "Columns")
+        tabs.addTab(col_tbl, f"Columns ({len(cols)})")
 
-        # ── Foreign Keys tab ─────────────────────────────────────────────────
+        # ── Indexes tab ───────────────────────────────────────────────────────────────
+        idx_tbl = QTableWidget(len(idxs), 4)
+        idx_tbl.setHorizontalHeaderLabels(["Name", "Columns", "Unique", "Type"])
+        idx_tbl.verticalHeader().setVisible(False)
+        idx_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        idx_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        idx_tbl.horizontalHeader().setStretchLastSection(True)
+        for r, idx in enumerate(idxs):
+            idx_tbl.setItem(r, 0, QTableWidgetItem(str(idx.get("name", ""))))
+            idx_tbl.setItem(r, 1, QTableWidgetItem(str(idx.get("columns", ""))))
+            idx_tbl.setItem(r, 2, QTableWidgetItem("✔" if idx.get("unique") else ""))
+            idx_tbl.setItem(r, 3, QTableWidgetItem(str(idx.get("type", ""))))
+        tabs.addTab(idx_tbl, f"Indexes ({len(idxs)})")
+
+        # ── Foreign Keys tab ───────────────────────────────────────────────────────────
         fk_tbl = QTableWidget(len(fks), 3)
         fk_tbl.setHorizontalHeaderLabels(["Column", "References Table", "References Column"])
         fk_tbl.verticalHeader().setVisible(False)
         fk_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        fk_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        fk_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        fk_tbl.horizontalHeader().setStretchLastSection(True)
         for r, fk in enumerate(fks):
             fk_tbl.setItem(r, 0, QTableWidgetItem(str(fk.get("column", ""))))
             fk_tbl.setItem(r, 1, QTableWidgetItem(str(fk.get("ref_table", ""))))
@@ -911,6 +1258,107 @@ class ConnectionPanel(QWidget):
                     self.load_schema()
             except Exception as ex:
                 QMessageBox.critical(self, "Error", str(ex))
+
+    # ─── CSV Import ──────────────────────────────────────────────────────────
+
+    def _import_csv_into_table(self, table_name: str):
+        """Read a CSV file and INSERT all rows into *table_name*."""
+        from PySide6.QtWidgets import QFileDialog, QProgressDialog
+        import pandas as pd
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, f"Import CSV into {table_name}", "",
+            "CSV Files (*.csv);;Tab-separated (*.tsv *.txt);;All Files (*)"
+        )
+        if not file_path:
+            return
+
+        try:
+            sep = "\t" if file_path.endswith((".tsv", ".txt")) else ","
+            df = pd.read_csv(file_path, sep=sep, keep_default_na=False)
+        except Exception as ex:
+            QMessageBox.critical(self, "Import Error", f"Could not read file:\n{ex}")
+            return
+
+        if df.empty:
+            QMessageBox.information(self, "Import", "The file contains no data rows.")
+            return
+
+        # Confirm
+        reply = QMessageBox.question(
+            self, "Confirm Import",
+            f"Insert <b>{len(df):,}</b> rows into <b>{table_name}</b>?<br>"
+            f"Columns: {', '.join(df.columns.tolist()[:8])}"
+            + (" …" if len(df.columns) > 8 else ""),
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Build INSERT statements and execute in batches
+        db_type = self.db_service.db_type
+        ph = "%s"  # MySQL / PostgreSQL
+        if db_type == "sqlite":
+            ph = "?"
+
+        cols_sql = ", ".join(
+            f"`{c}`" if db_type == "mysql" else f'"{c}"'
+            for c in df.columns
+        )
+        placeholders = ", ".join([ph] * len(df.columns))
+        insert_sql = (
+            f"INSERT INTO `{table_name}` ({cols_sql}) VALUES ({placeholders})"
+            if db_type == "mysql"
+            else f'INSERT INTO "{table_name}" ({cols_sql}) VALUES ({placeholders})'
+        )
+
+        progress = QProgressDialog(
+            f"Importing {len(df):,} rows…", "Cancel", 0, len(df), self)
+        progress.setWindowTitle("Import CSV")
+        progress.setMinimumDuration(0)
+
+        errors = 0
+        inserted = 0
+        BATCH = 500
+        try:
+            cursor = self.db_service.connection.cursor()
+            for start in range(0, len(df), BATCH):
+                if progress.wasCanceled():
+                    break
+                chunk = df.iloc[start:start + BATCH]
+                rows = [
+                    tuple(None if v == "" else v for v in row)
+                    for row in chunk.itertuples(index=False, name=None)
+                ]
+                try:
+                    cursor.executemany(insert_sql, rows)
+                    inserted += len(rows)
+                except Exception as ex:
+                    errors += 1
+                    logger.error(f"Import batch error: {ex}")
+                progress.setValue(start + len(chunk))
+            self.db_service.connection.commit()
+            cursor.close()
+        except Exception as ex:
+            QMessageBox.critical(self, "Import Error", str(ex))
+            return
+        finally:
+            progress.close()
+
+        msg = f"Imported <b>{inserted:,}</b> rows into <b>{table_name}</b>."
+        if errors:
+            msg += f"<br>{errors} batch(es) failed — check logs."
+        QMessageBox.information(self, "Import Complete", msg)
+
+        # Refresh the open table view if it exists
+        panel = self
+        for i in range(panel.tabs.count()):
+            w = panel.tabs.widget(i)
+            from ui.table_view_widget import TableViewWidget
+            if isinstance(w, TableViewWidget) and w.table_name == table_name:
+                w.current_page = 1
+                w.load_table_data()
+                break
 
     # ─── Quick search ─────────────────────────────────────────────────────────
 
@@ -1164,22 +1612,59 @@ class ConnectionPanel(QWidget):
             except Exception as ex:
                 logger.error(f"Failed to restore tab {tab}: {ex}")
 
+    def _do_reconnect(self):
+        """Manually reconnect to the database and reload the schema."""
+        reconnected_ok = False
+        try:
+            self._reconnect_btn.setEnabled(False)
+            self._reconnect_btn.setText("…")
+            self.db_service._reconnect()
+            reconnected_ok = True
+            # Refresh version label
+            try:
+                self._server_version = self.db_service.get_server_version()
+            except Exception:
+                pass
+            self.load_schema()
+            self.health_changed.emit('idle')
+            db_type = self.config.get('type', 'DB').upper()
+            self.reconnected.emit(f"Reconnected to {db_type} — {self.label}")
+        except Exception as ex:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Reconnect Failed", str(ex))
+            self.health_changed.emit('disconnected')
+        finally:
+            self._reconnect_btn.setEnabled(True)
+            self._reconnect_btn.setText("⟳ Reconnect")
+
     # ─── Health check ────────────────────────────────────────────────────────────
 
     def _check_health(self):
-        """Called every 30s to ping the connection and emit health status."""
-        try:
-            was_disconnected = getattr(self, '_last_health', 'idle') == 'disconnected'
-            ok = self.db_service.is_connected()
-            status = 'idle' if ok else 'disconnected'
-            self._last_health = status
-            self.health_changed.emit(status)
-            if ok and was_disconnected:
-                # Just recovered
-                db_type = self.config.get('type', 'DB').upper()
-                self.reconnected.emit(f"Reconnected to {db_type} — {self.label}")
-        except Exception:
-            pass
+        """Called every 30s — runs the actual ping on a daemon thread so the
+        UI never blocks, and skips when a query is already in flight on the
+        shared connection (prevents packet-sequence corruption)."""
+        # Skip entirely if any tab is mid-query on this connection
+        for i in range(self.tabs.count()):
+            if getattr(self.tabs.widget(i), '_query_running', False):
+                return
+
+        import threading
+        def _ping():
+            try:
+                was_disconnected = getattr(self, '_last_health', 'idle') == 'disconnected'
+                ok = self.db_service.is_connected()
+                status = 'idle' if ok else 'disconnected'
+                self._last_health = status
+                # Emit on main thread via a queued call
+                self.health_changed.emit(status)
+                if ok and was_disconnected:
+                    db_type = self.config.get('type', 'DB').upper()
+                    self.reconnected.emit(f"Reconnected to {db_type} — {self.label}")
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_ping, daemon=True)
+        t.start()
 
     # ─── Pinned tab persistence ───────────────────────────────────────────────────
 
@@ -1220,7 +1705,9 @@ class ConnectionPanel(QWidget):
 
     @property
     def label(self) -> str:
-        return self.config.get("name", "Connection")
+        base = self.config.get("name", "Connection")
+        ver = getattr(self, '_server_version', '')
+        return f"{base}  [{ver}]" if ver else base
 
     def disconnect(self):
         try:
