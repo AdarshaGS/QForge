@@ -1,4 +1,4 @@
-from PySide6.QtCore import Qt, Signal, QObject, QRunnable, Slot
+from PySide6.QtCore import Qt, Signal, QObject, QRunnable, Slot, QThreadPool
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -320,6 +320,32 @@ class TableViewWidget(QWidget):
                     background-color: rgba(0, 0, 0, 180);
                 }
             """)
+
+    def on_column_header_clicked(self, logical_index: int):
+        """
+        Handle column header click to sort the table by the clicked column
+
+        Args:
+            logical_index: The index of the clicked column
+        """
+        # Get the column name from the header
+        header_item = self.data_table.horizontalHeaderItem(logical_index)
+        if header_item is None:
+            return
+
+        column_name = header_item.text()
+
+        # Toggle sort order if clicking the same column, otherwise set to ascending
+        if self.sort_column == column_name:
+            # Same column - toggle sort order
+            self.sort_order = "DESC" if self.sort_order == "ASC" else "ASC"
+        else:
+            # Different column - set as new sort column with ascending order
+            self.sort_column = column_name
+            self.sort_order = "ASC"
+
+        # Reset and reload with new sort settings
+        self.reset_and_load_first_page()
 
     def reset_and_load_first_page(self):
         """Reset accumulated data and load the first page"""
