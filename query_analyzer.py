@@ -83,6 +83,17 @@ def load_connections(path: str) -> list[dict]:
         return json.load(f)
 
 
+def _resolve_password(section: dict, connection_id: str, kind: str) -> str:
+    """Return section["password"] if set, else fall back to the OS keychain
+    (for connections saved by the QForge GUI, which no longer persists
+    passwords to connections.json in plaintext)."""
+    pw = section.get("password", "")
+    if pw or not connection_id:
+        return pw
+    from utils.credential_store import get_password
+    return get_password(connection_id, kind)
+
+
 def pick_connection(connections: list[dict], name: str | None) -> dict:
     if name:
         for c in connections:
@@ -118,7 +129,7 @@ def open_connection(config: dict, db_override: str | None = None):
         if ssh_cfg.get("use_key") and ssh_key:
             kwargs["ssh_private_key"] = ssh_key
         else:
-            kwargs["ssh_password"] = ssh_cfg.get("password", "")
+            kwargs["ssh_password"] = _resolve_password(ssh_cfg, config.get("id", ""), "ssh")
 
         ssh_tunnel = SSHTunnelForwarder(
             (ssh_cfg["host"], int(ssh_cfg.get("port", 22))), **kwargs
@@ -132,7 +143,7 @@ def open_connection(config: dict, db_override: str | None = None):
         host=host,
         port=port,
         user=config["user"],
-        password=config["password"],
+        password=_resolve_password(config, config.get("id", ""), "db"),
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True,
         read_timeout=300,

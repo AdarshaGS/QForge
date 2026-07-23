@@ -2,6 +2,10 @@ import json
 import os
 from datetime import datetime
 
+from utils.logger import get_logger
+
+logger = get_logger()
+
 
 class QueryHistory:
     """Simple query history manager"""
@@ -22,7 +26,8 @@ class QueryHistory:
         try:
             with open(self.HISTORY_FILE, "r") as file:
                 self.queries = json.load(file)
-        except Exception:
+        except Exception as ex:
+            logger.warning(f"Failed to load query history: {ex}")
             self.queries = []
 
     def save_history(self):
@@ -31,7 +36,7 @@ class QueryHistory:
             with open(self.HISTORY_FILE, "w") as file:
                 json.dump(self.queries, file, indent=2)
         except Exception as ex:
-            print(f"Failed to save history: {ex}")
+            logger.warning(f"Failed to save history: {ex}")
 
     def add_query(self, query, connection_name, rows=0, execution_time=0):
         """Add a query to history"""

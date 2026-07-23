@@ -30,7 +30,7 @@ from PySide6.QtGui import QTextCursor, QKeyEvent, QShortcut, QKeySequence
 from ui.sql_highlighter import SqlHighlighter
 from ui.sql_completer import SqlCompleter
 from ui.editable_table import EditableTableWidget
-from ui.editable_table import EditableTableWidget
+from utils.df_export import export_dataframe
 from ui.column_filter_dialog import ColumnFilterDialog
 from ui.theme_manager import ThemeManager
 from ui.snippet_manager import SnippetManager
@@ -82,8 +82,6 @@ _ERROR_HINTS = [
     (r"data too long for column '(.+?)'",
      lambda m: f"The value for '{m.group(1)}' exceeds the column's maximum length."),
 ]
-
-import re as _re
 
 def _sql_error_hint(message: str, query: str = "") -> str:
     """Return a short actionable hint for a SQL error message, or empty string."""
@@ -1368,70 +1366,11 @@ class SqlTab(QWidget):
     # ======================================
 
     def export_data(self):
-        """Export data in multiple formats: CSV, JSON, Excel"""
-        if self.current_df is None:
-            QMessageBox.information(
-                self,
-                "Info",
-                "No data to export"
-            )
-            return
-
-        # Show file dialog with multiple format options
-        file_name, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Export Data",
-            "results.csv",
-            "CSV Files (*.csv);;SQL Insert (*.sql);;JSON Files (*.json);;Excel Files (*.xlsx)"
+        """Export data in multiple formats: CSV, JSON, Excel, SQL"""
+        export_dataframe(
+            self, self.current_df, "results.csv",
+            getattr(self, 'current_table_name', 'table'),
         )
-
-        if not file_name:
-            return
-
-        try:
-            # Determine format from filter or file extension
-            if selected_filter == "CSV Files (*.csv)" or file_name.endswith('.csv'):
-                self.current_df.to_csv(file_name, index=False)
-                format_name = "CSV"
-            elif selected_filter == "SQL Insert (*.sql)" or file_name.endswith('.sql'):
-                # Generate SQL INSERT statements
-                table_name = getattr(self, 'current_table_name', 'table')
-                with open(file_name, 'w') as f:
-                    for _, row in self.current_df.iterrows():
-                        columns = ', '.join([f"`{col}`" for col in self.current_df.columns])
-                        values = []
-                        for val in row:
-                            if pd.isna(val):
-                                values.append('NULL')
-                            elif isinstance(val, str):
-                                values.append(f"'{val.replace(chr(39), chr(39)+chr(39))}'")
-                            else:
-                                values.append(str(val))
-                        values_str = ', '.join(values)
-                        f.write(f"INSERT INTO `{table_name}` ({columns}) VALUES ({values_str});\n")
-                format_name = "SQL"
-            elif selected_filter == "JSON Files (*.json)" or file_name.endswith('.json'):
-                self.current_df.to_json(file_name, orient='records', indent=2)
-                format_name = "JSON"
-            elif selected_filter == "Excel Files (*.xlsx)" or file_name.endswith('.xlsx'):
-                self.current_df.to_excel(file_name, index=False, engine='openpyxl')
-                format_name = "Excel"
-            else:
-                # Default to CSV
-                self.current_df.to_csv(file_name, index=False)
-                format_name = "CSV"
-
-            QMessageBox.information(
-                self,
-                "Success",
-                f"{format_name} file exported successfully"
-            )
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"Failed to export: {str(e)}"
-            )
 
     # ======================================
     # IMPORT DATA
@@ -1781,15 +1720,6 @@ class SqlTab(QWidget):
         
         # If no query found, return None
         return None
-
-    def set_query(
-        self,
-        query
-    ):
-
-        self.editor.setPlainText(
-            query
-        )
 
     # ── Find / Replace ────────────────────────────────────────────────────────
 

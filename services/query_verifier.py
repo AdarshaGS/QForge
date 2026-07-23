@@ -284,6 +284,7 @@ class QueryVerifier:
 
     @staticmethod
     def _maybe_limit(sql: str, limit: int) -> str:
+        limit = int(limit)
         if limit <= 0:
             return sql
         sql = sql.rstrip().rstrip(";").rstrip()
