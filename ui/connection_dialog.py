@@ -1,5 +1,8 @@
 import json
 import os
+import uuid
+
+from utils import credential_store
 
 from PySide6.QtWidgets import (
     QDialog,
@@ -434,6 +437,8 @@ class ConnectionDialog(QDialog):
             QMessageBox.critical(self, "Error", str(ex))
             return
 
+        self._resolve_credentials()
+
         # Build ordered group → [indices] mapping
         groups: dict[str, list[int]] = {}
         for idx, conn in enumerate(self.connections):
@@ -501,10 +506,68 @@ class ConnectionDialog(QDialog):
         if matches or (text and not exact):
             self.group_input.showPopup()
 
+    def _resolve_credentials(self):
+        """Assign a stable id to every connection and fill in passwords from
+        the OS keychain, migrating any legacy plaintext passwords found on
+        disk into the keychain."""
+        needs_resave = False
+        for conn in self.connections:
+            if not conn.get("id"):
+                conn["id"] = uuid.uuid4().hex
+                needs_resave = True
+
+            if conn.get("type") == "sqlite":
+                continue
+            conn_id = conn["id"]
+
+            plaintext_pw = conn.get("password", "")
+            if plaintext_pw:
+                credential_store.set_password(conn_id, "db", plaintext_pw)
+                needs_resave = True
+            else:
+                plaintext_pw = credential_store.get_password(conn_id, "db")
+            conn["password"] = plaintext_pw
+
+            ssh = conn.get("ssh_tunnel")
+            if ssh and ssh.get("enabled") and not ssh.get("use_key"):
+                plaintext_ssh_pw = ssh.get("password", "")
+                if plaintext_ssh_pw:
+                    credential_store.set_password(conn_id, "ssh", plaintext_ssh_pw)
+                    needs_resave = True
+                else:
+                    plaintext_ssh_pw = credential_store.get_password(conn_id, "ssh")
+                ssh["password"] = plaintext_ssh_pw
+
+        if needs_resave:
+            self.save_connections()
+
     def save_connections(self):
         os.makedirs(os.path.dirname(self.CONNECTION_FILE), exist_ok=True)
+        sanitized = []
+        for conn in self.connections:
+            c = dict(conn)
+            conn_id = c.get("id")
+            if conn_id and c.get("type") != "sqlite":
+                pw = c.pop("password", "")
+                if pw:
+                    credential_store.set_password(conn_id, "db", pw)
+                else:
+                    credential_store.delete_password(conn_id, "db")
+                c["password"] = ""
+
+                ssh = c.get("ssh_tunnel")
+                if ssh and ssh.get("enabled") and not ssh.get("use_key"):
+                    ssh = dict(ssh)
+                    ssh_pw = ssh.pop("password", "")
+                    if ssh_pw:
+                        credential_store.set_password(conn_id, "ssh", ssh_pw)
+                    else:
+                        credential_store.delete_password(conn_id, "ssh")
+                    ssh["password"] = ""
+                    c["ssh_tunnel"] = ssh
+            sanitized.append(c)
         with open(self.CONNECTION_FILE, "w") as f:
-            json.dump(self.connections, f, indent=4)
+            json.dump(sanitized, f, indent=4)
 
     def _get_group_value(self) -> str:
         """Return the clean group name, stripping the '＋ Create new group:' prefix."""
@@ -590,6 +653,7 @@ class ConnectionDialog(QDialog):
             except ValueError as ex:
                 QMessageBox.warning(self, "Invalid Input", str(ex))
                 return
+            data["id"] = self.connections[conn_idx].get("id") or uuid.uuid4().hex
             self.connections[conn_idx] = data
             self.save_connections()
             self.load_connections()
@@ -620,6 +684,7 @@ class ConnectionDialog(QDialog):
         except ValueError as ex:
             QMessageBox.warning(self, "Invalid Input", str(ex))
             return
+        data["id"] = uuid.uuid4().hex
         self.connections.append(data)
         self.save_connections()
         self.load_connections()
@@ -630,6 +695,9 @@ class ConnectionDialog(QDialog):
         if selected_item is None:
             return
         conn_idx = selected_item.data(0, Qt.UserRole)
+        conn_id = self.connections[conn_idx].get("id", "")
+        credential_store.delete_password(conn_id, "db")
+        credential_store.delete_password(conn_id, "ssh")
         del self.connections[conn_idx]
         self.save_connections()
         self.load_connections()

@@ -26,6 +26,7 @@ from PySide6.QtGui import QShortcut, QKeySequence, QCursor
 
 from services.db_service import DbService
 from services.query_history import QueryHistory
+from services.schema_snapshot import fetch_schema_snapshot
 from ui.sql_tab import SqlTab
 from ui.table_view_widget import TableViewWidget
 from ui.quick_search_dialog import QuickSearchDialog
@@ -364,58 +365,17 @@ class ConnectionPanel(QWidget):
         loading_item = QTreeWidgetItem(["Loading…"])
         self.schema_tree.addTopLevelItem(loading_item)
 
-        # Run the DB I/O on a daemon thread; results come back via _schema_done
-        db   = self.db_service
+        # Fetch the schema on a daemon thread using a *dedicated* connection
+        # (see services/schema_snapshot.py) — never touches self.db_service,
+        # which the main thread may be using concurrently (query tabs, table
+        # views). Results come back via _schema_done.
         conf = dict(self.config)
         sig_done  = self._schema_done
         sig_error = self._schema_error
 
         def _worker():
             try:
-                import pandas as _pd
-                result = {}
-
-                # Databases list
-                db_type = db.db_type
-                try:
-                    if db_type == "mysql":
-                        df = db.execute_query("SHOW DATABASES")
-                        dbs = [d for d in df.iloc[:, 0].tolist()
-                               if d not in ("information_schema", "mysql",
-                                            "performance_schema", "sys")]
-                        result["dbs"] = dbs
-                        cur_db = conf.get("database", "")
-                        if cur_db not in dbs and dbs:
-                            db.connection.select_db(dbs[0])
-                            result["switched_db"] = dbs[0]
-                    elif db_type == "postgresql":
-                        df = db.execute_query(
-                            "SELECT datname FROM pg_database WHERE datistemplate = false")
-                        result["dbs"] = df["datname"].tolist()
-                    else:
-                        result["dbs"] = []
-                except Exception:
-                    result["dbs"] = []
-
-                # Tables, views, functions, columns — all in one pass
-                try:
-                    result["tables"] = db.get_tables()
-                except Exception:
-                    result["tables"] = []
-                try:
-                    result["columns"] = db.get_all_columns()
-                except Exception:
-                    result["columns"] = {}
-                try:
-                    result["views"] = db.get_views()
-                except Exception:
-                    result["views"] = []
-                try:
-                    result["functions"] = db.get_functions()
-                except Exception:
-                    result["functions"] = []
-
-                sig_done.emit(result)
+                sig_done.emit(fetch_schema_snapshot(conf))
             except Exception as ex:
                 # Suppress silent "not connected" errors (e.g. (0, '') on startup)
                 msg = str(ex)
@@ -432,8 +392,20 @@ class ConnectionPanel(QWidget):
         dbs = result.get("dbs", [])
         self._available_dbs = dbs
         if "switched_db" in result:
-            self.config["database"] = result["switched_db"]
+            new_db = result["switched_db"]
+            self.config["database"] = new_db
+            # The snapshot was fetched over its own dedicated connection, so
+            # the live connection's selected database needs updating here too.
+            if self.db_service.db_type == "mysql" and self.db_service.connection:
+                try:
+                    self.db_service.connection.select_db(new_db)
+                except Exception as ex:
+                    logger.warning(f"Failed to switch live connection to database {new_db}: {ex}")
         self._update_pill_label()
+
+        if result.get("server_version"):
+            self._server_version = result["server_version"]
+            self.label_changed.emit(self, self.label)
 
         tables    = result.get("tables", [])
         columns   = result.get("columns", {})
@@ -543,62 +515,38 @@ class ConnectionPanel(QWidget):
         self.config["database"] = new_db
         self._update_pill_label()
 
-        sig_done  = self._schema_done
-        sig_error = self._schema_error
-        db        = self.db_service
-        conf      = dict(self.config)
-
-        def _reconnect_and_load():
-            try:
-                db.disconnect()
-                db.connect(conf)
-                # Reuse _worker logic inline
-                result = {}
-                db_type = db.db_type
-                try:
-                    if db_type == "mysql":
-                        df = db.execute_query("SHOW DATABASES")
-                        result["dbs"] = [d for d in df.iloc[:, 0].tolist()
-                                         if d not in ("information_schema", "mysql",
-                                                      "performance_schema", "sys")]
-                    elif db_type == "postgresql":
-                        df = db.execute_query(
-                            "SELECT datname FROM pg_database WHERE datistemplate = false")
-                        result["dbs"] = df["datname"].tolist()
-                    else:
-                        result["dbs"] = []
-                except Exception:
-                    result["dbs"] = []
-                try:
-                    result["tables"] = db.get_tables()
-                except Exception:
-                    result["tables"] = []
-                try:
-                    result["columns"] = db.get_all_columns()
-                except Exception:
-                    result["columns"] = {}
-                try:
-                    result["views"] = db.get_views()
-                except Exception:
-                    result["views"] = []
-                try:
-                    result["functions"] = db.get_functions()
-                except Exception:
-                    result["functions"] = []
-                sig_done.emit(result)
-            except Exception as ex:
-                msg = str(ex)
-                if msg in ("(0, '')", "0", "") or "not connected" in msg.lower():
-                    return
-                sig_error.emit(msg)
-
         # Show spinner in schema tree
         self.schema_tree.clear()
         self.schema_tree.addTopLevelItem(QTreeWidgetItem(["Switching database…"]))
         from PySide6.QtWidgets import QApplication as _QApp
         _QApp.processEvents()
 
-        t = threading.Thread(target=_reconnect_and_load, daemon=True)
+        # Reconnect the shared connection synchronously (fast) so nothing else
+        # can be using it mid-reconnect. The (potentially slower) schema
+        # listing then runs on a background thread over its OWN dedicated
+        # connection (services/schema_snapshot.py) — never touching
+        # self.db_service concurrently.
+        try:
+            self.db_service.disconnect()
+            self.db_service.connect(dict(self.config))
+        except Exception as ex:
+            self._on_schema_error(str(ex))
+            return
+
+        conf = dict(self.config)
+        sig_done  = self._schema_done
+        sig_error = self._schema_error
+
+        def _load():
+            try:
+                sig_done.emit(fetch_schema_snapshot(conf))
+            except Exception as ex:
+                msg = str(ex)
+                if msg in ("(0, '')", "0", "") or "not connected" in msg.lower():
+                    return
+                sig_error.emit(msg)
+
+        t = threading.Thread(target=_load, daemon=True)
         t.start()
 
     # ─── Schema tree interaction ──────────────────────────────────────────────
@@ -641,7 +589,7 @@ class ConnectionPanel(QWidget):
         """Open a table view; re-focus if already open."""
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
-            if isinstance(w, TableViewWidget) and w.get_table_name() == table_name:
+            if isinstance(w, TableViewWidget) and w.table_name == table_name:
                 self.tabs.setCurrentIndex(i)
                 return
 
@@ -672,7 +620,7 @@ class ConnectionPanel(QWidget):
             def _apply():
                 for i in range(self.tabs.count()):
                     w = self.tabs.widget(i)
-                    if isinstance(w, TableViewWidget) and w.get_table_name() == ref_table:
+                    if isinstance(w, TableViewWidget) and w.table_name == ref_table:
                         if hasattr(w, 'filter_by_column_value'):
                             w.filter_by_column_value(ref_col, value)
                         break
@@ -784,7 +732,7 @@ class ConnectionPanel(QWidget):
             def _apply():
                 for i in range(self.tabs.count()):
                     w = self.tabs.widget(i)
-                    if isinstance(w, TableViewWidget) and w.get_table_name() == ref_table:
+                    if isinstance(w, TableViewWidget) and w.table_name == ref_table:
                         if hasattr(w, 'filter_by_column_value'):
                             w.filter_by_column_value(ref_col, value)
                         break
@@ -1317,28 +1265,18 @@ class ConnectionPanel(QWidget):
         progress.setWindowTitle("Import CSV")
         progress.setMinimumDuration(0)
 
-        errors = 0
-        inserted = 0
         BATCH = 500
+        rows = [
+            tuple(None if v == "" else v for v in row)
+            for row in df.itertuples(index=False, name=None)
+        ]
         try:
-            cursor = self.db_service.connection.cursor()
-            for start in range(0, len(df), BATCH):
-                if progress.wasCanceled():
-                    break
-                chunk = df.iloc[start:start + BATCH]
-                rows = [
-                    tuple(None if v == "" else v for v in row)
-                    for row in chunk.itertuples(index=False, name=None)
-                ]
-                try:
-                    cursor.executemany(insert_sql, rows)
-                    inserted += len(rows)
-                except Exception as ex:
-                    errors += 1
-                    logger.error(f"Import batch error: {ex}")
-                progress.setValue(start + len(chunk))
-            self.db_service.connection.commit()
-            cursor.close()
+            inserted, errors = self.db_service.execute_batch(
+                insert_sql, rows,
+                batch_size=BATCH,
+                on_batch=lambda start, n: progress.setValue(start + n),
+                should_cancel=progress.wasCanceled,
+            )
         except Exception as ex:
             QMessageBox.critical(self, "Import Error", str(ex))
             return
@@ -1576,7 +1514,7 @@ class ConnectionPanel(QWidget):
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
             if isinstance(w, TableViewWidget):
-                result.append({"type": "table", "name": w.get_table_name()})
+                result.append({"type": "table", "name": w.table_name})
             elif isinstance(w, SqlTab):
                 query = w.get_query() if hasattr(w, "get_query") else ""
                 result.append({
@@ -1712,12 +1650,12 @@ class ConnectionPanel(QWidget):
     def disconnect(self):
         try:
             self._health_timer.stop()
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.debug(f"Failed to stop health timer: {ex}")
         try:
             self.db_service.disconnect()
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.debug(f"Failed to disconnect cleanly: {ex}")
 
     # ─── Query-done toast notification ───────────────────────────────────────
 

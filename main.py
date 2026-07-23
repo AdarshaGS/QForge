@@ -211,8 +211,17 @@ class MainWindow(QMainWindow):
             lambda status, p=panel: self._on_health_changed(p, status)
         )
         panel.reconnected.connect(self._show_reconnect_toast)
+        panel.label_changed.connect(self._on_panel_label_changed)
         # Set initial green dot immediately
         self._on_health_changed(panel, 'idle')
+
+    def _on_panel_label_changed(self, panel, new_label: str):
+        if panel not in self._panels:
+            return
+        idx = self._panels.index(panel)
+        self.conn_tab_bar.setTabText(idx, new_label)
+        if self._current_panel() is panel:
+            self._update_window_title()
 
     def _on_connection_tab_changed(self, index: int):
         if 0 <= index < len(self._panels):
@@ -260,11 +269,10 @@ class MainWindow(QMainWindow):
                     parent=self
                 )
                 panel.update_theme(self.current_theme == "dark")
-                # Fetch and cache the server version for display in the tab bar
-                try:
-                    panel._server_version = db_service.get_server_version()
-                except Exception:
-                    panel._server_version = ""
+                # Server version arrives asynchronously via the schema-load
+                # result (panel.label_changed) rather than being fetched here —
+                # fetching it on this thread would race the schema-loading
+                # background thread over the same shared connection.
                 progress.close()
 
                 self._add_panel(panel)
