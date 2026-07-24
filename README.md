@@ -63,6 +63,19 @@ username, and password are not required.
 
 ## Core workflows
 
+### Classify a connection's environment
+
+Every connection profile has an **Environment** field in the Connection
+Manager — Local, Development, Staging, or Production — set explicitly by you,
+never guessed from the hostname. Profiles created before this field existed
+default to **Unclassified** rather than silently being treated as safe.
+
+The active environment is always visible: a persistent colored badge above
+the query tabs, and (except Unclassified, to keep older profiles looking as
+they always have) in the connection tab text, window title, and Connection
+Manager list. This is a visual safety aid, not an access-control mechanism —
+database permissions are still what actually protects a database.
+
 ### Explore a database
 
 Use the **Schema** sidebar to browse database objects. Double-click a table or

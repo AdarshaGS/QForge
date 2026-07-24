@@ -86,15 +86,34 @@ muddy, or visually noisy.
 
 ### Environment safety indicators
 
-| Environment | Background | Text / border | Label |
-| --- | --- | --- | --- |
-| Local | `#163D2A` | `#71D69A` / `#2D8054` | `LOCAL` |
-| Staging | `#4A3716` | `#F2C56B` / `#A96F10` | `STAGING` |
-| Production | `#542228` | `#FFAAA8` / `#D96565` | `PRODUCTION DATABASE` |
+Every connection profile has an explicit environment tier — never inferred
+from hostname — with a safe `Unclassified` default for profiles that predate
+this field, so an unclassified connection never silently reads as safe.
 
-Display the text label in the workspace and connection tab/window title. These
-labels are safety aids; they do not replace database permissions or future
-read-only enforcement.
+| Environment | Dark bg | Dark text / border | Light bg | Light text / border | Label |
+| --- | --- | --- | --- | --- | --- |
+| Unclassified | `#2A2E36` | `#A9B0BD` / `#56606F` | `#E9ECF1` | `#687080` / `#B7BEC9` | `ENVIRONMENT NOT SET` |
+| Local | `#163D2A` | `#71D69A` / `#2D8054` | `#E3F5EA` | `#1D6B41` / `#4CA97A` | `LOCAL` |
+| Development | `#1E2E3D` | `#8FC4E8` / `#3E7CA6` | `#E4EEF7` | `#1F5C85` / `#5B93B8` | `DEVELOPMENT` |
+| Staging | `#4A3716` | `#F2C56B` / `#A96F10` | `#FBF0DA` | `#8A5A0A` / `#D3A03E` | `STAGING` |
+| Production | `#542228` | `#FFAAA8` / `#D96565` | `#FBE4E4` | `#B3261E` / `#E08585` | `PRODUCTION DATABASE` |
+
+Development is deliberately its own muted blue-gray tone rather than reusing
+Local's green or Staging's amber, so it is never mistaken for "as safe as
+local" or "as risky as staging." Unclassified reads as quiet neutral chrome,
+matching the app's existing secondary-text/border tones, not a risk signal.
+
+Display the text label directly in the connection's tab text and window
+title, appended to the connection name — one place, not a separate
+workspace banner — so the identity, environment, read-only status, and
+server version read as a single line: `Name  TIER  🔒 READ-ONLY  [version]`.
+Unclassified is the one exception, omitted from that line entirely so
+existing pre-Slice-1 profiles look exactly as they did before this feature
+(it's still visible and selectable in the Connection Manager form and tree).
+Read-only status uses the same lock-and-text treatment (`🔒 READ-ONLY`)
+regardless of environment tier, since the read-only toggle is independent of
+environment. These labels are safety aids; they do not replace database
+permissions or read-only enforcement at the database level.
 
 ## Accessibility and quality checks
 

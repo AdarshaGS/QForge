@@ -2,8 +2,16 @@ import pymysql
 import pandas as pd
 import sqlite3
 from utils.logger import get_logger
+from services import query_classifier
 
 logger = get_logger()
+
+
+class ReadOnlyViolation(Exception):
+    """Raised when a write statement is attempted on a read-only connection.
+    This is the backstop guard — always active regardless of which UI entry
+    point called in, so it can't be bypassed by a new/forgotten call site."""
+    pass
 
 
 class DbService:
@@ -13,13 +21,29 @@ class DbService:
         self.connection_name = None
         self.db_type = None  # 'mysql', 'postgresql', 'sqlite'
         self.ssh_tunnel = None  # SSH tunnel object
+        self.read_only = False
         self._config = None   # stored for auto-reconnect
+
+    def _guard(self, sql: str):
+        """Raise ReadOnlyViolation if *sql* contains a write statement and
+        this connection is read-only. No-op otherwise. Classifies the
+        actual SQL text (not which public method was called), since
+        execute_query()/execute_update() will both run any statement."""
+        if not self.read_only:
+            return
+        for stmt in query_classifier.split_statements(sql):
+            c = query_classifier.classify(stmt)
+            if c.is_write:
+                raise ReadOnlyViolation(
+                    f"This connection is read-only — blocked: {stmt[:200]}"
+                )
 
     def connect(self, config):
         """Connect to database based on type"""
 
         db_type = config.get("type", "mysql").lower()
         self.db_type = db_type
+        self.read_only = bool(config.get("read_only"))
 
         logger.info(f"Connecting to {db_type} database: {config['name']}")
 
@@ -82,7 +106,14 @@ class DbService:
                 )
         except Exception as ex:
             logger.debug(f"Non-fatal: failed to set session timeouts: {ex}")
-    
+
+        if config.get("read_only"):
+            try:
+                with self.connection.cursor() as cur:
+                    cur.execute("SET SESSION TRANSACTION READ ONLY")
+            except Exception as ex:
+                logger.warning(f"Failed to set MySQL session read-only: {ex}")
+
     def _connect_postgresql(self, config):
         """Connect to PostgreSQL database"""
         try:
@@ -112,17 +143,29 @@ class DbService:
             
             self.connection = psycopg2.connect(**connect_params)
             self.connection.autocommit = True
+
+            if config.get("read_only"):
+                try:
+                    self.connection.set_session(readonly=True)
+                except Exception as ex:
+                    logger.warning(f"Failed to set PostgreSQL session read-only: {ex}")
         except ImportError:
             raise Exception("psycopg2 not installed. Run: pip install psycopg2-binary")
-    
+
     def _connect_sqlite(self, config):
         """Connect to SQLite database"""
         db_path = config.get("database", config.get("path", ""))
         if not db_path:
             raise Exception("SQLite database path is required")
-        
+
         self.connection = sqlite3.connect(db_path)
         self.connection.row_factory = sqlite3.Row
+
+        if config.get("read_only"):
+            try:
+                self.connection.execute("PRAGMA query_only = ON")
+            except Exception as ex:
+                logger.warning(f"Failed to set SQLite query_only pragma: {ex}")
     
     def _setup_ssh_tunnel(self, ssh_config, db_host, db_port):
         """Setup SSH tunnel and return local host/port"""
@@ -303,9 +346,11 @@ class DbService:
 
     def execute_query(self, query):
         """Execute a SELECT query and return results as DataFrame"""
-        
+
         if not self.connection:
             raise Exception("No active database connection")
+
+        self._guard(query)
 
         try:
             return self._execute_query_raw(query)
@@ -317,26 +362,30 @@ class DbService:
             raise
 
     def execute_multi_query(self, script: str) -> list[tuple[str, object]]:
-        """Split *script* on ';', execute each non-empty statement.
-        Returns list of (label, DataFrame|None) tuples — one per result-producing stmt.
+        """Split *script* into statements, execute each. Returns list of
+        (label, DataFrame|None) tuples — one per result-producing stmt.
         Non-SELECT statements produce (label, None).
+
+        Routes each statement by its real classification (not a first-
+        keyword guess), so a write hidden behind a leading comment or
+        wrapped in a `WITH` CTE is routed to execute_update() — and
+        therefore still passes through self._guard() — instead of silently
+        being treated as a read.
         """
-        import sqlparse
         results: list[tuple[str, object]] = []
-        stmts = [s.strip() for s in sqlparse.split(script) if s.strip()]
+        stmts = query_classifier.split_statements(script)
         for stmt in stmts:
-            kw = stmt.split()[0].upper() if stmt.split() else ""
             label = stmt[:40].replace("\n", " ").strip() + ("…" if len(stmt) > 40 else "")
-            if kw in ("SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "WITH"):
+            if query_classifier.classify(stmt).is_write:
                 try:
-                    df = self.execute_query(stmt)
-                    results.append((label, df))
+                    self.execute_update(stmt)
+                    results.append((label, None))
                 except Exception as ex:
                     results.append((label, ex))
             else:
                 try:
-                    self.execute_update(stmt)
-                    results.append((label, None))
+                    df = self.execute_query(stmt)
+                    results.append((label, df))
                 except Exception as ex:
                     results.append((label, ex))
         return results
@@ -442,6 +491,8 @@ class DbService:
         if not self.connection:
             raise Exception("No active database connection")
 
+        self._guard(query)
+
         try:
             return self._execute_update_raw(query)
         except Exception as ex:
@@ -470,6 +521,8 @@ class DbService:
         """
         if not self.connection:
             raise Exception("No active database connection")
+
+        self._guard(query)
 
         inserted = 0
         errors = 0
