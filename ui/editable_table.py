@@ -5,12 +5,12 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QAbstractItemView,
-    QFileDialog,
     QApplication,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QBrush
 import pandas as pd
+from utils.df_export import export_dataframe
 
 
 # ── Colour palette ───────────────────────────────────────────────────
@@ -940,40 +940,7 @@ class EditableTableWidget(QTableWidget):
     def export_selected(self):
         """Export visible table data to CSV / JSON / Excel / SQL."""
         df = self.filtered_data if self.filtered_data is not None else self.original_data
-        if df is None or df.empty:
-            QMessageBox.information(self, "Export", "No data to export.")
-            return
-
-        file_name, selected_filter = QFileDialog.getSaveFileName(
-            self, "Export Data", f"{self.table_name or 'data'}.csv",
-            "CSV Files (*.csv);;JSON Files (*.json);;Excel Files (*.xlsx);;SQL Insert (*.sql)"
-        )
-        if not file_name:
-            return
-
-        try:
-            if file_name.endswith(".json"):
-                df.to_json(file_name, orient="records", indent=2, force_ascii=False)
-            elif file_name.endswith(".xlsx"):
-                df.to_excel(file_name, index=False, engine="openpyxl")
-            elif file_name.endswith(".sql"):
-                tbl = self.table_name or "table"
-                lines = []
-                for _, row in df.iterrows():
-                    cols = ", ".join(f"`{c}`" for c in df.columns)
-                    vals = ", ".join(
-                        "NULL" if (v != v or v is None) else
-                        f"'{str(v).replace(chr(39), chr(39)*2)}'"
-                        for v in row
-                    )
-                    lines.append(f"INSERT INTO `{tbl}` ({cols}) VALUES ({vals});")
-                with open(file_name, "w", encoding="utf-8") as fh:
-                    fh.write("\n".join(lines))
-            else:
-                df.to_csv(file_name, index=False)
-            QMessageBox.information(self, "Export", f"Exported {len(df)} rows to:\n{file_name}")
-        except Exception as ex:
-            QMessageBox.critical(self, "Export Error", str(ex))
+        export_dataframe(self, df, f"{self.table_name or 'data'}.csv", self.table_name or "table")
     
     def set_cell_null(self):
         """Set current cell to NULL"""

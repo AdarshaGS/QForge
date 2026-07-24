@@ -1,4 +1,4 @@
-from PySide6.QtCore import Qt, Signal, QObject, QRunnable, Slot, QThreadPool
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -24,54 +24,6 @@ import pandas as pd
 logger = get_logger()
 
 
-# Worker for loading table data in a separate thread
-class TableDataLoaderSignals(QObject):
-    finished = Signal(object, object)  # dataframe, error
-    progress = Signal(int)  # percentage
-
-
-class TableDataLoader(QRunnable):
-    def __init__(self, db_service, table_name, current_filter="",
-                 sort_column=None, sort_order=None, page=1, page_size=100):
-        super().__init__()
-        self.db_service = db_service
-        self.table_name = table_name
-        self.current_filter = current_filter
-        self.sort_column = sort_column
-        self.sort_order = sort_order
-        self.page = page
-        self.page_size = page_size
-        self.signals = TableDataLoaderSignals()
-        self.is_cancelled = False
-
-    @Slot()
-    def run(self):
-        try:
-            # Build query with pagination
-            offset = (self.page - 1) * self.page_size
-            order_clause = ""
-            if self.sort_column:
-                order_clause = f" ORDER BY {self.sort_column} {self.sort_order}"
-
-            if self.current_filter:
-                query = f"SELECT * FROM {self.table_name} WHERE {self.current_filter}{order_clause} LIMIT {self.page_size} OFFSET {offset}"
-            else:
-                query = f"SELECT * FROM {self.table_name}{order_clause} LIMIT {self.page_size} OFFSET {offset}"
-
-            # Execute query
-            df = self.db_service.execute_query(query)
-
-            if not self.is_cancelled:
-                self.signals.finished.emit(df, None)
-
-        except Exception as e:
-            if not self.is_cancelled:
-                self.signals.finished.emit(None, e)
-
-    def cancel(self):
-        self.is_cancelled = True
-
-
 class TableViewWidget(QWidget):
     """Widget that shows a table with streaming data loading"""
 
@@ -88,15 +40,12 @@ class TableViewWidget(QWidget):
         self.sort_column = None
         self.sort_order = None  # 'DESC' or 'ASC'
         self.filter_conditions = []  # List of (column, operator, value) tuples
+        self.filter_visible = False
 
-        # Streaming data attributes
-        self.accumulated_data = None   # pandas DataFrame of all loaded rows
-        self.next_page = 1             # next page to load (1-indexed)
+        # Pagination state
+        self.current_page = 1          # 1-indexed
         self.total_rows = None         # total rows in the table (if known)
-        self.page_size = 100           # rows per page for loading
-        self.is_loading = False        # to prevent multiple concurrent loads
-        self.threadpool = QThreadPool()
-        self.current_loader = None
+        self.page_size = 100           # rows per page
 
         self.init_ui()
 
@@ -110,7 +59,7 @@ class TableViewWidget(QWidget):
 
         # Add Cmd+S shortcut to save changes
         self.save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
-        self.save_shortcut.activated.connect(self.save_changes)
+        self.save_shortcut.activated.connect(self.commit_changes)
 
         # Load first page of data
         self.reset_and_load_first_page()
@@ -233,7 +182,7 @@ class TableViewWidget(QWidget):
 
         table_layout.addWidget(self.data_table)
 
-        # Bottom controls - row count center, load more button right
+        # Bottom controls - row count center, pager right
         bottom_controls = QHBoxLayout()
         bottom_controls.setContentsMargins(3, 3, 3, 3)
         bottom_controls.setSpacing(3)
@@ -247,10 +196,8 @@ class TableViewWidget(QWidget):
 
         bottom_controls.addStretch()
 
-        # Load more button on right
-        self.load_more_btn = QPushButton("Load More Rows")
-        self.load_more_btn.clicked.connect(self.load_more_rows)
-        self.load_more_btn.setStyleSheet("""
+        # Pager on the right
+        pager_btn_style = """
             QPushButton {
                 background-color: #0078d4;
                 color: #ffffff;
@@ -267,15 +214,27 @@ class TableViewWidget(QWidget):
                 background-color: #6e6e73;
                 color: #ffffff;
             }
-        """)
-        bottom_controls.addWidget(self.load_more_btn)
+        """
+        self.prev_btn = QPushButton("‹ Prev")
+        self.prev_btn.clicked.connect(self.prev_page)
+        self.prev_btn.setEnabled(False)
+        self.prev_btn.setStyleSheet(pager_btn_style)
+        bottom_controls.addWidget(self.prev_btn)
+
+        self.page_label = QLabel("1/1")
+        self.page_label.setStyleSheet("color: gray; font-size: 11px;")
+        self.page_label.setAlignment(Qt.AlignCenter)
+        self.page_label.setFixedWidth(48)
+        bottom_controls.addWidget(self.page_label)
+
+        self.next_btn = QPushButton("Next ›")
+        self.next_btn.clicked.connect(self.next_page)
+        self.next_btn.setEnabled(False)
+        self.next_btn.setStyleSheet(pager_btn_style)
+        bottom_controls.addWidget(self.next_btn)
 
         layout.addWidget(table_container)
         layout.addLayout(bottom_controls)
-
-        # Connect resize event to update loading overlay geometry
-        table_container.resized.connect(self._update_loading_overlay_geometry)
-        self.data_table.resized.connect(self._update_loading_overlay_geometry)
 
     def _update_loading_overlay_geometry(self):
         """Update loading overlay to cover the table container"""
@@ -348,113 +307,122 @@ class TableViewWidget(QWidget):
         self.reset_and_load_first_page()
 
     def reset_and_load_first_page(self):
-        """Reset accumulated data and load the first page"""
-        # Cancel any ongoing load
-        if self.current_loader:
-            self.current_loader.cancel()
-
-        # Reset streaming state
-        self.accumulated_data = None
-        self.next_page = 1
+        """Reset to the first page and load it"""
+        self.current_page = 1
         self.total_rows = None
-        self.is_loading = False
+        self.load_table_data()
 
-        # Get total row count for the current filter (for display and knowing when to stop)
-        self._update_total_rows()
-
-        # Load first page
-        self.load_page(self.next_page)
-
-    def _update_total_rows(self):
-        """Get total row count for current filter and sort"""
+    def load_table_data(self):
+        """Load the current page for current filter and sort, refreshing row count"""
         try:
             if self.current_filter:
                 count_query = f"SELECT COUNT(*) as total FROM {self.table_name} WHERE {self.current_filter}"
             else:
-                count_query = f"SELECT COUNT(*) as total FROM {self.table_name}"
-
-            count_df = self.db_service.execute_query(count_query)
-            if len(count_df) > 0:
-                self.total_rows = int(count_df.iloc[0]['total'])
+                # For large unfiltered tables, use approximation or skip count
+                try:
+                    # Try to get approximate count (MySQL specific - very fast)
+                    if self.db_service.db_type == 'mysql':
+                        approx_query = f"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_NAME = '{self.table_name}' AND TABLE_SCHEMA = DATABASE()"
+                        approx_df = self.db_service.execute_query(approx_query)
+                        if len(approx_df) > 0 and approx_df.iloc[0]['TABLE_ROWS'] is not None:
+                            self.total_rows = int(approx_df.iloc[0]['TABLE_ROWS'])
+                        else:
+                            # Fallback: set to large number
+                            self.total_rows = 1000000
+                    else:
+                        # For other DBs, use COUNT but with timeout protection
+                        count_query = f"SELECT COUNT(*) as total FROM {self.table_name}"
+                        count_df = self.db_service.execute_query(count_query)
+                        self.total_rows = int(count_df.iloc[0]['total'])
+                except Exception as ex:
+                    # If approximate fails, set to large number to allow pagination
+                    logger.debug(f"Approximate row count failed for {self.table_name}: {ex}")
+                    self.total_rows = 1000000
+            
+            # Calculate offset
+            offset = (self.current_page - 1) * self.page_size
+            
+            # Build ORDER BY clause
+            order_clause = ""
+            if self.sort_column:
+                order_clause = f" ORDER BY {self.sort_column} {self.sort_order}"
+            
+            # Build query with pagination
+            if self.current_filter:
+                query = f"SELECT * FROM {self.table_name} WHERE {self.current_filter}{order_clause} LIMIT {self.page_size} OFFSET {offset}"
             else:
-                self.total_rows = 0
+                query = f"SELECT * FROM {self.table_name}{order_clause} LIMIT {self.page_size} OFFSET {offset}"
+            
+            df = self.db_service.execute_query(query)
+            
+            # Store column names for filter - even if table is empty
+            if not self.columns:
+                # Try to get columns from table structure if data is empty
+                if len(df.columns) > 0:
+                    self.columns = list(df.columns)
+                else:
+                    # Fallback: get structure from database
+                    try:
+                        cols = self.db_service.get_columns(self.table_name)
+                        self.columns = [col.get('Field', '') for col in cols]
+                    except Exception:
+                        pass
+                
+                if self.columns:
+                    # Update all filter row column combos
+                    for i in range(self.filter_rows_layout.count()):
+                        row_widget = self.filter_rows_layout.itemAt(i).widget()
+                        if row_widget:
+                            column_combo = row_widget.findChild(QComboBox, "column_combo")
+                            if column_combo:
+                                current = column_combo.currentText()
+                                column_combo.clear()
+                                column_combo.addItems(self.columns)
+                                if current in self.columns:
+                                    column_combo.setCurrentText(current)
+            
+            # For empty tables, create empty DataFrame with column structure
+            if self.total_rows == 0 and self.columns:
+                import pandas as pd
+                # Create empty DataFrame with columns to show structure
+                df = pd.DataFrame(columns=self.columns)
+            
+            self.data_table.load_data(df, table_name=self.table_name)
+            total_pages = (self.total_rows + self.page_size - 1) // self.page_size
+            self.page_label.setText(f"{self.current_page}/{max(1, total_pages)}")
+            
+            start_row = offset + 1 if self.total_rows > 0 else 0
+            end_row = min(offset + self.page_size, self.total_rows)
+            
+            if self.total_rows == 0:
+                # For empty tables, show message in center
+                self.limit_label.setText(f"No data - 0 rows")
+            elif self.current_filter:
+                self.limit_label.setText(f"Showing {start_row}-{end_row} of {self.total_rows} rows (filtered)")
+            else:
+                self.limit_label.setText(f"Showing {start_row}-{end_row} of {self.total_rows} rows")
+            
+            # Update pagination buttons
+            self.prev_btn.setEnabled(self.current_page > 1)
+            self.next_btn.setEnabled(self.current_page < total_pages)
+            
+            logger.info(f"Loaded page {self.current_page} ({len(df)} rows) from {self.table_name}")
         except Exception as ex:
-            logger.error(f"Failed to get total row count: {str(ex)}")
-            self.total_rows = None  # Unknown total
-
-    def load_page(self, page_num):
-        """Load a specific page of data"""
-        if self.is_loading:
-            return  # Prevent concurrent loads
-
-        self.is_loading = True
-        self.loading_overlay.show()
-        self.loading_overlay.raise_()
-        self.load_more_btn.setEnabled(False)
-
-        # Create and start worker
-        self.current_loader = TableDataLoader(
-            self.db_service, self.table_name, self.current_filter,
-            self.sort_column, self.sort_order, page_num, self.page_size
-        )
-        self.current_loader.signals.finished.connect(self._on_page_loaded)
-        self.threadpool.start(self.current_loader)
-
-    def _on_page_loaded(self, df, error):
-        """Handle completion of page loading"""
-        self.is_loading = False
-        self.loading_overlay.hide()
-        self.load_more_btn.setEnabled(True)
-
-        if error:
-            self.limit_label.setText(f"Error: {str(error)}")
-            logger.error(f"Failed to load page: {str(error)}")
-            return
-
-        # Accumulate data
-        if self.accumulated_data is None:
-            self.accumulated_data = df
-        else:
-            self.accumulated_data = pd.concat([self.accumulated_data, df], ignore_index=True)
-
-        # Update table view with accumulated data
-        self.data_table.load_data(self.accumulated_data, table_name=self.table_name)
-
-        # Update UI
-        self._update_ui_after_load(len(df))
-
-        # Prepare for next page
-        self.next_page += 1
-
-        # Check if we've loaded all rows
-        if self.total_rows is not None and len(self.accumulated_data) >= self.total_rows:
-            self.load_more_btn.setEnabled(False)
-            self.load_more_btn.setText("All Rows Loaded")
-        elif len(df) < self.page_size:
-            # Last page had less than a full page of results
-            self.load_more_btn.setEnabled(False)
-            self.load_more_btn.setText("No More Rows")
-        else:
-            self.load_more_btn.setEnabled(True)
-            self.load_more_btn.setText("Load More Rows")
-
-    def _update_ui_after_load(self, newly_loaded_rows):
-        """Update labels and buttons after loading a page"""
-        loaded_rows = len(self.accumulated_data) if self.accumulated_data is not None else 0
-
-        if self.total_rows is not None:
-            self.limit_label.setText(
-                f"Showing {loaded_rows} rows (of {self.total_rows} total)"
-            )
-        else:
-            self.limit_label.setText(f"Showing {loaded_rows} rows")
-
-    def load_more_rows(self):
-        """Load the next page and append to current view"""
-        if not self.is_loading:
-            self.load_page(self.next_page)
-
-    # ─── Filtering ─────────────────────────────────────────────────────────────
+            logger.error(f"Failed to load table data: {str(ex)}")
+            self.limit_label.setText(f"Error: {str(ex)}")
+    
+    def prev_page(self):
+        """Load previous page"""
+        if self.current_page > 1:
+            self.current_page -= 1
+            self.load_table_data()
+    
+    def next_page(self):
+        """Load next page"""
+        total_pages = (self.total_rows + self.page_size - 1) // self.page_size
+        if self.current_page < total_pages:
+            self.current_page += 1
+            self.load_table_data()
 
     def add_filter_row(self):
         """Add a new filter row"""

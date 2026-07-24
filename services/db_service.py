@@ -2,7 +2,6 @@ import pymysql
 import pandas as pd
 import sqlite3
 from utils.logger import get_logger
-from utils.credential_manager import get_connection_password, delete_connection_password
 
 logger = get_logger()
 
@@ -23,14 +22,6 @@ class DbService:
         self.db_type = db_type
 
         logger.info(f"Connecting to {db_type} database: {config['name']}")
-
-        # Retrieve password from secure storage if not provided in config
-        # (allows for migrations where password might still be in config)
-        if "password" not in config or not config["password"]:
-            stored_password = get_connection_password(config["name"])
-            if stored_password is not None:
-                config = config.copy()  # Don't modify original
-                config["password"] = stored_password
 
         if db_type == "mysql":
             self._connect_mysql(config)
@@ -89,8 +80,8 @@ class DbService:
                     "wait_timeout=28800, "
                     "interactive_timeout=28800"
                 )
-        except Exception:
-            pass   # non-fatal: best-effort
+        except Exception as ex:
+            logger.debug(f"Non-fatal: failed to set session timeouts: {ex}")
     
     def _connect_postgresql(self, config):
         """Connect to PostgreSQL database"""
@@ -146,8 +137,8 @@ class DbService:
                 if not hasattr(paramiko, 'DSSKey'):
                     # Create dummy DSSKey class to prevent errors
                     paramiko.DSSKey = None
-            except:
-                pass
+            except ImportError as ex:
+                logger.debug(f"paramiko DSSKey patch skipped: {ex}")
             
             ssh_host = ssh_config.get("host")
             ssh_port = ssh_config.get("port", 22)
@@ -469,6 +460,37 @@ class DbService:
         cursor.close()
         self.connection.commit()
         return affected_rows
+
+    def execute_batch(self, query, rows, batch_size=500, on_batch=None, should_cancel=None):
+        """Run `query` via executemany, in batches, committing once at the end.
+
+        on_batch(start, batch_len) is called after each batch (for progress UI).
+        should_cancel() is polled before each batch; returning True stops early.
+        Returns (inserted, errors) — errors is the count of batches that raised.
+        """
+        if not self.connection:
+            raise Exception("No active database connection")
+
+        inserted = 0
+        errors = 0
+        cursor = self.connection.cursor()
+        try:
+            for start in range(0, len(rows), batch_size):
+                if should_cancel and should_cancel():
+                    break
+                chunk = rows[start:start + batch_size]
+                try:
+                    cursor.executemany(query, chunk)
+                    inserted += len(chunk)
+                except Exception as ex:
+                    errors += 1
+                    logger.error(f"Batch execute error: {ex}")
+                if on_batch:
+                    on_batch(start, len(chunk))
+            self.connection.commit()
+        finally:
+            cursor.close()
+        return inserted, errors
 
     def get_server_version(self) -> str:
         """Return a short version string like 'MySQL 8.0.41' or 'PostgreSQL 15.3'."""

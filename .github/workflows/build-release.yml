@@ -1,0 +1,114 @@
+name: Build & Release
+
+# Builds QForge on macOS, Windows, and Linux from QForge.spec (the same spec
+# build.sh uses locally). Pushing a `vX.Y.Z` tag also publishes a GitHub
+# Release with all three artifacts attached — always built fresh from that
+# exact tagged commit on a clean runner, so a stale local checkout can never
+# get published under the wrong tag again.
+#
+# "Run workflow" (workflow_dispatch) lets you validate the build matrix on
+# any branch without cutting a real release.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact_name: QForge.dmg
+          - os: windows-latest
+            artifact_name: QForge-windows.zip
+          - os: ubuntu-latest
+            artifact_name: QForge-linux.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # PySide6 needs a handful of shared libraries present to even import
+      # cleanly on a bare Ubuntu runner (no desktop environment installed).
+      - name: Install Linux Qt runtime dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libopengl0 libxkbcommon0 libdbus-1-3 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
+            libxcb-xkb1 libxkbcommon-x11-0
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller --clean QForge.spec
+
+      - name: Package macOS app (prune Qt frameworks, ad-hoc sign, create DMG)
+        if: runner.os == 'macOS'
+        run: |
+          QT_LIB_DIR="dist/QForge.app/Contents/Frameworks/PySide6/Qt/lib"
+          for fw in QtQml QtQuick QtQuick3D QtQmlModels QtQmlMeta QtQmlWorkerScript \
+                    QtPdf QtPdfWidgets QtVirtualKeyboard QtVirtualKeyboardQml QtOpenGL; do
+            rm -rf "$QT_LIB_DIR/${fw}.framework"
+            rm -f "dist/QForge.app/Contents/Frameworks/${fw}" \
+                  "dist/QForge.app/Contents/Resources/${fw}"
+          done
+          # Ad-hoc signature only (no Apple Developer ID / notarization
+          # configured) — matches build.sh's local behavior. Users still see
+          # a Gatekeeper prompt on first launch; see README.
+          codesign --force --deep -s - dist/QForge.app
+          hdiutil create -volname "QForge" -srcfolder dist/QForge.app -ov -format UDZO "${{ matrix.artifact_name }}"
+
+      - name: Package Windows build (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/QForge/* -DestinationPath "${{ matrix.artifact_name }}"
+
+      - name: Package Linux build (tarball)
+        if: runner.os == 'Linux'
+        run: tar -czf "${{ matrix.artifact_name }}" -C dist QForge
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute checksums
+        working-directory: artifacts
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${{ github.repository }}" \
+            --title "QForge ${GITHUB_REF_NAME}" \
+            --notes "Automated release built from commit ${{ github.sha }}. Verify downloads against SHA256SUMS.txt." \
+            artifacts/*

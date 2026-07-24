@@ -48,3 +48,5 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+*.spec
+!QForge.spec
