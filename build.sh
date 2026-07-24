@@ -38,100 +38,7 @@ fi
 
 # Clean previous builds
 echo "${BLUE}🧹 Cleaning previous builds...${NC}"
-rm -rf build/ dist/ *.spec
-
-# Create PyInstaller spec file
-echo "${BLUE}📝 Creating build configuration...${NC}"
-cat > QForge.spec << 'EOF'
-# -*- mode: python ; coding: utf-8 -*-
-
-block_cipher = None
-
-a = Analysis(
-    ['main.py'],
-    pathex=[],
-    binaries=[],
-    datas=[
-        ('ui/*.py', 'ui'),
-        ('services/*.py', 'services'),
-        ('utils/*.py', 'utils'),
-    ],
-    hiddenimports=[
-        'pymysql',
-        'psycopg2',
-        'pandas',
-        'numpy',
-        'sqlparse',
-        'sshtunnel',
-        'paramiko',
-        'openpyxl',
-        'pyarrow',
-        'PySide6.QtCore',
-        'PySide6.QtGui',
-        'PySide6.QtWidgets',
-    ],
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
-    noarchive=False,
-)
-
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
-
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name='QForge',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='QForge',
-)
-
-app = BUNDLE(
-    coll,
-    name='QForge.app',
-    icon=None,
-    bundle_identifier='com.qforge.app',
-    version='1.0.0',
-    info_plist={
-        'NSPrincipalClass': 'NSApplication',
-        'NSHighResolutionCapable': 'True',
-        'LSMinimumSystemVersion': '10.13.0',
-        'CFBundleShortVersionString': '1.0.0',
-        'CFBundleVersion': '1.0.0',
-    },
-)
-EOF
-
-# Patch the version number into the spec (heredoc uses single quotes so vars don't expand)
-sed -i '' "s/version='1.0.0'/version='${APP_VERSION}'/g" QForge.spec
-sed -i '' "s/CFBundleShortVersionString': '1.0.0'/CFBundleShortVersionString': '${APP_VERSION}'/g" QForge.spec
-sed -i '' "s/CFBundleVersion': '1.0.0'/CFBundleVersion': '${APP_VERSION}'/g" QForge.spec
-echo "${GREEN}   version ${APP_VERSION} injected into spec${NC}"
+rm -rf build/ dist/
 
 # Build the application
 echo "${BLUE}🔨 Building application...${NC}"
@@ -143,7 +50,37 @@ if [ -d "dist/QForge.app" ]; then
     echo ""
     echo "📦 Application created at: ${BLUE}dist/QForge.app${NC}"
     echo ""
-    
+
+    # Prune unused Qt frameworks. QForge only imports PySide6.QtCore/QtGui/
+    # QtWidgets, but PySide6's PyInstaller hook copies its entire Qt/lib tree
+    # regardless of Analysis(excludes=...) — that only affects Python module
+    # scanning, not this hook's own binary bundling. Verified via `otool -L`
+    # across every binary in the built app that nothing links against any of
+    # these frameworks, so removing them is safe.
+    echo "${BLUE}✂️  Pruning unused Qt frameworks...${NC}"
+    QT_LIB_DIR="dist/QForge.app/Contents/Frameworks/PySide6/Qt/lib"
+    PRUNED_MB=0
+    for fw in QtQml QtQuick QtQuick3D QtQmlModels QtQmlMeta QtQmlWorkerScript \
+              QtPdf QtPdfWidgets QtVirtualKeyboard QtVirtualKeyboardQml QtOpenGL; do
+        FW_PATH="$QT_LIB_DIR/${fw}.framework"
+        if [ -d "$FW_PATH" ]; then
+            FW_MB=$(du -sm "$FW_PATH" | cut -f1)
+            PRUNED_MB=$((PRUNED_MB + FW_MB))
+            rm -rf "$FW_PATH"
+        fi
+        # PyInstaller also drops top-level convenience symlinks to each
+        # framework's binary directly under Contents/Frameworks and
+        # Contents/Resources — remove those too or they're left dangling.
+        rm -f "dist/QForge.app/Contents/Frameworks/${fw}" \
+              "dist/QForge.app/Contents/Resources/${fw}"
+    done
+    echo "   removed ~${PRUNED_MB}MB of unused Qt frameworks"
+
+    # Re-sign after modifying bundle contents (PyInstaller ad-hoc-signs the
+    # bundle during BUNDLE(); deleting files after that invalidates it).
+    codesign --force --deep -s - dist/QForge.app 2>&1 | tail -5
+    echo ""
+
     # Get app size
     APP_SIZE=$(du -sh dist/QForge.app | cut -f1)
     echo "📏 Size: ${APP_SIZE}"

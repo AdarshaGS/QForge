@@ -2,7 +2,6 @@ import pymysql
 import pandas as pd
 import sqlite3
 from utils.logger import get_logger
-from utils.credential_manager import get_connection_password, delete_connection_password
 
 logger = get_logger()
 
@@ -23,14 +22,6 @@ class DbService:
         self.db_type = db_type
 
         logger.info(f"Connecting to {db_type} database: {config['name']}")
-
-        # Retrieve password from secure storage if not provided in config
-        # (allows for migrations where password might still be in config)
-        if "password" not in config or not config["password"]:
-            stored_password = get_connection_password(config["name"])
-            if stored_password is not None:
-                config = config.copy()  # Don't modify original
-                config["password"] = stored_password
 
         if db_type == "mysql":
             self._connect_mysql(config)

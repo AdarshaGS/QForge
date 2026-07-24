@@ -498,7 +498,7 @@ class MainWindow(QMainWindow):
         act.triggered.connect(self._export_current_data)
 
         act = file_menu.addAction("Import Data…")
-        act.setShortcut("Ctrl+Shift+I")
+        act.setShortcut("Ctrl+Shift+E")
         act.triggered.connect(self._import_data)
 
         file_menu.addSeparator()

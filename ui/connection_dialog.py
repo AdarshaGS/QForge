@@ -24,15 +24,6 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QShortcut, QKeySequence, QFont, QColor
 from PySide6.QtCore import Qt
 
-# Import credential manager for secure password storage
-try:
-    from utils.credential_manager import store_connection_password, delete_connection_password
-    CREDENTIAL_MANAGER_AVAILABLE = True
-except ImportError:
-    CREDENTIAL_MANAGER_AVAILABLE = False
-    store_connection_password = None
-    delete_connection_password = None
-
 
 class ConnectionDialog(QDialog):
 
@@ -45,6 +36,10 @@ class ConnectionDialog(QDialog):
 
         self.selected_connection = None
         self.auto_connect_last = auto_connect_last
+        # (connection_id, "db"|"ssh") -> password, populated on demand so we
+        # don't hit the OS keychain (and its access-control prompt) once per
+        # saved profile every time the connection list loads or saves.
+        self._resolved_passwords = {}
 
         self.setWindowTitle("Connection Manager")
         self._compact_height = 530
@@ -507,9 +502,15 @@ class ConnectionDialog(QDialog):
             self.group_input.showPopup()
 
     def _resolve_credentials(self):
-        """Assign a stable id to every connection and fill in passwords from
-        the OS keychain, migrating any legacy plaintext passwords found on
-        disk into the keychain."""
+        """Assign a stable id to every connection, migrating any legacy
+        plaintext password found on disk into the keychain.
+
+        Deliberately does NOT eagerly fetch existing keychain passwords here
+        — with several saved profiles, doing that on every load/save/reorder
+        meant one OS keychain access per profile per action. Instead, a
+        password is resolved lazily, only for the connection the user
+        actually selects (see `_resolve_password`), and cached for the life
+        of this dialog."""
         needs_resave = False
         for conn in self.connections:
             if not conn.get("id"):
@@ -523,51 +524,100 @@ class ConnectionDialog(QDialog):
             plaintext_pw = conn.get("password", "")
             if plaintext_pw:
                 credential_store.set_password(conn_id, "db", plaintext_pw)
+                self._resolved_passwords[(conn_id, "db")] = plaintext_pw
                 needs_resave = True
-            else:
-                plaintext_pw = credential_store.get_password(conn_id, "db")
-            conn["password"] = plaintext_pw
 
             ssh = conn.get("ssh_tunnel")
             if ssh and ssh.get("enabled") and not ssh.get("use_key"):
                 plaintext_ssh_pw = ssh.get("password", "")
                 if plaintext_ssh_pw:
                     credential_store.set_password(conn_id, "ssh", plaintext_ssh_pw)
+                    self._resolved_passwords[(conn_id, "ssh")] = plaintext_ssh_pw
                     needs_resave = True
-                else:
-                    plaintext_ssh_pw = credential_store.get_password(conn_id, "ssh")
-                ssh["password"] = plaintext_ssh_pw
 
         if needs_resave:
             self.save_connections()
 
+    def _resolve_password(self, conn_id: str, kind: str) -> str:
+        """Fetch a single credential from the OS keychain on demand, caching
+        the result for the lifetime of this dialog so repeated UI actions
+        (saving, reordering, reselecting) don't re-hit the keychain for the
+        same item."""
+        key = (conn_id, kind)
+        if key not in self._resolved_passwords:
+            self._resolved_passwords[key] = credential_store.get_password(conn_id, kind)
+        return self._resolved_passwords[key]
+
+    def _remember_form_password(self, data: dict):
+        """Record a just-submitted form's password(s) as this session's known
+        value for that connection, so `save_connections()` knows it's safe to
+        sync (rather than skipping a credential it never actually resolved)."""
+        if "password" not in data:
+            return  # sqlite: no credential to track
+        self._resolved_passwords[(data["id"], "db")] = data["password"]
+        ssh = data.get("ssh_tunnel")
+        if ssh and ssh.get("enabled") and not ssh.get("use_key"):
+            self._resolved_passwords[(data["id"], "ssh")] = ssh.get("password", "")
+
     def save_connections(self):
         os.makedirs(os.path.dirname(self.CONNECTION_FILE), exist_ok=True)
         sanitized = []
+        keyring_failures = []
         for conn in self.connections:
             c = dict(conn)
             conn_id = c.get("id")
+            c.pop("password", None)
             if conn_id and c.get("type") != "sqlite":
-                pw = c.pop("password", "")
-                if pw:
-                    credential_store.set_password(conn_id, "db", pw)
-                else:
-                    credential_store.delete_password(conn_id, "db")
-                c["password"] = ""
+                c["password"] = self._sync_password(conn_id, "db", c.get("name", conn_id), keyring_failures)
 
                 ssh = c.get("ssh_tunnel")
                 if ssh and ssh.get("enabled") and not ssh.get("use_key"):
                     ssh = dict(ssh)
-                    ssh_pw = ssh.pop("password", "")
-                    if ssh_pw:
-                        credential_store.set_password(conn_id, "ssh", ssh_pw)
-                    else:
-                        credential_store.delete_password(conn_id, "ssh")
-                    ssh["password"] = ""
+                    ssh.pop("password", None)
+                    ssh["password"] = self._sync_password(
+                        conn_id, "ssh", f"{c.get('name', conn_id)} (SSH)", keyring_failures
+                    )
                     c["ssh_tunnel"] = ssh
             sanitized.append(c)
         with open(self.CONNECTION_FILE, "w") as f:
             json.dump(sanitized, f, indent=4)
+
+        if keyring_failures:
+            self._warn_keyring_unavailable(keyring_failures)
+
+    def _sync_password(self, conn_id: str, kind: str, label: str, keyring_failures: list) -> str:
+        """Write this dialog session's known value of a credential to the
+        keychain, returning what belongs in connections.json (always blank
+        on success, kept in plaintext if the keychain write failed).
+
+        If this credential was never resolved or edited in this session
+        (i.e. the user never selected that connection), its true current
+        value is unknown here — skip touching the keychain entirely rather
+        than risk deleting it based on an unresolved blank."""
+        key = (conn_id, kind)
+        if key not in self._resolved_passwords:
+            return ""
+        pw = self._resolved_passwords[key]
+        if not pw:
+            credential_store.delete_password(conn_id, kind)
+            return ""
+        if credential_store.set_password(conn_id, kind, pw):
+            return ""
+        keyring_failures.append(label)
+        return pw
+
+    def _warn_keyring_unavailable(self, names):
+        QMessageBox.warning(
+            self,
+            "Password Not Stored Securely",
+            "QForge could not reach the system keychain to store the "
+            "password(s) for:\n\n"
+            + "\n".join(f"  • {n}" for n in names)
+            + "\n\nThe password(s) were kept in connections.json in plain "
+            "text instead of being lost. Check that your OS keyring service "
+            "is unlocked and running, then reopen the connection and save it "
+            "again once it's available.",
+        )
 
     def _get_group_value(self) -> str:
         """Return the clean group name, stripping the '＋ Create new group:' prefix."""
@@ -654,6 +704,7 @@ class ConnectionDialog(QDialog):
                 QMessageBox.warning(self, "Invalid Input", str(ex))
                 return
             data["id"] = self.connections[conn_idx].get("id") or uuid.uuid4().hex
+            self._remember_form_password(data)
             self.connections[conn_idx] = data
             self.save_connections()
             self.load_connections()
@@ -685,6 +736,7 @@ class ConnectionDialog(QDialog):
             QMessageBox.warning(self, "Invalid Input", str(ex))
             return
         data["id"] = uuid.uuid4().hex
+        self._remember_form_password(data)
         self.connections.append(data)
         self.save_connections()
         self.load_connections()
@@ -702,11 +754,6 @@ class ConnectionDialog(QDialog):
         self.save_connections()
         self.load_connections()
         self.clear_form()
-
-        # Remove stored credentials for deleted connection
-        if CREDENTIAL_MANAGER_AVAILABLE and connection_name:
-            delete_connection_password(connection_name)
-            delete_connection_password(f"{connection_name}_ssh_tunnel")
 
     def load_selected_connection(self):
         selected_item = self._get_selected_conn_item()
@@ -732,7 +779,9 @@ class ConnectionDialog(QDialog):
             self.host_input.setText(connection.get("host", ""))
             self.port_input.setText(str(connection.get("port", 3306)))
             self.user_input.setText(connection.get("user", ""))
-            self.password_input.setText(connection.get("password", ""))
+            resolved_pw = self._resolve_password(connection["id"], "db")
+            connection["password"] = resolved_pw
+            self.password_input.setText(resolved_pw)
 
             ssh_data = connection.get("ssh_tunnel", {"enabled": False})
             if ssh_data.get("enabled", False):
@@ -745,7 +794,9 @@ class ConnectionDialog(QDialog):
                 if use_key:
                     self.ssh_key_path_input.setText(ssh_data.get("key_path", ""))
                 else:
-                    self.ssh_password_input.setText(ssh_data.get("password", ""))
+                    resolved_ssh_pw = self._resolve_password(connection["id"], "ssh")
+                    ssh_data["password"] = resolved_ssh_pw
+                    self.ssh_password_input.setText(resolved_ssh_pw)
             else:
                 self.ssh_enabled_check.setChecked(False)
 
@@ -755,7 +806,21 @@ class ConnectionDialog(QDialog):
             QMessageBox.warning(self, "Warning", "Select a connection first.")
             return
         conn_idx = selected_item.data(0, Qt.UserRole)
-        self.selected_connection = self.connections[conn_idx]
+
+        # Persist whatever is currently in the form (including a freshly
+        # typed password) automatically, so Connect never requires a
+        # separate Save click first.
+        try:
+            data = self.get_form_data()
+        except ValueError as ex:
+            QMessageBox.warning(self, "Invalid Input", str(ex))
+            return
+        data["id"] = self.connections[conn_idx].get("id") or uuid.uuid4().hex
+        self._remember_form_password(data)
+        self.connections[conn_idx] = data
+        self.save_connections()
+
+        self.selected_connection = data
         self.save_last_connection(self.selected_connection)
         self.accept()
 
