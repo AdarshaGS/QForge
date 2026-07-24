@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QTabBar, QStackedWidget, QPushButton, QMessageBox, QProgressDialog,
     QMenu,
 )
-from PySide6.QtGui import QShortcut, QKeySequence, QColor
+from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon
 
 from services.db_service import DbService
 from services.query_history import QueryHistory
@@ -18,8 +18,17 @@ from ui.connection_panel import ConnectionPanel
 from ui.theme_manager import ThemeManager
 from utils.logger import setup_logger, get_logger
 from utils.updater import UpdateChecker, APP_VERSION
+from utils import environment
 
 logger = setup_logger()
+
+
+def _asset_path(name: str) -> str:
+    """Resolve a bundled asset both when running from source and when frozen
+    by PyInstaller (which extracts/collects data files next to `sys._MEIPASS`)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
 
 _SESSION_FILE = os.path.join(
     os.path.expanduser("~"), "Library", "Application Support", "QForge", "session.json"
@@ -403,13 +412,24 @@ class MainWindow(QMainWindow):
         'disconnected': '#ff453a',  # red
     }
 
+    def _tab_text_color(self, panel: ConnectionPanel, status: str) -> str:
+        """Idle connections show their environment's semantic colour (the
+        safety cue from ai/ui-design.md); an active/disconnected status is
+        a more urgent, transient signal and takes priority over it."""
+        if status == 'idle':
+            env = environment.normalize(panel.config.get("environment"))
+            if env != environment.UNCLASSIFIED:
+                _, text_color, _ = ThemeManager.env_colors(env, self.current_theme == "dark")
+                return text_color
+        return self._HEALTH_COLOR.get(status, '#8e8e93')
+
     def _on_health_changed(self, panel: ConnectionPanel, status: str):
         try:
             idx = self._panels.index(panel)
         except ValueError:
             return
         dot   = self._HEALTH_DOT.get(status, '● ')
-        color = self._HEALTH_COLOR.get(status, '#8e8e93')
+        color = self._tab_text_color(panel, status)
         base_label = panel.label
         self.conn_tab_bar.setTabText(idx, dot + base_label)
         self.conn_tab_bar.setTabTextColor(idx, QColor(color))
@@ -563,6 +583,9 @@ class MainWindow(QMainWindow):
         is_dark = self.current_theme == "dark"
         for panel in self._panels:
             panel.update_theme(is_dark)
+            # Re-derive the tab text colour so an environment-tinted tab
+            # (see _tab_text_color) flips to the other theme's tones too.
+            self._on_health_changed(panel, getattr(panel, '_last_health', 'idle'))
 
     def toggle_theme(self):
         if self.current_theme == "dark":
@@ -659,6 +682,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     logger.info("Starting QForge")
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(_asset_path("logo.png")))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

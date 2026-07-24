@@ -3,6 +3,8 @@ import os
 import uuid
 
 from utils import credential_store
+from utils import environment
+from ui.theme_manager import ThemeManager
 
 from PySide6.QtWidgets import (
     QDialog,
@@ -122,6 +124,15 @@ class ConnectionDialog(QDialog):
         self.type_input.currentTextChanged.connect(self.on_type_changed)
 
         self.name_input = QLineEdit()
+        # Fixed enum, not free text — see utils/environment.py. Index 0 is
+        # "Unclassified" so new connections default to it until the user
+        # deliberately chooses a real tier.
+        self.environment_input = QComboBox()
+        self.environment_input.addItems(
+            [environment.COMBO_LABELS[e] for e in environment.ENVIRONMENTS]
+        )
+        self.environment_input.currentIndexChanged.connect(self._on_environment_changed)
+        self.read_only_check = QCheckBox("Read-only (block writes in QForge)")
         # Editable combo that lists existing groups; typing a new name is allowed
         self.group_input = QComboBox()
         self.group_input.setEditable(True)
@@ -152,6 +163,8 @@ class ConnectionDialog(QDialog):
 
         form_layout.addRow("Type", self.type_input)
         form_layout.addRow("Name", self.name_input)
+        form_layout.addRow("Environment", self.environment_input)
+        form_layout.addRow("", self.read_only_check)
         form_layout.addRow("Group", self.group_input)
         self.host_row = form_layout.addRow("Host", self.host_input)
         self.port_row = form_layout.addRow("Port", self.port_input)
@@ -357,6 +370,14 @@ class ConnectionDialog(QDialog):
             elif db_type == "PostgreSQL":
                 self.port_input.setText("5432")
 
+    def _on_environment_changed(self, index: int):
+        """Auto-suggest Read-only when the user picks Staging/Production —
+        one-directional (never auto-unchecks), so a deliberate choice to
+        keep a Staging/Production connection writable is never overridden."""
+        env = environment.ENVIRONMENTS[index]
+        if env in (environment.STAGING, environment.PRODUCTION):
+            self.read_only_check.setChecked(True)
+
     # ── SSH helpers ──────────────────────────────────────────────
 
     def on_ssh_enabled_toggled(self, checked):
@@ -459,10 +480,19 @@ class ConnectionDialog(QDialog):
                 db_type = _type_names.get(raw_type, raw_type.upper())
                 host = conn.get("host", "")
                 suffix = f"  [{db_type}]" + (f"  {host}" if host else "")
+                env = environment.normalize(conn.get("environment"))
+                env_suffix = (
+                    f"  · {environment.BADGE_LABELS[env]}"
+                    if env != environment.UNCLASSIFIED else ""
+                )
+                read_only_suffix = "  🔒" if conn.get("read_only") else ""
                 child = QTreeWidgetItem(group_item)
-                child.setText(0, conn["name"] + suffix)
+                child.setText(0, conn["name"] + suffix + env_suffix + read_only_suffix)
                 child.setData(0, Qt.UserRole, conn_idx)
                 child.setToolTip(0, f"{db_type} — {host}")
+                if env != environment.UNCLASSIFIED:
+                    _, text_color, _ = ThemeManager.env_colors(env, is_dark=True)
+                    child.setForeground(0, QColor(text_color))
 
         # Refresh the group combo with all known group names
         self._populate_group_combo()
@@ -515,6 +545,17 @@ class ConnectionDialog(QDialog):
         for conn in self.connections:
             if not conn.get("id"):
                 conn["id"] = uuid.uuid4().hex
+                needs_resave = True
+
+            if "environment" not in conn:
+                conn["environment"] = environment.DEFAULT_ENVIRONMENT
+                needs_resave = True
+
+            if "read_only" not in conn:
+                # Explicitly False, never derived from environment — an
+                # existing writable connection must never be silently
+                # locked just because this field didn't exist yet.
+                conn["read_only"] = False
                 needs_resave = True
 
             if conn.get("type") == "sqlite":
@@ -641,6 +682,8 @@ class ConnectionDialog(QDialog):
         data = {
             "type": db_type,
             "name": name,
+            "environment": environment.ENVIRONMENTS[self.environment_input.currentIndex()],
+            "read_only": self.read_only_check.isChecked(),
             "group": self._get_group_value(),
             "database": self.database_input.text().strip(),
         }
@@ -675,6 +718,8 @@ class ConnectionDialog(QDialog):
     def clear_form(self):
         self.type_input.setCurrentIndex(0)
         self.name_input.clear()
+        self.environment_input.setCurrentIndex(0)
+        self.read_only_check.setChecked(False)
         self.group_input.clear()
         self.host_input.clear()
         self.port_input.setText("3306")
@@ -772,6 +817,11 @@ class ConnectionDialog(QDialog):
         type_map = {"mysql": "MySQL", "postgresql": "PostgreSQL", "sqlite": "SQLite"}
         self.type_input.setCurrentText(type_map.get(db_type, "MySQL"))
         self.name_input.setText(connection["name"])
+        env = environment.normalize(connection.get("environment"))
+        self.environment_input.setCurrentText(environment.COMBO_LABELS[env])
+        # Set explicitly (after the line above) so the stored value always
+        # wins over _on_environment_changed's auto-suggest side effect.
+        self.read_only_check.setChecked(connection.get("read_only", False))
         self.group_input.lineEdit().setText(connection.get("group", ""))
         self.database_input.setText(connection.get("database", ""))
 

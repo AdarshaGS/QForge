@@ -25,6 +25,23 @@ class ThemeManager:
     D_DANGER       = "#FF6B6B"
     D_DANGER_HOVER = "#FF8888"
 
+    # ── Dark environment-safety tokens (background / text / border) ─────────
+    D_ENV_UNCLASSIFIED_BG     = "#2A2E36"
+    D_ENV_UNCLASSIFIED_TEXT   = "#A9B0BD"
+    D_ENV_UNCLASSIFIED_BORDER = "#56606F"
+    D_ENV_LOCAL_BG            = "#163D2A"
+    D_ENV_LOCAL_TEXT          = "#71D69A"
+    D_ENV_LOCAL_BORDER        = "#2D8054"
+    D_ENV_DEVELOPMENT_BG      = "#1E2E3D"
+    D_ENV_DEVELOPMENT_TEXT    = "#8FC4E8"
+    D_ENV_DEVELOPMENT_BORDER  = "#3E7CA6"
+    D_ENV_STAGING_BG          = "#4A3716"
+    D_ENV_STAGING_TEXT        = "#F2C56B"
+    D_ENV_STAGING_BORDER      = "#A96F10"
+    D_ENV_PRODUCTION_BG       = "#542228"
+    D_ENV_PRODUCTION_TEXT     = "#FFAAA8"
+    D_ENV_PRODUCTION_BORDER   = "#D96565"
+
     # ── Light tokens — "soft paper" ──────────────────────────────────────────
     L_BG        = "#F3F4F6"
     L_SIDEBAR   = "#E9ECF1"
@@ -42,11 +59,40 @@ class ThemeManager:
     L_DANGER       = "#D92D20"
     L_DANGER_HOVER = "#B42318"
 
+    # ── Light environment-safety tokens (background / text / border) ────────
+    L_ENV_UNCLASSIFIED_BG     = "#E9ECF1"
+    L_ENV_UNCLASSIFIED_TEXT   = "#687080"
+    L_ENV_UNCLASSIFIED_BORDER = "#B7BEC9"
+    L_ENV_LOCAL_BG            = "#E3F5EA"
+    L_ENV_LOCAL_TEXT          = "#1D6B41"
+    L_ENV_LOCAL_BORDER        = "#4CA97A"
+    L_ENV_DEVELOPMENT_BG      = "#E4EEF7"
+    L_ENV_DEVELOPMENT_TEXT    = "#1F5C85"
+    L_ENV_DEVELOPMENT_BORDER  = "#5B93B8"
+    L_ENV_STAGING_BG          = "#FBF0DA"
+    L_ENV_STAGING_TEXT        = "#8A5A0A"
+    L_ENV_STAGING_BORDER      = "#D3A03E"
+    L_ENV_PRODUCTION_BG       = "#FBE4E4"
+    L_ENV_PRODUCTION_TEXT     = "#B3261E"
+    L_ENV_PRODUCTION_BORDER   = "#E08585"
+
     # Back-compat aliases used by call sites that reference the accent
     # directly rather than through a generated stylesheet.
     ACCENT       = D_BLUE
     ACCENT_HOVER = D_BLUE_HOVER
     ACCENT_PRESS = D_BLUE_PRESS
+
+    @classmethod
+    def env_colors(cls, env: str, is_dark: bool) -> tuple:
+        """(background, text, border) hex colors for a normalized environment
+        key (see utils/environment.py). `env` must already be normalized."""
+        prefix = "D_ENV_" if is_dark else "L_ENV_"
+        key = env.upper()
+        return (
+            getattr(cls, f"{prefix}{key}_BG"),
+            getattr(cls, f"{prefix}{key}_TEXT"),
+            getattr(cls, f"{prefix}{key}_BORDER"),
+        )
 
     # ── Dark palette ──────────────────────────────────────────────────────────
     @staticmethod

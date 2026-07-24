@@ -29,6 +29,7 @@ a = Analysis(
         ('ui/*.py', 'ui'),
         ('services/*.py', 'services'),
         ('utils/*.py', 'utils'),
+        ('logo.png', '.'),
     ],
     hiddenimports=[
         'pymysql',
@@ -56,6 +57,9 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# EXE() icon= only takes effect on Windows (embeds it in QForge.exe); it's a
+# no-op on macOS/Linux, where BUNDLE()'s icon= (below) and the in-app
+# QIcon(logo.png) set at runtime are what's actually shown.
 exe = EXE(
     pyz,
     a.scripts,
@@ -72,6 +76,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/icon.ico',
 )
 
 coll = COLLECT(
@@ -92,7 +97,7 @@ if sys.platform == 'darwin':
     app = BUNDLE(
         coll,
         name='QForge.app',
-        icon=None,
+        icon='assets/icon.icns',
         bundle_identifier='com.qforge.app',
         version=APP_VERSION,
         info_plist={

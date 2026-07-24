@@ -33,9 +33,20 @@ from ui.quick_search_dialog import QuickSearchDialog
 from ui.structure_editor import StructureEditorDialog
 from ui.db_switcher_dialog import DbSwitcherDialog
 from ui.query_history_dialog import QueryHistoryDialog
+from ui.theme_manager import ThemeManager
+from ui import query_guard_dialog
 from utils.logger import get_logger
+from utils import environment
+from services import query_classifier
 
 logger = get_logger()
+
+# CSV imports at or above this row count are treated as a "mass write" for
+# the dangerous-query guard on Staging/Production, even though a plain
+# INSERT alone isn't otherwise flagged (ai/load-context.md: "mass writes,
+# where a reliable row-count estimate is available" — a CSV import's
+# DataFrame length is exactly that).
+MASS_WRITE_ROW_THRESHOLD = 5000
 
 
 # ── Background query worker (must be a top-level class for PySide6) ──────────
@@ -343,6 +354,52 @@ class ConnectionPanel(QWidget):
         splitter.setStretchFactor(1, 1)
 
         root.addWidget(splitter)
+
+    def _guard_write(self, sql: str, extra_reason: str = None) -> bool:
+        """Classify *sql* (one statement or a whole script) and show
+        whatever dialog is needed before a write reaches the database.
+        Returns True if the caller should proceed.
+
+        Read-only connections block outright, regardless of environment.
+        Staging/Production connections additionally require confirmation
+        for statements the classifier flags as dangerous (destructive DDL
+        — DROP/TRUNCATE — requires typing the connection name). Local/
+        Development/Unclassified and non-flagged statements return True
+        with no dialog, leaving today's existing per-entry-point confirms
+        (if any) unaffected.
+
+        services/db_service.py's own read-only guard is the real backstop
+        — this method is the UX layer (explain + confirm + cancel) on top
+        of it, per ai/load-context.md's "explain why, offer a clear cancel
+        path" principle.
+        """
+        statements = query_classifier.split_statements(sql)
+        if not statements:
+            return True
+
+        classifications = [query_classifier.classify(s) for s in statements]
+        connection_name = self.config.get("name", "Connection")
+        env = environment.normalize(self.config.get("environment"))
+
+        if self.config.get("read_only") and any(c.is_write for c in classifications):
+            blocked = [c.statement for c in classifications if c.is_write]
+            query_guard_dialog.show_read_only_blocked(self, connection_name, env, blocked)
+            return False
+
+        if env in (environment.STAGING, environment.PRODUCTION):
+            dangerous = [c for c in classifications if query_classifier.is_dangerous(c)]
+            reasons = [r for c in dangerous for r in c.reasons]
+            if extra_reason:
+                reasons.append(extra_reason)
+            if dangerous or extra_reason:
+                shown_statements = [c.statement for c in dangerous] or statements
+                require_typed_name = any(c.is_destructive_ddl for c in dangerous)
+                return query_guard_dialog.show_dangerous_confirmation(
+                    self, connection_name, env, shown_statements, reasons,
+                    require_typed_name=require_typed_name,
+                )
+
+        return True
 
     # ─── Schema loading ───────────────────────────────────────────────────────
 
@@ -672,6 +729,8 @@ class ConnectionPanel(QWidget):
 
     def _execute_commit_sql(self, sql_list: list, tab):
         """Execute inline-edit SQL statements against the live connection."""
+        if not self._guard_write("\n".join(sql_list)):
+            return
         errors = []
         success = 0
         for sql in sql_list:
@@ -908,6 +967,9 @@ class ConnectionPanel(QWidget):
             return          # user cancelled
         query = resolved
 
+        if not self._guard_write(query):
+            return
+
         # Don't allow concurrent queries on the same tab
         if getattr(tab, '_query_running', False):
             return
@@ -1056,6 +1118,8 @@ class ConnectionPanel(QWidget):
         if dialog.exec():
             try:
                 sql = dialog.get_sql()
+                if not self._guard_write(sql):
+                    return
                 reply = QMessageBox.question(
                     self, "Create Table",
                     f"Execute the following SQL?\n\n{sql}",
@@ -1194,15 +1258,15 @@ class ConnectionPanel(QWidget):
                 if sql.strip().startswith("--"):
                     QMessageBox.information(self, "No Changes", sql)
                     return
+                if not self._guard_write(sql):
+                    return
                 reply = QMessageBox.question(
                     self, "Alter Table",
                     f"Execute the following SQL?\n\n{sql}",
                     QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.Yes:
-                    for stmt in sql.strip().split(";\n"):
-                        s = stmt.strip().rstrip(";")
-                        if s:
-                            self.db_service.execute_update(s + ";")
+                    for stmt in query_classifier.split_statements(sql):
+                        self.db_service.execute_update(stmt)
                     QMessageBox.information(
                         self, "Success", f"Table {table_name} altered successfully")
                     self.load_schema()
@@ -1261,6 +1325,13 @@ class ConnectionPanel(QWidget):
             if db_type == "mysql"
             else f'INSERT INTO "{table_name}" ({cols_sql}) VALUES ({placeholders})'
         )
+
+        mass_write_reason = (
+            f"Importing {len(df):,} rows — treated as a mass write"
+            if len(df) >= MASS_WRITE_ROW_THRESHOLD else None
+        )
+        if not self._guard_write(insert_sql, extra_reason=mass_write_reason):
+            return
 
         progress = QProgressDialog(
             f"Importing {len(df):,} rows…", "Cancel", 0, len(df), self)
@@ -1647,7 +1718,11 @@ class ConnectionPanel(QWidget):
     def label(self) -> str:
         base = self.config.get("name", "Connection")
         ver = getattr(self, '_server_version', '')
-        return f"{base}  [{ver}]" if ver else base
+        env = environment.normalize(self.config.get("environment"))
+        env_suffix = f"  {environment.BADGE_LABELS[env]}" if env != environment.UNCLASSIFIED else ""
+        read_only_suffix = "  🔒 READ-ONLY" if self.config.get("read_only") else ""
+        ver_suffix = f"  [{ver}]" if ver else ""
+        return f"{base}{env_suffix}{read_only_suffix}{ver_suffix}"
 
     def disconnect(self):
         try:
