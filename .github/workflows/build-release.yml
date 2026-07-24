@@ -111,4 +111,5 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "QForge ${GITHUB_REF_NAME}" \
             --notes "Automated release built from commit ${{ github.sha }}. Verify downloads against SHA256SUMS.txt." \
+            --generate-notes \
             artifacts/*
