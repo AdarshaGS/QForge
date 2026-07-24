@@ -2,14 +2,18 @@
 # QForge — Upload DMG to GitHub Releases
 # Assumes QForge.dmg is already built (run build.sh first)
 #
-# NOTE: pushing a vX.Y.Z tag now also triggers
-# .github/workflows/build-release.yml, which builds macOS/Windows/Linux from
-# that tagged commit on clean CI runners and publishes its own GitHub
-# Release for the same tag. Don't run this script AND push that tag for the
-# same version — whichever runs second will fail because the release
-# already exists. Use this script only for the parts CI doesn't do yet
-# (Homebrew tap push, APP_VERSION/cask version bump commit), against a tag
-# that hasn't been pushed, or after deleting the CI-created release first.
+# NOTE: pushing a vX.Y.Z tag now triggers
+# .github/workflows/build-release.yml, which builds QForge from that tagged
+# commit on a clean CI runner, publishes its own GitHub Release, AND (via
+# the update-homebrew-tap job) pushes the version/sha256 bump to
+# adarshags/homebrew-qforge automatically — the normal release path is just:
+#   1. Bump APP_VERSION in utils/updater.py, commit.
+#   2. git tag vX.Y.Z && git push origin vX.Y.Z
+# This script is now only a manual fallback — for a hotfix where CI is down,
+# or the HOMEBREW_TAP_TOKEN repo secret isn't set (the tap job warns and
+# skips rather than failing if so). Don't run this script AND push that tag
+# for the same version — whichever runs second will fail because the
+# release already exists, and both would try to push to the same tap.
 
 set -euo pipefail
 
