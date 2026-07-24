@@ -18,11 +18,15 @@ def _account(connection_id: str, kind: str) -> str:
     return f"{connection_id}:{kind}"
 
 
-def set_password(connection_id: str, kind: str, password: str) -> None:
+def set_password(connection_id: str, kind: str, password: str) -> bool:
+    """Returns True on success. Callers must not discard a plaintext copy of
+    `password` on failure — the keychain is the only place it's persisted."""
     try:
         keyring.set_password(_SERVICE, _account(connection_id, kind), password)
+        return True
     except Exception as ex:
         logger.warning(f"Keychain: failed to store {kind} password for {connection_id}: {ex}")
+        return False
 
 
 def get_password(connection_id: str, kind: str) -> str:

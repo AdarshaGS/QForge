@@ -12,8 +12,6 @@ app and user settings are stored under `~/Library/Application Support/QForge`.
 
 - Connect to MySQL, PostgreSQL, and SQLite; keep several database connections
   open at once in separate top-level tabs.
-- Classify connection profiles as local, staging, or production; QForge shows
-  a persistent environment indicator for every open connection.
 - Connect to MySQL or PostgreSQL through an SSH tunnel using a password or
   private key.
 - Save, group, search, reorder, test, and reconnect connection profiles.
@@ -59,11 +57,6 @@ python main.py
 
 On first launch, create a connection profile in the Connection Manager, test
 it if desired, then select **Connect**.
-
-Choose an environment for each profile: **Local**, **Staging**, or
-**Production**. QForge makes the active environment visible in both the
-connection tab and workspace; this label is an accident-prevention aid and
-does not replace database permissions.
 
 For SQLite, choose **SQLite** and provide the database file path. Host, port,
 username, and password are not required.
@@ -113,7 +106,7 @@ table in the schema browser and choose **Import CSV into Table…**.
 | `Ctrl+R` or `F5` | Refresh current view |
 | `Ctrl+P` | Search database objects |
 | `Ctrl+E` | Export current query results |
-| `Ctrl+Shift+I` | Import data into the current query tab |
+| `Ctrl+Shift+E` | Import data into the current query tab |
 | `Ctrl+Q` | Quit |
 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Zoom in / out / reset |
 
@@ -138,12 +131,16 @@ QForge keeps its application data in:
 
 This includes saved connection metadata, snippets, pinned tabs, and session
 state. Query history is stored as `query_history.json` in the directory from
-which QForge is launched. Logs are created in `logs/`.
+which QForge is launched. Logs are created in `~/.qforge/logs/` (one file per
+day).
 
-Passwords are not written into connection profiles. QForge uses the platform
-keyring when it is available and falls back to an encrypted local credential
-file with owner-only permissions. Treat exported profiles, logs, and query
-history appropriately: SQL text can still contain sensitive information.
+Passwords are not written into connection profiles. QForge stores them in the
+platform keyring (e.g. macOS Keychain) instead. There is no encrypted-file
+fallback: if the keyring is unavailable when saving, QForge keeps the
+password in `connections.json` in plain text rather than losing it, and
+warns you so you can fix your keyring setup. Treat exported profiles, logs,
+and query history appropriately: SQL text can still contain sensitive
+information.
 
 ## Project layout
 
@@ -181,10 +178,11 @@ python query_analyzer.py --conn "My connection" --queries ./queries --out ./opti
 It expects a connection profile in `connections.json`; use `--help` for all
 options. Review its output before running any generated SQL in production.
 
-## Build a macOS app
+## Build a macOS app locally
 
 The repository includes a PyInstaller-based build script that creates
-`dist/QForge.app` and a `QForge.dmg` installer.
+`dist/QForge.app` and a `QForge.dmg` installer, using the checked-in
+`QForge.spec`.
 
 ```bash
 python3 -m venv venv
@@ -195,6 +193,20 @@ pip install -r requirements.txt
 
 The script installs PyInstaller into the active virtual environment if needed.
 It uses macOS utilities such as `hdiutil`, so run it on macOS.
+
+## Releases (macOS, Windows, Linux)
+
+Pushing a `vX.Y.Z` tag runs `.github/workflows/build-release.yml`, which
+builds QForge from that exact commit on clean macOS/Windows/Linux runners
+(from the same `QForge.spec` used locally) and attaches the three artifacts
+— `QForge.dmg`, `QForge-windows.zip`, `QForge-linux.tar.gz` — plus a
+`SHA256SUMS.txt` to a GitHub Release. You can also trigger the workflow
+manually ("Run workflow" in the Actions tab) on any branch to validate the
+build matrix without cutting a real release.
+
+The macOS build is ad-hoc signed only (no Apple Developer ID / notarization),
+so first launch still requires bypassing Gatekeeper (right-click → Open, or
+`xattr -cr`). Windows and Linux binaries are unsigned as well.
 
 ## Dependencies
 
@@ -211,4 +223,4 @@ See [requirements.txt](requirements.txt) for version constraints.
 
 ## License
 
-This project is intended for personal and educational use.
+MIT — see [LICENSE](LICENSE).

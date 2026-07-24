@@ -450,13 +450,12 @@ class ConnectionPanel(QWidget):
             self.schema_tree.addTopLevelItem(functions_cat)
         tables_cat.setExpanded(True)
 
-        # Update autocomplete in existing tabs
+        # Update autocomplete in existing SQL tabs (TableViewWidget is a data
+        # grid, not an editor — it has no autocomplete/schema to push).
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, SqlTab):
                 tab.set_schema(tables, columns)
-            elif isinstance(tab, TableViewWidget):
-                tab.set_schema((tables, columns))
 
     def _on_schema_error(self, msg: str):
         self.schema_tree.clear()
@@ -567,6 +566,7 @@ class ConnectionPanel(QWidget):
         menu = QMenu(self)
         open_action = menu.addAction("📋 Open Table")
         menu.addSeparator()
+        structure_action = menu.addAction("🔍 View Structure")
         edit_action = menu.addAction("✏️ Edit Structure")
         menu.addSeparator()
         import_action = menu.addAction("📥 Import CSV into Table…")
@@ -576,6 +576,8 @@ class ConnectionPanel(QWidget):
         action = menu.exec_(self.schema_tree.mapToGlobal(position))
         if action == open_action:
             self.open_table_view(item.text(0))
+        elif action == structure_action:
+            self._show_table_structure(item.text(0))
         elif action == edit_action:
             self.show_alter_table_editor(item.text(0))
         elif action == import_action:
