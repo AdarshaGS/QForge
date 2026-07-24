@@ -1,10 +1,16 @@
 name: Build & Release
 
-# Builds QForge on macOS, Windows, and Linux from QForge.spec (the same spec
-# build.sh uses locally). Pushing a `vX.Y.Z` tag also publishes a GitHub
-# Release with all three artifacts attached — always built fresh from that
-# exact tagged commit on a clean runner, so a stale local checkout can never
-# get published under the wrong tag again.
+# Builds QForge from QForge.spec (the same spec build.sh uses locally).
+# Pushing a `vX.Y.Z` tag publishes a GitHub Release with the built
+# artifact(s) attached — always built fresh from that exact tagged commit on
+# a clean runner, so a stale local checkout can never get published under
+# the wrong tag again. Also pushes the corresponding Homebrew tap update
+# (see the update-homebrew-tap job below).
+#
+# Windows/Linux legs only actually run once CROSS_PLATFORM_SUPPORTED is
+# flipped to 'true' below — until then this only builds/releases macOS,
+# since Windows/Linux aren't verified-supported yet (see Tier 2 of the
+# product roadmap in the plans referenced from ai/flush-context.md).
 #
 # "Run workflow" (workflow_dispatch) lets you validate the build matrix on
 # any branch without cutting a real release.
@@ -14,8 +20,16 @@ on:
       - 'v*.*.*'
   workflow_dispatch:
 
+env:
+  # Windows/Linux aren't actually supported yet (no path unification via
+  # utils/paths.py, no per-OS verification — see Tier 2 of the product
+  # roadmap). Building and publishing installers for them would imply
+  # support that doesn't exist. Flip to 'true' once that's done.
+  CROSS_PLATFORM_SUPPORTED: 'false'
+
 jobs:
   build:
+    if: matrix.os == 'macos-latest' || env.CROSS_PLATFORM_SUPPORTED == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -113,3 +127,45 @@ jobs:
             --notes "Automated release built from commit ${{ github.sha }}. Verify downloads against SHA256SUMS.txt." \
             --generate-notes \
             artifacts/*
+
+  # Bumps adarshags/homebrew-qforge's Casks/qforge.rb to this tag's version
+  # and the just-published QForge.dmg's real sha256, so `brew upgrade --cask
+  # qforge` picks up the new release without a manual step. Needs a
+  # HOMEBREW_TAP_TOKEN repo secret (a fine-grained PAT scoped to Contents:
+  # Read and write on adarshags/homebrew-qforge only) — see README/deploy.sh
+  # for setup. If the secret isn't set, this job warns and exits cleanly
+  # rather than failing the release.
+  update-homebrew-tap:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew tap cask
+        run: |
+          if [ -z "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN secret not set — skipping Homebrew tap update. Update Casks/qforge.rb in adarshags/homebrew-qforge manually (see deploy.sh)."
+            exit 0
+          fi
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG_SHA256=$(curl -sL "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/SHA256SUMS.txt" | awk '/QForge\.dmg$/ {print $1}')
+          if [ -z "$DMG_SHA256" ]; then
+            echo "::error::Could not determine QForge.dmg sha256 from the release's SHA256SUMS.txt"
+            exit 1
+          fi
+
+          git clone "https://x-access-token:${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/AdarshaGS/homebrew-qforge.git" tap
+          cd tap
+          sed -i "s/  version \".*\"/  version \"${VERSION}\"/" Casks/qforge.rb
+          sed -i "s/  sha256 \".*\"/  sha256 \"${DMG_SHA256}\"/" Casks/qforge.rb
+
+          if git diff --quiet; then
+            echo "Cask already up to date — nothing to push."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/qforge.rb
+          git commit -m "qforge ${VERSION}"
+          git push origin HEAD
