@@ -28,18 +28,30 @@ env:
   CROSS_PLATFORM_SUPPORTED: 'false'
 
 jobs:
+  # Computes which OS legs the build matrix should actually include. A
+  # job-level `if:` can't reference `matrix` (only github/needs/vars/inputs
+  # are available there), so gating individual matrix entries has to happen
+  # by controlling what goes into the matrix itself, via this job's output,
+  # rather than trying to skip matrix entries with a job-level condition.
+  determine-platforms:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        run: |
+          if [ "${{ env.CROSS_PLATFORM_SUPPORTED }}" = "true" ]; then
+            echo 'matrix=[{"os":"macos-latest","artifact_name":"QForge.dmg"},{"os":"windows-latest","artifact_name":"QForge-windows.zip"},{"os":"ubuntu-latest","artifact_name":"QForge-linux.tar.gz"}]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix=[{"os":"macos-latest","artifact_name":"QForge.dmg"}]' >> "$GITHUB_OUTPUT"
+          fi
+
   build:
-    if: matrix.os == 'macos-latest' || env.CROSS_PLATFORM_SUPPORTED == 'true'
+    needs: determine-platforms
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-latest
-            artifact_name: QForge.dmg
-          - os: windows-latest
-            artifact_name: QForge-windows.zip
-          - os: ubuntu-latest
-            artifact_name: QForge-linux.tar.gz
+        include: ${{ fromJSON(needs.determine-platforms.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -115,7 +127,7 @@ jobs:
 
       - name: Compute checksums
         working-directory: artifacts
-        run: sha256sum * > SHA256SUMS.txt
+        run: sha256sum ./* > SHA256SUMS.txt
 
       - name: Create GitHub Release
         env:
