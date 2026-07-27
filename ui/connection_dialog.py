@@ -634,9 +634,13 @@ class ConnectionDialog(QDialog):
             "password(s) for:\n\n"
             + "\n".join(f"  • {n}" for n in names)
             + "\n\nThe password(s) were kept in connections.json in plain "
-            "text instead of being lost. Check that your OS keyring service "
-            "is unlocked and running, then reopen the connection and save it "
-            "again once it's available.",
+            "text instead of being lost. This can happen after updating "
+            "QForge, if a password was stored by a previous version and the "
+            "keychain still associates it with that older install. Try "
+            "opening Keychain Access, searching for \"QForge\", deleting the "
+            "affected entries, then reopening the connection and saving it "
+            "again. Otherwise, check that your OS keyring service is "
+            "unlocked and running.",
         )
 
     def _get_group_value(self) -> str:
