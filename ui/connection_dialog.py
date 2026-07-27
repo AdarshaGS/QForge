@@ -859,6 +859,26 @@ class ConnectionDialog(QDialog):
             else:
                 self.ssh_enabled_check.setChecked(False)
 
+        # setText() leaves the cursor at the end of the string, which scrolls
+        # long values so the START is hidden (e.g. "Adaptive Connection"
+        # renders as "\daptive Connection" — issue #13). Reset the cursor so
+        # the beginning of each value is visible by default.
+        for line_edit in (
+            self.name_input,
+            self.group_input.lineEdit(),
+            self.host_input,
+            self.port_input,
+            self.database_input,
+            self.user_input,
+            self.password_input,
+            self.ssh_host_input,
+            self.ssh_port_input,
+            self.ssh_user_input,
+            self.ssh_key_path_input,
+            self.ssh_password_input,
+        ):
+            line_edit.setCursorPosition(0)
+
     def connect_selected(self):
         selected_item = self._get_selected_conn_item()
         if selected_item is None:
