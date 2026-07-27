@@ -285,7 +285,21 @@ class SqlCompletePopup(QFrame):
     MAX_ROWS = 12
 
     def __init__(self, parent=None):
-        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        # WindowDoesNotAcceptFocus (on top of the existing NoFocus policy /
+        # WA_ShowWithoutActivating below) tells the OS window server itself
+        # that this window can never become key/active — on macOS, that's
+        # what actually determines whether showing a new window can trigger
+        # a full-screen-Space switch. WA_ShowWithoutActivating alone stops
+        # Qt from *requesting* activation, but apparently wasn't enough to
+        # stop macOS from still treating this as an activatable window and
+        # sliding to a new Space to reveal it while typing in a full-screen
+        # SQL tab (GitHub issue #15, follow-up: still occurred every time
+        # autocomplete showed, not just when opening a new tab).
+        super().__init__(
+            parent,
+            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+        )
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setFocusPolicy(Qt.NoFocus)
