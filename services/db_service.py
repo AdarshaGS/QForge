@@ -7,6 +7,39 @@ from services import query_classifier
 logger = get_logger()
 
 
+def _dsskey_stub_class(paramiko_module):
+    """A stand-in for paramiko.DSSKey that raises SSHException instead of
+    being bare None.
+
+    paramiko 3.0+ removed DSS/DSA key support entirely, but the pinned
+    sshtunnel==0.4.0 still references `paramiko.DSSKey` unconditionally
+    inside its private-key fallback loop (RSA -> DSS -> ECDSA -> Ed25519),
+    which tries each key type in turn and catches `paramiko.SSHException`
+    to move on to the next one. Patching `paramiko.DSSKey = None` breaks
+    that fallback: if the *first* type tried (RSA) fails to parse a given
+    key file, the loop falls through to the None stand-in and crashes with
+    "'NoneType' object has no attribute 'from_private_key_file'" instead of
+    trying ECDSA/Ed25519 next — exactly what happened for .pem files that
+    aren't plain legacy RSA PEM (GitHub issue #14: a plain `id_rsa` key
+    connected fine, a `.pem` key crashed with that exact error). Raising
+    SSHException here instead preserves the loop's intended fallback."""
+    class _RemovedDSSKey:
+        @staticmethod
+        def from_private_key_file(*args, **kwargs):
+            raise paramiko_module.SSHException(
+                "DSS/DSA keys are not supported (removed in paramiko 3.0+)"
+            )
+    return _RemovedDSSKey
+
+
+def _ensure_dsskey_stub():
+    """Idempotently patch paramiko.DSSKey with the stub above if this
+    paramiko version removed DSSKey entirely."""
+    import paramiko
+    if not hasattr(paramiko, 'DSSKey'):
+        paramiko.DSSKey = _dsskey_stub_class(paramiko)
+
+
 class ReadOnlyViolation(Exception):
     """Raised when a write statement is attempted on a read-only connection.
     This is the backstop guard — always active regardless of which UI entry
@@ -172,17 +205,12 @@ class DbService:
         try:
             from sshtunnel import SSHTunnelForwarder
             import os
-            
-            # Fix paramiko DSSKey issue (DSS keys deprecated in paramiko 3.0+)
-            # Monkey-patch to prevent sshtunnel from trying to use DSSKey
+
             try:
-                import paramiko
-                if not hasattr(paramiko, 'DSSKey'):
-                    # Create dummy DSSKey class to prevent errors
-                    paramiko.DSSKey = None
+                _ensure_dsskey_stub()
             except ImportError as ex:
                 logger.debug(f"paramiko DSSKey patch skipped: {ex}")
-            
+
             ssh_host = ssh_config.get("host")
             ssh_port = ssh_config.get("port", 22)
             ssh_user = ssh_config.get("user")
