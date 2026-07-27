@@ -567,6 +567,26 @@ class MainWindow(QMainWindow):
         act.setShortcut("Ctrl+0")
         act.triggered.connect(lambda: self._zoom(0))
 
+        # Database
+        db_menu = menubar.addMenu("Database")
+
+        act = db_menu.addAction("Create Database…")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().create_database()
+        )
+
+        act = db_menu.addAction("Refresh Databases")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().refresh_databases()
+        )
+
+        db_menu.addSeparator()
+
+        act = db_menu.addAction("Drop Database…")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().drop_database()
+        )
+
         # Help
         help_menu = menubar.addMenu("Help")
         act = help_menu.addAction("Keyboard Shortcuts")

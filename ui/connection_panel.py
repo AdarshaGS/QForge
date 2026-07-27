@@ -605,6 +605,96 @@ class ConnectionPanel(QWidget):
         t = threading.Thread(target=_load, daemon=True)
         t.start()
 
+    # ─── Database management (create/refresh/drop) ────────────────────────────
+
+    _VALID_DB_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+    def _check_db_management_supported(self) -> bool:
+        if self.db_service.db_type not in ("mysql", "postgresql"):
+            QMessageBox.information(
+                self, "Not Supported",
+                "Creating, dropping, and listing databases is only supported "
+                "for MySQL and PostgreSQL connections.")
+            return False
+        return True
+
+    def create_database(self):
+        if not self._check_db_management_supported():
+            return
+        name, ok = QInputDialog.getText(self, "Create Database", "Database name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if not self._VALID_DB_NAME.match(name):
+            QMessageBox.warning(
+                self, "Invalid Name",
+                "Database name must start with a letter or underscore and "
+                "contain only letters, digits, and underscores.")
+            return
+
+        sql = f"CREATE DATABASE {name}"
+        if not self._guard_write(sql):
+            return
+        reply = QMessageBox.question(
+            self, "Create Database",
+            f"Execute the following SQL?\n\n{sql}",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self.db_service.execute_update(sql)
+        except Exception as ex:
+            QMessageBox.critical(self, "Create Database Failed", str(ex))
+            return
+        QMessageBox.information(self, "Success", f"Database '{name}' created.")
+        self._load_databases()
+
+    def refresh_databases(self):
+        if not self._check_db_management_supported():
+            return
+        self._load_databases()
+
+    def drop_database(self):
+        if not self._check_db_management_supported():
+            return
+        if not self._available_dbs:
+            self._load_databases()
+        if not self._available_dbs:
+            QMessageBox.information(self, "Drop Database", "No databases found.")
+            return
+
+        name, ok = QInputDialog.getItem(
+            self, "Drop Database", "Database to drop:",
+            self._available_dbs, editable=False)
+        if not ok or not name:
+            return
+        if not self._VALID_DB_NAME.match(name):
+            QMessageBox.warning(self, "Invalid Name", "Unrecognized database name.")
+            return
+        if name == self.config.get("database"):
+            QMessageBox.warning(
+                self, "Drop Database",
+                f"'{name}' is the database this connection is currently using. "
+                "Switch to a different database first, then drop it.")
+            return
+
+        sql = f"DROP DATABASE {name}"
+        if not self._guard_write(sql):
+            return
+        reply = QMessageBox.question(
+            self, "Drop Database",
+            f"Execute the following SQL?\n\n{sql}",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self.db_service.execute_update(sql)
+        except Exception as ex:
+            QMessageBox.critical(self, "Drop Database Failed", str(ex))
+            return
+        QMessageBox.information(self, "Success", f"Database '{name}' dropped.")
+        self._load_databases()
+
     # ─── Schema tree interaction ──────────────────────────────────────────────
 
     def _on_item_clicked(self, item, column):
