@@ -33,8 +33,8 @@ class ConnectionDialog(QDialog):
     CONNECTION_FILE = os.path.join(_APP_DIR, "connections.json")
     LAST_CONNECTION_FILE = os.path.join(_APP_DIR, "last_connection.json")
 
-    def __init__(self, auto_connect_last=False):
-        super().__init__()
+    def __init__(self, auto_connect_last=False, parent=None):
+        super().__init__(parent)
 
         self.selected_connection = None
         self.auto_connect_last = auto_connect_last

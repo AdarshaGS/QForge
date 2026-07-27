@@ -245,7 +245,11 @@ class MainWindow(QMainWindow):
 
     def _prompt_new_connection(self, allow_cancel_quit: bool = False):
         while True:
-            dialog = ConnectionDialog(auto_connect_last=(len(self._panels) == 0))
+            # Always parent to the main window: an unparented dialog is a
+            # fully independent top-level window to macOS, so opening one
+            # while the main window is in native full-screen kicks the app
+            # out to a new desktop/Space instead of staying put (issue #15).
+            dialog = ConnectionDialog(auto_connect_last=(len(self._panels) == 0), parent=self)
             if not dialog.exec():
                 if allow_cancel_quit and not self._panels:
                     sys.exit()
@@ -257,7 +261,7 @@ class MainWindow(QMainWindow):
 
             try:
                 from PySide6.QtCore import QCoreApplication
-                progress = QProgressDialog("Connecting…", None, 0, 0)
+                progress = QProgressDialog("Connecting…", None, 0, 0, self)
                 progress.setWindowTitle("Connecting")
                 progress.setWindowModality(Qt.WindowModal)
                 progress.setCancelButton(None)
@@ -291,7 +295,7 @@ class MainWindow(QMainWindow):
                 logger.error(f"Connection failed: {ex}")
                 if 'progress' in dir():
                     progress.close()
-                QMessageBox.critical(None, "Connection Error", str(ex))
+                QMessageBox.critical(self, "Connection Error", str(ex))
 
     # ─── Close connection tab ────────────────────────────────────────────────
 
