@@ -424,6 +424,37 @@ class ConnectionDialog(QDialog):
 
     # ── Load / save connections ──────────────────────────────────
 
+    @staticmethod
+    def load_connection_by_id(conn_id: str):
+        """Read connections.json fresh from disk and return the full,
+        credential-resolved config for *conn_id* (or None if it no longer
+        exists). Used by an already-open ConnectionPanel's Reconnect action
+        so edits made in the Connection Manager while the tab stayed open
+        (host, port, credentials, ...) take effect without having to close
+        and reopen the tab (GitHub issue #17) — reconnecting otherwise
+        reuses whatever config was captured when the tab was first opened."""
+        if not conn_id or not os.path.exists(ConnectionDialog.CONNECTION_FILE):
+            return None
+        try:
+            with open(ConnectionDialog.CONNECTION_FILE, "r") as f:
+                connections = json.load(f)
+        except Exception:
+            return None
+
+        for conn in connections:
+            if conn.get("id") != conn_id:
+                continue
+            conn = dict(conn)
+            if conn.get("type") != "sqlite":
+                conn["password"] = credential_store.get_password(conn_id, "db")
+                ssh = conn.get("ssh_tunnel")
+                if ssh and ssh.get("enabled") and not ssh.get("use_key"):
+                    ssh = dict(ssh)
+                    ssh["password"] = credential_store.get_password(conn_id, "ssh")
+                    conn["ssh_tunnel"] = ssh
+            return conn
+        return None
+
     def _migrate_legacy_connections(self):
         if os.path.exists(self.CONNECTION_FILE):
             return

@@ -1719,7 +1719,18 @@ class ConnectionPanel(QWidget):
         try:
             self._reconnect_btn.setEnabled(False)
             self._reconnect_btn.setText("…")
-            self.db_service._reconnect()
+
+            # Pick up any edits made in the Connection Manager while this
+            # tab stayed open (host, port, credentials, environment, ...)
+            # instead of reusing whatever was captured when the tab was
+            # first opened (GitHub issue #17).
+            from ui.connection_dialog import ConnectionDialog
+            fresh = ConnectionDialog.load_connection_by_id(self.config.get("id"))
+            if fresh is not None:
+                self.config.clear()
+                self.config.update(fresh)
+
+            self.db_service._reconnect(self.config)
             reconnected_ok = True
             # Refresh version label
             try:
