@@ -138,7 +138,6 @@ class ConnectionDialog(QDialog):
         self.group_input.setEditable(True)
         self.group_input.setInsertPolicy(QComboBox.NoInsert)
         self.group_input.lineEdit().setPlaceholderText("e.g. Production, Staging, Local…")
-        self.group_input.lineEdit().textEdited.connect(self._on_group_text_edited)
         self.host_input = QLineEdit()
         self.port_input = QLineEdit("3306")
         self.database_input = QLineEdit()
@@ -511,26 +510,6 @@ class ConnectionDialog(QDialog):
         self.group_input.lineEdit().setText(current_text)
         self.group_input.blockSignals(False)
 
-    def _on_group_text_edited(self, text: str):
-        """While the user types, show existing groups that match + a 'create' hint."""
-        text = text.strip()
-        all_groups = [self.group_input.itemText(i) for i in range(self.group_input.count())
-                      if not self.group_input.itemText(i).startswith("＋ Create")]
-        # Build filtered list
-        matches = [g for g in all_groups if text.lower() in g.lower()] if text else all_groups
-        self.group_input.blockSignals(True)
-        self.group_input.clear()
-        self.group_input.addItems(matches)
-        # If typed text doesn't exactly match any existing group, offer to create it
-        exact = any(g.lower() == text.lower() for g in matches)
-        if text and not exact:
-            self.group_input.addItem(f"＋ Create new group: \"{text}\"")
-        self.group_input.lineEdit().setText(text)
-        self.group_input.blockSignals(False)
-        # Open the drop-down so suggestions are visible
-        if matches or (text and not exact):
-            self.group_input.showPopup()
-
     def _resolve_credentials(self):
         """Assign a stable id to every connection, migrating any legacy
         plaintext password found on disk into the keychain.
@@ -661,14 +640,9 @@ class ConnectionDialog(QDialog):
         )
 
     def _get_group_value(self) -> str:
-        """Return the clean group name, stripping the '＋ Create new group:' prefix."""
-        raw = self.group_input.lineEdit().text().strip()
-        if raw.startswith("＋ Create new group:"):
-            # Extract the quoted name
-            import re
-            m = re.search(r'"(.+?)"', raw)
-            return m.group(1).strip() if m else raw
-        return raw or "Default"
+        """Return the typed group name — free text; any name not matching an
+        existing group (see _populate_group_combo) is a new group."""
+        return self.group_input.lineEdit().text().strip() or "Default"
 
     # ── Form helpers ─────────────────────────────────────────────
 
