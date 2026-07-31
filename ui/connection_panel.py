@@ -605,6 +605,96 @@ class ConnectionPanel(QWidget):
         t = threading.Thread(target=_load, daemon=True)
         t.start()
 
+    # ─── Database management (create/refresh/drop) ────────────────────────────
+
+    _VALID_DB_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+    def _check_db_management_supported(self) -> bool:
+        if self.db_service.db_type not in ("mysql", "postgresql"):
+            QMessageBox.information(
+                self, "Not Supported",
+                "Creating, dropping, and listing databases is only supported "
+                "for MySQL and PostgreSQL connections.")
+            return False
+        return True
+
+    def create_database(self):
+        if not self._check_db_management_supported():
+            return
+        name, ok = QInputDialog.getText(self, "Create Database", "Database name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if not self._VALID_DB_NAME.match(name):
+            QMessageBox.warning(
+                self, "Invalid Name",
+                "Database name must start with a letter or underscore and "
+                "contain only letters, digits, and underscores.")
+            return
+
+        sql = f"CREATE DATABASE {name}"
+        if not self._guard_write(sql):
+            return
+        reply = QMessageBox.question(
+            self, "Create Database",
+            f"Execute the following SQL?\n\n{sql}",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self.db_service.execute_update(sql)
+        except Exception as ex:
+            QMessageBox.critical(self, "Create Database Failed", str(ex))
+            return
+        QMessageBox.information(self, "Success", f"Database '{name}' created.")
+        self._load_databases()
+
+    def refresh_databases(self):
+        if not self._check_db_management_supported():
+            return
+        self._load_databases()
+
+    def drop_database(self):
+        if not self._check_db_management_supported():
+            return
+        if not self._available_dbs:
+            self._load_databases()
+        if not self._available_dbs:
+            QMessageBox.information(self, "Drop Database", "No databases found.")
+            return
+
+        name, ok = QInputDialog.getItem(
+            self, "Drop Database", "Database to drop:",
+            self._available_dbs, editable=False)
+        if not ok or not name:
+            return
+        if not self._VALID_DB_NAME.match(name):
+            QMessageBox.warning(self, "Invalid Name", "Unrecognized database name.")
+            return
+        if name == self.config.get("database"):
+            QMessageBox.warning(
+                self, "Drop Database",
+                f"'{name}' is the database this connection is currently using. "
+                "Switch to a different database first, then drop it.")
+            return
+
+        sql = f"DROP DATABASE {name}"
+        if not self._guard_write(sql):
+            return
+        reply = QMessageBox.question(
+            self, "Drop Database",
+            f"Execute the following SQL?\n\n{sql}",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self.db_service.execute_update(sql)
+        except Exception as ex:
+            QMessageBox.critical(self, "Drop Database Failed", str(ex))
+            return
+        QMessageBox.information(self, "Success", f"Database '{name}' dropped.")
+        self._load_databases()
+
     # ─── Schema tree interaction ──────────────────────────────────────────────
 
     def _on_item_clicked(self, item, column):
@@ -1132,109 +1222,12 @@ class ConnectionPanel(QWidget):
                 QMessageBox.critical(self, "Error", str(ex))
 
     def _show_table_structure(self, table_name: str):
-        """Show a read-only structure popup for *table_name*: columns, indexes, FKs."""
-        from PySide6.QtWidgets import (
-            QDialog, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
-            QTabWidget, QDialogButtonBox, QHeaderView
-        )
-        try:
-            cols = self.db_service.get_columns(table_name)
-            fks  = self.db_service.get_foreign_keys(table_name)
-            try:
-                idxs = self.db_service.get_indexes(table_name)
-            except Exception:
-                idxs = []
-        except Exception as ex:
-            QMessageBox.warning(self, "Structure", str(ex))
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"📊 Structure — {table_name}")
-        dlg.resize(680, 460)
-        lay = QVBoxLayout(dlg)
-        lay.setContentsMargins(12, 10, 12, 10)
-
-        tabs = QTabWidget()
-        tabs.setStyleSheet("""
-            QTabWidget::pane {
-                border: 1px solid #3a3a3a;
-                border-radius: 4px;
-                background: #1e1e1e;
-            }
-            QTabBar::tab {
-                background: #2a2a2a;
-                color: #888888;
-                padding: 7px 18px;
-                border: 1px solid #3a3a3a;
-                border-bottom: none;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-                font-size: 12px;
-                min-width: 100px;
-            }
-            QTabBar::tab:selected {
-                background: #1e1e1e;
-                color: #ffffff;
-                border-bottom: 2px solid #0078d4;
-                font-weight: 600;
-            }
-            QTabBar::tab:hover:!selected {
-                background: #333333;
-                color: #cccccc;
-            }
-        """)
-
-        # ── Columns tab ────────────────────────────────────────────────────────────
-        col_tbl = QTableWidget(len(cols), 5)
-        col_tbl.setHorizontalHeaderLabels(["Column", "Type", "Null", "Key", "Default"])
-        col_tbl.verticalHeader().setVisible(False)
-        col_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        col_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        col_tbl.horizontalHeader().setStretchLastSection(True)
-        for r, c in enumerate(cols):
-            if isinstance(c, dict):
-                col_tbl.setItem(r, 0, QTableWidgetItem(str(c.get("Field", ""))))
-                col_tbl.setItem(r, 1, QTableWidgetItem(str(c.get("Type",  ""))))
-                col_tbl.setItem(r, 2, QTableWidgetItem(str(c.get("Null",  ""))))
-                col_tbl.setItem(r, 3, QTableWidgetItem(str(c.get("Key",   ""))))
-                col_tbl.setItem(r, 4, QTableWidgetItem(str(c.get("Default", ""))))
-            else:
-                for ci, val in enumerate(list(c)[:5]):
-                    col_tbl.setItem(r, ci, QTableWidgetItem(str(val)))
-        tabs.addTab(col_tbl, f"Columns ({len(cols)})")
-
-        # ── Indexes tab ───────────────────────────────────────────────────────────────
-        idx_tbl = QTableWidget(len(idxs), 4)
-        idx_tbl.setHorizontalHeaderLabels(["Name", "Columns", "Unique", "Type"])
-        idx_tbl.verticalHeader().setVisible(False)
-        idx_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        idx_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        idx_tbl.horizontalHeader().setStretchLastSection(True)
-        for r, idx in enumerate(idxs):
-            idx_tbl.setItem(r, 0, QTableWidgetItem(str(idx.get("name", ""))))
-            idx_tbl.setItem(r, 1, QTableWidgetItem(str(idx.get("columns", ""))))
-            idx_tbl.setItem(r, 2, QTableWidgetItem("✔" if idx.get("unique") else ""))
-            idx_tbl.setItem(r, 3, QTableWidgetItem(str(idx.get("type", ""))))
-        tabs.addTab(idx_tbl, f"Indexes ({len(idxs)})")
-
-        # ── Foreign Keys tab ───────────────────────────────────────────────────────────
-        fk_tbl = QTableWidget(len(fks), 3)
-        fk_tbl.setHorizontalHeaderLabels(["Column", "References Table", "References Column"])
-        fk_tbl.verticalHeader().setVisible(False)
-        fk_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        fk_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        fk_tbl.horizontalHeader().setStretchLastSection(True)
-        for r, fk in enumerate(fks):
-            fk_tbl.setItem(r, 0, QTableWidgetItem(str(fk.get("column", ""))))
-            fk_tbl.setItem(r, 1, QTableWidgetItem(str(fk.get("ref_table", ""))))
-            fk_tbl.setItem(r, 2, QTableWidgetItem(str(fk.get("ref_column", ""))))
-        tabs.addTab(fk_tbl, f"Foreign Keys ({len(fks)})")
-
-        lay.addWidget(tabs)
-        btns = QDialogButtonBox(QDialogButtonBox.Close)
-        btns.rejected.connect(dlg.accept)
-        lay.addWidget(btns)
-        dlg.exec()
+        """Open (or focus) *table_name*'s tab and switch it to the Structure
+        sub-tab (issue #27) — no more separate popup window to lose context in."""
+        self.open_table_view(table_name)
+        w = self.tabs.currentWidget()
+        if isinstance(w, TableViewWidget):
+            w.show_structure_tab()
 
 
 
@@ -1629,7 +1622,18 @@ class ConnectionPanel(QWidget):
         try:
             self._reconnect_btn.setEnabled(False)
             self._reconnect_btn.setText("…")
-            self.db_service._reconnect()
+
+            # Pick up any edits made in the Connection Manager while this
+            # tab stayed open (host, port, credentials, environment, ...)
+            # instead of reusing whatever was captured when the tab was
+            # first opened (GitHub issue #17).
+            from ui.connection_dialog import ConnectionDialog
+            fresh = ConnectionDialog.load_connection_by_id(self.config.get("id"))
+            if fresh is not None:
+                self.config.clear()
+                self.config.update(fresh)
+
+            self.db_service._reconnect(self.config)
             reconnected_ok = True
             # Refresh version label
             try:

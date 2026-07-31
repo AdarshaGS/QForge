@@ -18,6 +18,7 @@ from ui.connection_panel import ConnectionPanel
 from ui.theme_manager import ThemeManager
 from utils.logger import setup_logger, get_logger
 from utils.updater import UpdateChecker, APP_VERSION
+from utils.self_updater import UpdateInstaller, running_app_bundle_path, relaunch
 from utils import environment
 
 logger = setup_logger()
@@ -70,9 +71,6 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(
             lambda: self._current_panel() and self._current_panel().refresh_current_view()
         )
-        QShortcut(QKeySequence("Ctrl+W"), self).activated.connect(
-            self._smart_close
-        )
         QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(
             lambda: self._prompt_new_connection()
         )
@@ -90,13 +88,24 @@ class MainWindow(QMainWindow):
         self._update_checker.update_available.connect(self._on_update_available)
         self._update_checker.start()
         self._release_url = ""
+        self._update_tag = ""
+        self._dmg_url = ""
 
-    def _on_update_available(self, tag: str, url: str):
+    def _on_update_available(self, tag: str, url: str, dmg_url: str):
         self._release_url = url
+        self._update_tag = tag
+        self._dmg_url = dmg_url
+        action = "download & install" if self._can_self_update() else "download"
         self._update_label.setText(
-            f"\u2B06  QForge {tag} is available \u2014 click to download"
+            f"\u2B06  QForge {tag} is available \u2014 click to {action}"
         )
         self._update_banner.show()
+
+    def _can_self_update(self) -> bool:
+        """Self-update needs an actual .dmg asset and a running .app bundle
+        to replace \u2014 running from source (dev) has neither, so that case
+        falls back to opening the release page instead."""
+        return bool(self._dmg_url) and running_app_bundle_path() is not None
 
     def _open_release_url(self):
         if self._release_url:
@@ -104,8 +113,54 @@ class MainWindow(QMainWindow):
             from PySide6.QtCore import QUrl
             QDesktopServices.openUrl(QUrl(self._release_url))
 
+    def _handle_update_click(self):
+        if self._can_self_update():
+            self._start_self_update()
+        else:
+            self._open_release_url()
+
     def _dismiss_update_banner(self):
         self._update_banner.hide()
+
+    def _start_self_update(self):
+        self._dismiss_update_banner()
+        self._update_progress = QProgressDialog(
+            "Downloading update\u2026", None, 0, 100, self
+        )
+        self._update_progress.setWindowTitle("Updating QForge")
+        self._update_progress.setWindowModality(Qt.WindowModal)
+        self._update_progress.setCancelButton(None)
+        self._update_progress.setMinimumDuration(0)
+        self._update_progress.setValue(0)
+        self._update_progress.show()
+
+        self._update_installer = UpdateInstaller(self._update_tag, self._dmg_url, parent=self)
+        self._update_installer.progress.connect(self._on_update_progress)
+        self._update_installer.failed.connect(self._on_update_failed)
+        self._update_installer.ready_to_restart.connect(self._on_update_ready)
+        self._update_installer.start()
+
+    def _on_update_progress(self, percent: int):
+        self._update_progress.setValue(percent)
+        self._update_progress.setLabelText(f"Downloading update\u2026 {percent}%")
+
+    def _on_update_failed(self, message: str):
+        self._update_progress.close()
+        QMessageBox.critical(
+            self, "Update Failed", f"Could not install the update:\n\n{message}"
+        )
+
+    def _on_update_ready(self, app_path: str):
+        self._update_progress.close()
+        reply = QMessageBox.question(
+            self, "Update Downloaded",
+            "QForge has downloaded and installed the update.\n\n"
+            "Restart now to finish?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.save_session()
+            relaunch(app_path)
 
     # ─── UI ──────────────────────────────────────────────────────────────────
 
@@ -182,7 +237,7 @@ class MainWindow(QMainWindow):
             "color:#5cdb5c; font-size:13px; font-weight:600;"
             " text-align:left; border:none; background:transparent;"
         )
-        self._update_label.clicked.connect(self._open_release_url)
+        self._update_label.clicked.connect(self._handle_update_click)
         banner_layout.addWidget(self._update_label, 1)
 
         dismiss_btn = QPushButton("✕")
@@ -245,7 +300,11 @@ class MainWindow(QMainWindow):
 
     def _prompt_new_connection(self, allow_cancel_quit: bool = False):
         while True:
-            dialog = ConnectionDialog(auto_connect_last=(len(self._panels) == 0))
+            # Always parent to the main window: an unparented dialog is a
+            # fully independent top-level window to macOS, so opening one
+            # while the main window is in native full-screen kicks the app
+            # out to a new desktop/Space instead of staying put (issue #15).
+            dialog = ConnectionDialog(auto_connect_last=(len(self._panels) == 0), parent=self)
             if not dialog.exec():
                 if allow_cancel_quit and not self._panels:
                     sys.exit()
@@ -257,7 +316,7 @@ class MainWindow(QMainWindow):
 
             try:
                 from PySide6.QtCore import QCoreApplication
-                progress = QProgressDialog("Connecting…", None, 0, 0)
+                progress = QProgressDialog("Connecting…", None, 0, 0, self)
                 progress.setWindowTitle("Connecting")
                 progress.setWindowModality(Qt.WindowModal)
                 progress.setCancelButton(None)
@@ -291,7 +350,7 @@ class MainWindow(QMainWindow):
                 logger.error(f"Connection failed: {ex}")
                 if 'progress' in dir():
                     progress.close()
-                QMessageBox.critical(None, "Connection Error", str(ex))
+                QMessageBox.critical(self, "Connection Error", str(ex))
 
     # ─── Close connection tab ────────────────────────────────────────────────
 
@@ -321,7 +380,10 @@ class MainWindow(QMainWindow):
                 self._close_connection_at(i)
 
     def _smart_close(self):
-        """Cmd+W: close current content tab; if none, close the connection."""
+        """Cmd+W: close current content tab; if that was the last tab for
+        this connection, close the connection too in the same keypress
+        (issue #40) rather than leaving an empty connected workspace that
+        needs a second Cmd+W."""
         panel = self._current_panel()
         if not panel:
             return
@@ -329,8 +391,9 @@ class MainWindow(QMainWindow):
             idx = panel.tabs.currentIndex()
             if idx >= 0:
                 panel.tabs.removeTab(idx)
-        else:
-            self._close_connection_tab(self.conn_tab_bar.currentIndex())
+            if panel.tabs.count() > 0:
+                return
+        self._close_connection_tab(self.conn_tab_bar.currentIndex())
 
     def _conn_tab_context_menu(self, pos):
         """Right-click menu on a connection tab."""
@@ -355,13 +418,6 @@ class MainWindow(QMainWindow):
             self._close_connection_tab(idx)
         elif action == close_others_act:
             self._close_other_connections(keep_index=idx)
-
-    def _close_current_content_tab(self):
-        panel = self._current_panel()
-        if panel:
-            idx = panel.tabs.currentIndex()
-            if idx >= 0:
-                panel.tabs.removeTab(idx)
 
     # ─── Session ─────────────────────────────────────────────────────────────
 
@@ -451,11 +507,12 @@ class MainWindow(QMainWindow):
         """Triggered by Help → Check for Updates. Shows a dialog with result."""
         from PySide6.QtCore import QEventLoop
         checker = UpdateChecker()
-        found = {"tag": None, "url": None}
+        found = {"tag": None, "url": None, "dmg_url": None}
 
-        def _got(tag, url):
+        def _got(tag, url, dmg_url):
             found["tag"] = tag
             found["url"] = url
+            found["dmg_url"] = dmg_url
 
         checker.update_available.connect(_got)
         checker.start()
@@ -463,19 +520,27 @@ class MainWindow(QMainWindow):
 
         if found["tag"]:
             self._release_url = found["url"]
+            self._update_tag = found["tag"]
+            self._dmg_url = found["dmg_url"]
+            can_self_update = self._can_self_update()
+            action = "download & install" if can_self_update else "download"
             self._update_label.setText(
-                f"\u2B06  QForge {found['tag']} is available \u2014 click to download"
+                f"\u2B06  QForge {found['tag']} is available \u2014 click to {action}"
             )
             self._update_banner.show()
+            question = (
+                "Download and install it now?" if can_self_update
+                else "Open the download page?"
+            )
             reply = QMessageBox.question(
                 self,
                 "Update Available",
                 f"QForge <b>{found['tag']}</b> is available.\n\n"
-                f"You are on <b>v{APP_VERSION}</b>.\n\nOpen the download page?",
+                f"You are on <b>v{APP_VERSION}</b>.\n\n{question}",
                 QMessageBox.Yes | QMessageBox.No,
             )
             if reply == QMessageBox.Yes:
-                self._open_release_url()
+                self._handle_update_click()
         else:
             QMessageBox.information(
                 self,
@@ -503,7 +568,7 @@ class MainWindow(QMainWindow):
 
         act = file_menu.addAction("Close Tab")
         act.setShortcut("Ctrl+W")
-        act.triggered.connect(self._close_current_content_tab)
+        act.triggered.connect(self._smart_close)
 
         file_menu.addSeparator()
 
@@ -563,6 +628,26 @@ class MainWindow(QMainWindow):
         act.setShortcut("Ctrl+0")
         act.triggered.connect(lambda: self._zoom(0))
 
+        # Database
+        db_menu = menubar.addMenu("Database")
+
+        act = db_menu.addAction("Create Database…")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().create_database()
+        )
+
+        act = db_menu.addAction("Refresh Databases")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().refresh_databases()
+        )
+
+        db_menu.addSeparator()
+
+        act = db_menu.addAction("Drop Database…")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().drop_database()
+        )
+
         # Help
         help_menu = menubar.addMenu("Help")
         act = help_menu.addAction("Keyboard Shortcuts")
@@ -605,25 +690,34 @@ class MainWindow(QMainWindow):
         from ui.table_view_widget import TableViewWidget
         current_tab = panel.tabs.currentWidget()
         if hasattr(current_tab, "editor") and current_tab.editor is not None:
-            font = current_tab.editor.font()
-            size = font.pointSize()
-            if direction == 0:
-                font.setPointSize(13)
-            elif direction > 0 and size < 30:
-                font.setPointSize(max(size, 1) + 1)
-            elif direction < 0 and size > 8:
-                font.setPointSize(size - 1)
-            current_tab.editor.setFont(font)
+            self._apply_zoom(current_tab.editor, direction)
         elif isinstance(current_tab, TableViewWidget) and hasattr(current_tab, "data_table"):
-            font = current_tab.data_table.font()
-            size = font.pointSize()
-            if direction == 0:
-                font.setPointSize(13)
-            elif direction > 0 and size < 30:
-                font.setPointSize(max(size, 1) + 1)
-            elif direction < 0 and size > 8:
-                font.setPointSize(size - 1)
-            current_tab.data_table.setFont(font)
+            self._apply_zoom(current_tab.data_table, direction)
+
+    @staticmethod
+    def _apply_zoom(widget, direction: int):
+        """Adjust *widget*'s font size relative to its last zoom level.
+
+        Reading QFont.pointSize() back off the widget isn't reliable here:
+        once the app-wide theme stylesheet's `font-size` CSS property has
+        touched a widget, Qt reports pointSize() as -1 (its sentinel for
+        "size was set in pixels"), regardless of what setFont() was last
+        called with. That made every zoom action compute its step from -1
+        instead of the actual current size — collapsing the font to ~2pt
+        on the very first Zoom In (issue #11). Track the size ourselves
+        instead of trusting the widget to report it back accurately.
+        """
+        size = getattr(widget, "_qforge_zoom_pt", 13)
+        if direction == 0:
+            size = 13
+        elif direction > 0:
+            size = min(size + 1, 30)
+        elif direction < 0:
+            size = max(size - 1, 8)
+        widget._qforge_zoom_pt = size
+        font = widget.font()
+        font.setPointSize(size)
+        widget.setFont(font)
 
     # ─── File operations ─────────────────────────────────────────────────────
 
