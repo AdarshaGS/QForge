@@ -285,21 +285,7 @@ class SqlCompletePopup(QFrame):
     MAX_ROWS = 12
 
     def __init__(self, parent=None):
-        # WindowDoesNotAcceptFocus (on top of the existing NoFocus policy /
-        # WA_ShowWithoutActivating below) tells the OS window server itself
-        # that this window can never become key/active — on macOS, that's
-        # what actually determines whether showing a new window can trigger
-        # a full-screen-Space switch. WA_ShowWithoutActivating alone stops
-        # Qt from *requesting* activation, but apparently wasn't enough to
-        # stop macOS from still treating this as an activatable window and
-        # sliding to a new Space to reveal it while typing in a full-screen
-        # SQL tab (GitHub issue #15, follow-up: still occurred every time
-        # autocomplete showed, not just when opening a new tab).
-        super().__init__(
-            parent,
-            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
-            | Qt.WindowDoesNotAcceptFocus
-        )
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setFocusPolicy(Qt.NoFocus)
@@ -436,18 +422,8 @@ class SqlCompleter:
 
     def __init__(self, editor):
         self._editor  = editor
-        # Built lazily (see _ensure_popup) rather than here. At this point
-        # `editor` has usually just been constructed and isn't attached to
-        # the real window hierarchy yet (a new SqlTab isn't added to its
-        # QTabWidget until after __init__ returns), so `editor.window()`
-        # would resolve to the editor itself, not the actual main window.
-        # Eagerly creating this Qt.Tool-flagged top-level popup against that
-        # dangling ancestor — once per new SQL tab — was intermittently
-        # kicking a fullscreen macOS window to a different Space the instant
-        # a tab was opened, before the user ever touched autocomplete
-        # (GitHub issue #15). Deferring construction to first real use means
-        # it's always built once the tab is fully part of the real window.
-        self._popup   = None
+        self._popup   = SqlCompletePopup(editor.window())
+        self._popup.item_activated.connect(self._insert)
 
         self._tables:   list[str]            = []
         self._columns:  dict[str, list[str]] = {}   # {table: [col, ...]}
@@ -473,27 +449,19 @@ class SqlCompleter:
             else:
                 self._columns[table] = [c for c in cols if c]
 
-    def _ensure_popup(self) -> SqlCompletePopup:
-        """Construct the popup on first real use — see __init__ for why."""
-        if self._popup is None:
-            self._popup = SqlCompletePopup(self._editor.window())
-            self._popup.item_activated.connect(self._insert)
-        return self._popup
-
     @property
     def popup_visible(self) -> bool:
-        return self._popup.visible if self._popup else False
+        return self._popup.visible
 
     def hide_popup(self):
-        if self._popup:
-            self._popup.hide()
+        self._popup.hide()
 
     def handle_key(self, event) -> bool:
         """
         Route a key event to the popup.
         Returns True if the event was consumed (caller must not pass it to editor).
         """
-        if not self._popup or not self._popup.visible:
+        if not self._popup.visible:
             return False
         key = event.key()
         if key == Qt.Key_Down:
@@ -522,7 +490,7 @@ class SqlCompleter:
         prefix = self._current_prefix(query, pos)
 
         if not prefix and not force:
-            self.hide_popup()
+            self._popup.hide()
             return
 
         # Refresh alias map from current query text
@@ -532,18 +500,18 @@ class SqlCompleter:
         items   = self._build_suggestions(prefix, context, query)
 
         if not items:
-            self.hide_popup()
+            self._popup.hide()
             return
 
         # Auto-hide when the single remaining suggestion is an exact match
         if len(items) == 1 and items[0].text.lower() == prefix.lower():
-            self.hide_popup()
+            self._popup.hide()
             return
 
         cur_rect   = editor.cursorRect()
         global_pos = editor.mapToGlobal(cur_rect.bottomLeft())
         global_pos.setX(global_pos.x() - 2)
-        self._ensure_popup().show_suggestions(items, prefix, global_pos)
+        self._popup.show_suggestions(items, prefix, global_pos)
 
     # ── Prefix extraction ─────────────────────────────────────────────────────
 
