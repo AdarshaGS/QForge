@@ -4,7 +4,6 @@ import uuid
 
 from utils import credential_store
 from utils import environment
-from utils.paths import app_data_dir
 from ui.theme_manager import ThemeManager
 
 from PySide6.QtWidgets import (
@@ -30,7 +29,7 @@ from PySide6.QtCore import Qt
 
 class ConnectionDialog(QDialog):
 
-    _APP_DIR = str(app_data_dir())
+    _APP_DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "QForge")
     CONNECTION_FILE = os.path.join(_APP_DIR, "connections.json")
     LAST_CONNECTION_FILE = os.path.join(_APP_DIR, "last_connection.json")
 

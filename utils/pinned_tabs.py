@@ -6,11 +6,12 @@ import json
 import os
 
 from utils.logger import get_logger
-from utils.paths import app_data_dir
 
 logger = get_logger()
 
-_FILE = os.path.join(app_data_dir(), "pinned_tabs.json")
+_FILE = os.path.join(
+    os.path.expanduser("~"), "Library", "Application Support", "QForge", "pinned_tabs.json"
+)
 
 
 def load() -> dict:
