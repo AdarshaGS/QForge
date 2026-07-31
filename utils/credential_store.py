@@ -5,7 +5,6 @@ written to connections.json in plaintext. Each stored secret is keyed by a
 connection's stable `id` plus a `kind` ("db" or "ssh").
 """
 import subprocess
-import sys
 
 import keyring
 from keyring.errors import PasswordDeleteError
@@ -34,12 +33,7 @@ def _force_delete_stale_item(connection_id: str, kind: str) -> None:
     errSecInvalidOwnerEdit). Shelling out to `security` instead of using
     the same Security-framework call keyring made gives macOS a chance to
     resolve the conflict (e.g. via an interactive re-authorization prompt)
-    rather than failing the same way again. The `security` CLI only exists
-    on macOS — this ownership conflict is a macOS-only Keychain quirk, so
-    Windows/Linux (Credential Manager / Secret Service via keyring) never
-    need this recovery path (issue #34)."""
-    if sys.platform != "darwin":
-        return
+    rather than failing the same way again."""
     try:
         subprocess.run(
             ["security", "delete-generic-password", "-s", _SERVICE,
