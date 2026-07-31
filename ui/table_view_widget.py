@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QMessageBox,
     QToolTip,
-    QTabWidget,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QCursor
 from ui.advanced_filter_dialog import AdvancedFilterDialog
@@ -23,58 +22,6 @@ from utils.logger import get_logger
 import pandas as pd
 
 logger = get_logger()
-
-
-def build_structure_tabs(cols, idxs, fks) -> QTabWidget:
-    """Build a read-only Columns/Indexes/Foreign Keys QTabWidget from schema
-    metadata. Shared by the in-tab Structure view (issue #27) and the
-    schema-tree "View Structure" popup so both stay in sync."""
-    tabs = QTabWidget()
-
-    col_tbl = QTableWidget(len(cols), 5)
-    col_tbl.setHorizontalHeaderLabels(["Column", "Type", "Null", "Key", "Default"])
-    col_tbl.verticalHeader().setVisible(False)
-    col_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-    col_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-    col_tbl.horizontalHeader().setStretchLastSection(True)
-    for r, c in enumerate(cols):
-        if isinstance(c, dict):
-            col_tbl.setItem(r, 0, QTableWidgetItem(str(c.get("Field", ""))))
-            col_tbl.setItem(r, 1, QTableWidgetItem(str(c.get("Type",  ""))))
-            col_tbl.setItem(r, 2, QTableWidgetItem(str(c.get("Null",  ""))))
-            col_tbl.setItem(r, 3, QTableWidgetItem(str(c.get("Key",   ""))))
-            col_tbl.setItem(r, 4, QTableWidgetItem(str(c.get("Default", ""))))
-        else:
-            for ci, val in enumerate(list(c)[:5]):
-                col_tbl.setItem(r, ci, QTableWidgetItem(str(val)))
-    tabs.addTab(col_tbl, f"Columns ({len(cols)})")
-
-    idx_tbl = QTableWidget(len(idxs), 4)
-    idx_tbl.setHorizontalHeaderLabels(["Name", "Columns", "Unique", "Type"])
-    idx_tbl.verticalHeader().setVisible(False)
-    idx_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-    idx_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-    idx_tbl.horizontalHeader().setStretchLastSection(True)
-    for r, idx in enumerate(idxs):
-        idx_tbl.setItem(r, 0, QTableWidgetItem(str(idx.get("name", ""))))
-        idx_tbl.setItem(r, 1, QTableWidgetItem(str(idx.get("columns", ""))))
-        idx_tbl.setItem(r, 2, QTableWidgetItem("✔" if idx.get("unique") else ""))
-        idx_tbl.setItem(r, 3, QTableWidgetItem(str(idx.get("type", ""))))
-    tabs.addTab(idx_tbl, f"Indexes ({len(idxs)})")
-
-    fk_tbl = QTableWidget(len(fks), 3)
-    fk_tbl.setHorizontalHeaderLabels(["Column", "References Table", "References Column"])
-    fk_tbl.verticalHeader().setVisible(False)
-    fk_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-    fk_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-    fk_tbl.horizontalHeader().setStretchLastSection(True)
-    for r, fk in enumerate(fks):
-        fk_tbl.setItem(r, 0, QTableWidgetItem(str(fk.get("column", ""))))
-        fk_tbl.setItem(r, 1, QTableWidgetItem(str(fk.get("ref_table", ""))))
-        fk_tbl.setItem(r, 2, QTableWidgetItem(str(fk.get("ref_column", ""))))
-    tabs.addTab(fk_tbl, f"Foreign Keys ({len(fks)})")
-
-    return tabs
 
 
 class TableViewWidget(QWidget):
@@ -94,7 +41,6 @@ class TableViewWidget(QWidget):
         self.sort_order = None  # 'DESC' or 'ASC'
         self.filter_conditions = []  # List of (column, operator, value) tuples
         self.filter_visible = False
-        self._structure_loaded = False
 
         # Pagination state
         self.current_page = 1          # 1-indexed
@@ -119,23 +65,9 @@ class TableViewWidget(QWidget):
         self.reset_and_load_first_page()
 
     def init_ui(self):
-        outer_layout = QVBoxLayout(self)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        outer_layout.setSpacing(0)
-
-        self.view_tabs = QTabWidget()
-        outer_layout.addWidget(self.view_tabs)
-
-        data_page = QWidget()
-        layout = QVBoxLayout(data_page)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        self.view_tabs.addTab(data_page, "Data")
-
-        self.structure_page = QWidget()
-        QVBoxLayout(self.structure_page).setContentsMargins(0, 0, 0, 0)
-        self.view_tabs.addTab(self.structure_page, "Structure")
-        self.view_tabs.currentChanged.connect(self._on_view_tab_changed)
 
         # Top controls bar - only shown when filtering
         self.filter_container = QWidget()
@@ -709,30 +641,6 @@ class TableViewWidget(QWidget):
         """Rename tab at index."""
         # This method is kept for compatibility but not used in this widget
         pass
-
-    # ─── Structure tab (issue #27) ──────────────────────────────────────────────
-
-    def show_structure_tab(self):
-        """Switch to the Structure tab, loading it on first use."""
-        self.view_tabs.setCurrentWidget(self.structure_page)
-
-    def _on_view_tab_changed(self, index):
-        if self.view_tabs.widget(index) is self.structure_page and not self._structure_loaded:
-            self._load_structure_tab()
-
-    def _load_structure_tab(self):
-        self._structure_loaded = True
-        try:
-            cols = self.db_service.get_columns(self.table_name)
-            fks = self.db_service.get_foreign_keys(self.table_name)
-            try:
-                idxs = self.db_service.get_indexes(self.table_name)
-            except Exception:
-                idxs = []
-        except Exception as ex:
-            self.structure_page.layout().addWidget(QLabel(f"Could not load structure: {ex}"))
-            return
-        self.structure_page.layout().addWidget(build_structure_tabs(cols, idxs, fks))
 
     # ─── Structure editor ─────────────────────────────────────────────────────
 

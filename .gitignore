@@ -28,9 +28,6 @@ logs/
 query_history.json
 connections.json
 
-# graphify codegraph output (derivable from tracked source, regenerate via /graphify)
-graphify-out/
-
 # py2app build artifacts
 *.app/
 setup.py
