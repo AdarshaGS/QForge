@@ -8,10 +8,11 @@ should land after the snippet is expanded.
 from __future__ import annotations
 
 import json
-from pathlib import Path
+
+from utils.paths import app_data_dir
 
 # ── Storage location ──────────────────────────────────────────────────────────
-_DATA_DIR     = Path.home() / "Library" / "Application Support" / "QForge"
+_DATA_DIR     = app_data_dir()
 _SNIPPET_FILE = _DATA_DIR / "snippets.json"
 
 # ── Built-in defaults (written on first run) ──────────────────────────────────

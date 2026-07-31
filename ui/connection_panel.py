@@ -131,6 +131,7 @@ class ConnectionPanel(QWidget):
     # Bridge signals for background schema load
     _schema_done   = Signal(object)   # (schema_data dict)
     _schema_error  = Signal(str)      # error message
+    _schema_fast   = Signal(list, dict)   # (tables, columns) — arrives ahead of _schema_done
     def __init__(self, config: dict, db_service: DbService,
                  query_history: QueryHistory, parent=None):
         super().__init__(parent)
@@ -154,6 +155,7 @@ class ConnectionPanel(QWidget):
         self._q_cancelled.connect(self._on_query_cancelled, Qt.QueuedConnection)
         self._schema_done.connect(self._on_schema_loaded, Qt.QueuedConnection)
         self._schema_error.connect(self._on_schema_error, Qt.QueuedConnection)
+        self._schema_fast.connect(self._on_schema_tables_ready, Qt.QueuedConnection)
         self._column_cache: dict = {}   # {table: [col, ...]} for autocomplete
 
         self._build_ui()
@@ -429,10 +431,12 @@ class ConnectionPanel(QWidget):
         conf = dict(self.config)
         sig_done  = self._schema_done
         sig_error = self._schema_error
+        sig_fast  = self._schema_fast
 
         def _worker():
             try:
-                sig_done.emit(fetch_schema_snapshot(conf))
+                sig_done.emit(fetch_schema_snapshot(
+                    conf, on_tables_ready=lambda t, c: sig_fast.emit(t, c)))
             except Exception as ex:
                 # Suppress silent "not connected" errors (e.g. (0, '') on startup)
                 msg = str(ex)
@@ -442,6 +446,16 @@ class ConnectionPanel(QWidget):
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
+
+    def _on_schema_tables_ready(self, tables: list, columns: dict):
+        """Push tables/columns to autocomplete as soon as they're fetched —
+        ahead of the slower dbs/views/functions/server_version round-trips
+        that _on_schema_loaded waits for (issue #16)."""
+        self._column_cache = columns
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if isinstance(tab, SqlTab):
+                tab.set_schema(tables, columns)
 
     def _on_schema_loaded(self, result: dict):
         """Main-thread: populate the schema tree from background result."""
@@ -577,25 +591,40 @@ class ConnectionPanel(QWidget):
         from PySide6.QtWidgets import QApplication as _QApp
         _QApp.processEvents()
 
-        # Reconnect the shared connection synchronously (fast) so nothing else
-        # can be using it mid-reconnect. The (potentially slower) schema
-        # listing then runs on a background thread over its OWN dedicated
-        # connection (services/schema_snapshot.py) — never touching
-        # self.db_service concurrently.
-        try:
-            self.db_service.disconnect()
-            self.db_service.connect(dict(self.config))
-        except Exception as ex:
-            self._on_schema_error(str(ex))
-            return
+        # MySQL can point the existing connection at the new database with a
+        # single lightweight command (COM_INIT_DB) — no new TCP handshake,
+        # auth round-trip, or (potentially tunnelled) SSH setup. Previously
+        # every switch paid the full disconnect+reconnect cost, which is
+        # where the multi-second freeze reported in issue #23 actually came
+        # from. Postgres/SQLite connections are bound to one database for
+        # their lifetime, so they still need a real reconnect — done
+        # synchronously (as before) so nothing else can use the shared
+        # connection mid-reconnect. The (potentially slower) schema listing
+        # always runs on a background thread over its OWN dedicated
+        # connection (services/schema_snapshot.py) either way.
+        if self.db_service.db_type == "mysql" and self.db_service.connection:
+            try:
+                self.db_service.connection.select_db(new_db)
+            except Exception as ex:
+                self._on_schema_error(str(ex))
+                return
+        else:
+            try:
+                self.db_service.disconnect()
+                self.db_service.connect(dict(self.config))
+            except Exception as ex:
+                self._on_schema_error(str(ex))
+                return
 
         conf = dict(self.config)
         sig_done  = self._schema_done
         sig_error = self._schema_error
+        sig_fast  = self._schema_fast
 
         def _load():
             try:
-                sig_done.emit(fetch_schema_snapshot(conf))
+                sig_done.emit(fetch_schema_snapshot(
+                    conf, on_tables_ready=lambda t, c: sig_fast.emit(t, c)))
             except Exception as ex:
                 msg = str(ex)
                 if msg in ("(0, '')", "0", "") or "not connected" in msg.lower():
@@ -799,17 +828,44 @@ class ConnectionPanel(QWidget):
         is_dark = self.current_theme == "dark"
         tv.update_theme(is_dark)
 
+    def ensure_at_least_one_tab(self):
+        """Guarantee this panel has at least one query tab. Called once
+        right after a panel becomes interactive (fresh connect or session
+        restore) so its tab bar's native view is realized immediately —
+        before the user can ever switch the main window to full screen.
+        Confirmed via live testing (real screenshots of a real full-screen
+        session, not just offscreen flag inspection): the first time Qt has
+        to realize brand-new native tab content inside an *already*
+        full-screen window, macOS briefly slides the window out to reveal
+        another Space (issue #25). Front-loading that realization while
+        still windowed avoids the trigger for the common case of a panel
+        that starts with zero tabs."""
+        if self.tabs.count() == 0:
+            self.add_new_tab()
+
     def add_new_tab(self):
         """Open a blank SQL query tab."""
         tab = SqlTab()
+        # Reparent into the real tab widget FIRST, before any other setup.
+        # SqlTab() itself is a fairly heavy construction (dozens of child
+        # widgets), and until it's added here it's a parentless — hence
+        # top-level — widget. Empirically (screenshots of a real full-screen
+        # session, not just offscreen flag-checking), macOS briefly slides
+        # the fullscreen window out to reveal the desktop the moment the
+        # event loop gets a chance to notice that parentless top-level
+        # widget, even though it's never actually shown — the same class of
+        # bug fixed for the autocomplete popup under issue #15, just for the
+        # tab itself this time (issue #25). Keeping this gap as short as
+        # possible (one line, no signal connects or other work first)
+        # closes the window for it to happen.
+        count = self.tabs.count() + 1
+        idx = self.tabs.addTab(tab, f"Tab {count}")
         tab.run_btn.clicked.connect(lambda: self._run_query_in_tab(tab))
         tab.verify_btn.clicked.connect(lambda: self._open_verify_dialog(tab))
         # Wire inline-edit commit: execute SQL with our db_service
         tab.commit_sql.connect(lambda sqls, t=tab: self._execute_commit_sql(sqls, t))
         # Push current schema so autocomplete works immediately
         tab.set_schema(self.all_tables, self._column_cache)
-        count = self.tabs.count() + 1
-        idx = self.tabs.addTab(tab, f"Tab {count}")
         self._attach_close_btn(idx)
         self.tabs.setCurrentWidget(tab)
         tab.update_theme(self.current_theme == "dark")
