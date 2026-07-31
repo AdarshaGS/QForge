@@ -1080,9 +1080,11 @@ class SqlTab(QWidget):
             self.result_table.show()
             self._pagination_bar.show()
             self._refresh_result_view()
+            self._expand_result_area()
         else:
             self.result_table.hide()
             self._pagination_bar.hide()
+            self._collapse_result_area()
 
         # Update button states
         self.commit_btn.setEnabled(False)
@@ -1145,6 +1147,7 @@ class SqlTab(QWidget):
             self._update_filter_columns(list(df.columns))
         self.result_table.show()
         self._refresh_result_view()
+        self._expand_result_area()
 
     
     def add_filter_headers(self):
@@ -1304,6 +1307,30 @@ class SqlTab(QWidget):
             """,
         )
 
+    # Fits status_label's tallest case (150px cap in _set_status) + margins.
+    _COLLAPSED_RESULT_HEIGHT = 170
+
+    def _collapse_result_area(self):
+        """Shrink the splitter's bottom pane to just fit the status line,
+        giving the reclaimed space to the editor. Without this, hiding
+        result_table on error/cancel/no-result-set left the bottom pane at
+        whatever size it last was, showing a large empty gap below the
+        status message (issue #31)."""
+        sizes = self.splitter.sizes()
+        if len(sizes) != 2:
+            return
+        total = sum(sizes)
+        if sizes[1] > self._COLLAPSED_RESULT_HEIGHT:
+            self._expanded_splitter_sizes = sizes
+        self.splitter.setSizes([total - self._COLLAPSED_RESULT_HEIGHT, self._COLLAPSED_RESULT_HEIGHT])
+
+    def _expand_result_area(self):
+        """Restore the splitter to its pre-collapse size once a real
+        result grid is being shown again."""
+        sizes = getattr(self, '_expanded_splitter_sizes', None)
+        if sizes:
+            self.splitter.setSizes(sizes)
+
     def show_error(self, message: str, query: str = "", elapsed: float = 0.0):
         """Display a SQL error inline with actionable hints — always selectable."""
         self.result_table.clearContents()
@@ -1334,6 +1361,7 @@ class SqlTab(QWidget):
             }
             """,
         )
+        self._collapse_result_area()
 
     def show_cancelled(self):
         """Show a neutral 'query cancelled' status."""
@@ -1355,6 +1383,7 @@ class SqlTab(QWidget):
             }
             """,
         )
+        self._collapse_result_area()
 
     # ======================================
     # EXPORT DATA
@@ -1721,7 +1750,12 @@ class SqlTab(QWidget):
     # ─── Find / Replace ───────────────────────────────────────────────────────
 
     def _toggle_find_bar(self):
-        """Cmd+F: show find bar (replace row hidden)."""
+        """Cmd+F: open Quick Filter when the result grid has focus (issue
+        #2), otherwise show the find bar (replace row hidden) for the
+        SQL editor."""
+        if hasattr(self, 'result_table') and self.result_table.hasFocus():
+            self.toggle_filter()
+            return
         if self._find_bar.isHidden():
             self._replace_row.hide()
             self._find_bar.show()

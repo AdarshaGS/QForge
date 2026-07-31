@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import pandas as pd
+from sqlparse.engine.grouping import MAX_GROUPING_TOKENS
+from sqlparse.exceptions import SQLParseError
 
 from utils.logger import get_logger
 
@@ -274,6 +276,22 @@ class QueryVerifier:
                 and all(a.match for a in result.agg_rows)
             )
 
+        except SQLParseError:
+            # sqlparse's own grouping-safety limit (issue #30) — every write
+            # goes through query_classifier.classify()/split_statements(),
+            # which parses via sqlparse and hits this on oversized SQL. The
+            # raw message exposes an internal constant, so translate it to
+            # something the user can actually act on.
+            result.error = (
+                "Query verification could not be completed because the query "
+                "exceeds the maximum supported size.\n\n"
+                f"Current limit: {MAX_GROUPING_TOKENS:,} tokens.\n\n"
+                "Please reduce the query size or verify a smaller portion of "
+                "the query."
+            )
+            logger.warning(
+                f"QueryVerifier: query exceeded sqlparse's {MAX_GROUPING_TOKENS}-token grouping limit"
+            )
         except Exception as ex:
             result.error = str(ex)
             logger.error(f"QueryVerifier error: {ex}")

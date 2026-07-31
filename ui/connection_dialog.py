@@ -319,6 +319,28 @@ class ConnectionDialog(QDialog):
                 import copy
                 new_conn = copy.deepcopy(self.connections[conn_idx])
                 new_conn["name"] = new_conn["name"] + " Copy"
+
+                # A deepcopy still carries the original's "id" — since
+                # credentials are keyed by id in the keychain, that meant
+                # the duplicate and the original silently shared one
+                # keychain entry: editing/saving the duplicate's password
+                # overwrote the original's (issue #36). Give the duplicate
+                # its own id, then copy the actual credentials across so it
+                # still starts out fully working, independently.
+                old_id = new_conn.get("id")
+                new_conn["id"] = uuid.uuid4().hex
+                if old_id and new_conn.get("type") != "sqlite":
+                    db_pw = self._resolve_password(old_id, "db")
+                    if db_pw:
+                        credential_store.set_password(new_conn["id"], "db", db_pw)
+                        self._resolved_passwords[(new_conn["id"], "db")] = db_pw
+                    ssh = new_conn.get("ssh_tunnel")
+                    if ssh and ssh.get("enabled") and not ssh.get("use_key"):
+                        ssh_pw = self._resolve_password(old_id, "ssh")
+                        if ssh_pw:
+                            credential_store.set_password(new_conn["id"], "ssh", ssh_pw)
+                            self._resolved_passwords[(new_conn["id"], "ssh")] = ssh_pw
+
                 self.connections.append(new_conn)
                 self.save_connections()
                 self.load_connections()
@@ -521,7 +543,7 @@ class ConnectionDialog(QDialog):
                 child.setData(0, Qt.UserRole, conn_idx)
                 child.setToolTip(0, f"{db_type} — {host}")
                 if env != environment.UNCLASSIFIED:
-                    _, text_color, _ = ThemeManager.env_colors(env, is_dark=True)
+                    _, text_color, _ = ThemeManager.env_colors(env, self._is_dark_theme())
                     child.setForeground(0, QColor(text_color))
 
         # Refresh the group combo with all known group names
@@ -681,12 +703,21 @@ class ConnectionDialog(QDialog):
 
     # ── Form helpers ─────────────────────────────────────────────
 
-    def get_form_data(self):
+    def get_form_data(self, require_name=True):
+        """require_name=False for actions that don't persist the connection
+        (test, one-off connect) — a name is only mandatory once the details
+        are actually being stored (Save, or auto-save on Connect for an
+        already-saved connection). When omitted, falls back to host/database
+        so the connection still has a readable label in the UI."""
         db_type = self.type_input.currentText().lower()
         name = self.name_input.text().strip()
+        host = self.host_input.text().strip()
+        database = self.database_input.text().strip()
 
         if not name:
-            raise ValueError("Connection name cannot be empty.")
+            if require_name:
+                raise ValueError("Connection name cannot be empty.")
+            name = host or database or "Unnamed connection"
 
         data = {
             "type": db_type,
@@ -694,14 +725,14 @@ class ConnectionDialog(QDialog):
             "environment": environment.ENVIRONMENTS[self.environment_input.currentIndex()],
             "read_only": self.read_only_check.isChecked(),
             "group": self._get_group_value(),
-            "database": self.database_input.text().strip(),
+            "database": database,
         }
 
         if db_type != "sqlite":
             port_text = self.port_input.text().strip()
             if not port_text.isdigit():
                 raise ValueError(f"Port must be a number (got '{port_text}').")
-            data["host"] = self.host_input.text().strip()
+            data["host"] = host
             data["port"] = int(port_text)
             data["user"] = self.user_input.text().strip()
             data["password"] = self.password_input.text()
@@ -881,19 +912,27 @@ class ConnectionDialog(QDialog):
 
     def connect_selected(self):
         selected_item = self._get_selected_conn_item()
-        if selected_item is None:
-            QMessageBox.warning(self, "Warning", "Select a connection first.")
+
+        try:
+            data = self.get_form_data(require_name=(selected_item is not None))
+        except ValueError as ex:
+            QMessageBox.warning(self, "Invalid Input", str(ex))
             return
-        conn_idx = selected_item.data(0, Qt.UserRole)
+
+        if selected_item is None:
+            # No saved connection selected — e.g. "New Connection" was filled
+            # in directly and never saved. Connect with the form values as
+            # entered, without writing anything to connections.json or the
+            # keychain; Save remains the only way to keep it (issue #33).
+            data["id"] = uuid.uuid4().hex
+            self.selected_connection = data
+            self.accept()
+            return
 
         # Persist whatever is currently in the form (including a freshly
         # typed password) automatically, so Connect never requires a
         # separate Save click first.
-        try:
-            data = self.get_form_data()
-        except ValueError as ex:
-            QMessageBox.warning(self, "Invalid Input", str(ex))
-            return
+        conn_idx = selected_item.data(0, Qt.UserRole)
         data["id"] = self.connections[conn_idx].get("id") or uuid.uuid4().hex
         self._remember_form_password(data)
         self.connections[conn_idx] = data
@@ -914,15 +953,21 @@ class ConnectionDialog(QDialog):
         if item is not None:
             item.setForeground(0, color)
 
+    def _is_dark_theme(self) -> bool:
+        """Whether the app's active theme is dark. The status/field tint
+        colors below need to pick a light- or dark-appropriate palette —
+        hardcoding the dark one clashes badly with a light theme (issue #10)."""
+        return getattr(self.parent(), "current_theme", "dark") == "dark"
+
     def _set_field_colours(self, success: bool):
         """Turn all connection form fields green (success) or red (failure) like TablePlus."""
-        if success:
-            bg  = "#0d2e0d"
-            border = "#30d158"
-        else:
-            bg  = "#2e0d0d"
-            border = "#ff453a"
-        style = f"background: {bg}; border: 1px solid {border}; border-radius: 4px; padding: 3px 6px;"
+        bg, text_color, border = ThemeManager.env_colors(
+            "local" if success else "production", self._is_dark_theme()
+        )
+        style = (
+            f"background: {bg}; color: {text_color}; "
+            f"border: 1px solid {border}; border-radius: 4px; padding: 3px 6px;"
+        )
         main_fields = [
             self.host_input, self.port_input, self.database_input,
             self.user_input, self.password_input,
@@ -949,14 +994,18 @@ class ConnectionDialog(QDialog):
     def test_connection(self):
         from services.db_service import DbService
         try:
-            data = self.get_form_data()
+            data = self.get_form_data(require_name=False)
         except ValueError as ex:
             self.test_status_label.setText(f"⚠️ {ex}")
             self.test_status_label.setStyleSheet("color: orange; padding: 5px; border-radius: 3px;")
             return
 
+        is_dark = self._is_dark_theme()
+        testing_bg, testing_text, _ = ThemeManager.env_colors("development", is_dark)
         self.test_status_label.setText("⏳ Testing connection...")
-        self.test_status_label.setStyleSheet("color: #0096FF; background: #2a2a2a; padding: 5px; border-radius: 3px;")
+        self.test_status_label.setStyleSheet(
+            f"color: {testing_text}; background: {testing_bg}; padding: 5px; border-radius: 3px;"
+        )
         self.test_btn.setEnabled(False)
 
         from PySide6.QtCore import QCoreApplication
@@ -966,13 +1015,19 @@ class ConnectionDialog(QDialog):
         try:
             db_service.connect(data)
             db_service.disconnect()
+            bg, text_color, _ = ThemeManager.env_colors("local", is_dark)
             self.test_status_label.setText("Connection successful")
-            self.test_status_label.setStyleSheet("color: #30d158; background: #0d2e0d; padding: 6px 8px; border-radius: 4px;")
+            self.test_status_label.setStyleSheet(
+                f"color: {text_color}; background: {bg}; padding: 6px 8px; border-radius: 4px;"
+            )
             self._set_current_item_color(QColor("#30d158"))
             self._set_field_colours(True)
         except Exception as ex:
+            bg, text_color, _ = ThemeManager.env_colors("production", is_dark)
             self.test_status_label.setText(f"Connection failed: {str(ex)}")
-            self.test_status_label.setStyleSheet("color: #ff453a; background: #2e0d0d; padding: 6px 8px; border-radius: 4px;")
+            self.test_status_label.setStyleSheet(
+                f"color: {text_color}; background: {bg}; padding: 6px 8px; border-radius: 4px;"
+            )
             self._set_current_item_color(QColor("#ff453a"))
             self._set_field_colours(False)
         finally:
