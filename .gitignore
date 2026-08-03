@@ -50,3 +50,12 @@ build/
 Thumbs.db
 *.spec
 !QForge.spec
+
+# graphify — keep the shared graph (graph.json, manifest.json,
+# GRAPH_REPORT.md, graph.html, .graphify_labels.json, cost.json) so every
+# machine queries the same graph; exclude what's machine-specific or
+# regenerable (`graphify update .` rebuilds all of this).
+graphify-out/cache/
+graphify-out/.graphify_python
+graphify-out/.graphify_root
+graphify-out/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
