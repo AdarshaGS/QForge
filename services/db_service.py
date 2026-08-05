@@ -315,9 +315,12 @@ class DbService:
         except Exception as ex:
             logger.warning(f"kill_current_query failed (non-fatal): {ex}")
 
-    def _reconnect(self):
-        """Re-establish the connection using the stored config."""
-        if not self._config:
+    def _reconnect(self, config=None):
+        """Re-establish the connection using *config*, or the previously
+        stored config if not given (the automatic-retry-after-a-dropped-
+        connection path, where nothing about the profile has changed)."""
+        config = config or self._config
+        if not config:
             raise Exception("No connection config stored — cannot reconnect")
         logger.info(f"Attempting reconnect to {self.connection_name}...")
         # Close cleanly first
@@ -334,7 +337,7 @@ class DbService:
             except Exception:
                 pass
             self.ssh_tunnel = None
-        self.connect(self._config)
+        self.connect(config)
         logger.info("Reconnect successful")
 
     def is_connected(self):
