@@ -50,6 +50,20 @@ def _force_delete_stale_item(connection_id: str, kind: str) -> None:
         pass
 
 
+_OWNER_CONFLICT_MARKERS = ("-25244", "invalidowneredit", "unknown error")
+
+
+def _looks_like_owner_conflict(ex: Exception) -> bool:
+    """Only the specific errSecInvalidOwnerEdit signature (see
+    _force_delete_stale_item) should trigger the delete-and-retry path.
+    Any other failure (locked keychain, a denied OS authorization prompt,
+    no Secret Service running, ...) means the stored item is fine — forcing
+    a delete in those cases would destroy a valid password the first
+    attempt just happened not to overwrite, and the retry would fail for
+    the same unrelated reason anyway."""
+    return any(m in str(ex).lower() for m in _OWNER_CONFLICT_MARKERS)
+
+
 def set_password(connection_id: str, kind: str, password: str) -> bool:
     """Returns True on success. Callers must not discard a plaintext copy of
     `password` on failure — the keychain is the only place it's persisted."""
@@ -58,9 +72,11 @@ def set_password(connection_id: str, kind: str, password: str) -> bool:
         return True
     except Exception as ex:
         logger.warning(f"Keychain: failed to store {kind} password for {connection_id}: {ex}")
+        if not _looks_like_owner_conflict(ex):
+            return False
 
-    # Retry once after clearing out a possibly stale, ownership-conflicted
-    # item — see _force_delete_stale_item.
+    # Retry once after clearing out a stale, ownership-conflicted item —
+    # see _force_delete_stale_item.
     _force_delete_stale_item(connection_id, kind)
     try:
         keyring.set_password(_SERVICE, _account(connection_id, kind), password)

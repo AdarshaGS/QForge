@@ -581,9 +581,6 @@ class ConnectionPanel(QWidget):
     def _switch_database(self, new_db: str):
         if new_db == self.config.get("database", ""):
             return
-        # Update pill immediately so the UI feels instant
-        self.config["database"] = new_db
-        self._update_pill_label()
 
         # Show spinner in schema tree
         self.schema_tree.clear()
@@ -611,10 +608,19 @@ class ConnectionPanel(QWidget):
         else:
             try:
                 self.db_service.disconnect()
-                self.db_service.connect(dict(self.config))
+                self.db_service.connect(dict(self.config, database=new_db))
             except Exception as ex:
                 self._on_schema_error(str(ex))
                 return
+
+        # Only commit the switch to tracked state/the pill once the
+        # connection has actually confirmed it. Setting these eagerly
+        # (before the try/except above) meant a failed switch left the UI
+        # and self.config claiming new_db while the live connection was
+        # still silently on the old database — every query in this tab
+        # would then run against the wrong database with no indication.
+        self.config["database"] = new_db
+        self._update_pill_label()
 
         conf = dict(self.config)
         sig_done  = self._schema_done
