@@ -94,6 +94,35 @@ class ThemeManager:
             getattr(cls, f"{prefix}{key}_BORDER"),
         )
 
+    @staticmethod
+    def _close_icon_path(color_hex: str) -> str:
+        """Render a 16x16 'x' close-tab icon in *color_hex* to a cached PNG
+        and return its path. Qt's stylesheet `url()` doesn't reliably
+        render inline SVG data-URIs — verified empirically, the close-tab
+        button rendered fully invisible (issue #35) — but loads a real
+        image file fine, so this sidesteps the data-URI entirely rather
+        than fighting its syntax. Cached by color so repeated theme
+        rebuilds (e.g. every dark/light toggle) reuse the same file."""
+        import os
+        import tempfile
+        from PySide6.QtCore import Qt as _Qt
+        from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+
+        key = color_hex.lstrip("#").upper()
+        path = os.path.join(tempfile.gettempdir(), f"qforge_close_icon_{key}.png")
+        if not os.path.exists(path):
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(_Qt.transparent)
+            painter = QPainter(pixmap)
+            pen = QPen(QColor(color_hex), 2)
+            pen.setCapStyle(_Qt.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(4, 4, 12, 12)
+            painter.drawLine(12, 4, 4, 12)
+            painter.end()
+            pixmap.save(path, "PNG")
+        return path.replace(os.sep, "/")
+
     # ── Dark palette ──────────────────────────────────────────────────────────
     @staticmethod
     def get_dark_theme() -> str:
@@ -104,6 +133,8 @@ class ThemeManager:
         A, AH, AP = ThemeManager.D_BLUE, ThemeManager.D_BLUE_HOVER, ThemeManager.D_BLUE_PRESS
         SEL = ThemeManager.D_SELECTION
         DANGER, DANGER_H = ThemeManager.D_DANGER, ThemeManager.D_DANGER_HOVER
+        CLOSE_ICON = ThemeManager._close_icon_path(TEXT2)
+        CLOSE_ICON_HOVER = ThemeManager._close_icon_path(DANGER)
         return f"""
 /* ── Base ──────────────────────────────────────────────────────── */
 QMainWindow {{
@@ -195,12 +226,12 @@ QTabBar::close-button {{
     width: 16px;
     height: 16px;
     border-radius: 3px;
-    image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'><line x1='4' y1='4' x2='12' y2='12' stroke='%23{TEXT2[1:]}' stroke-width='2' stroke-linecap='round'/><line x1='12' y1='4' x2='4' y2='12' stroke='%23{TEXT2[1:]}' stroke-width='2' stroke-linecap='round'/></svg>");
+    image: url("{CLOSE_ICON}");
 }}
 QTabBar::close-button:hover {{
     background: {DANGER}33;
     border-radius: 3px;
-    image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'><line x1='4' y1='4' x2='12' y2='12' stroke='%23{DANGER[1:]}' stroke-width='2.5' stroke-linecap='round'/><line x1='12' y1='4' x2='4' y2='12' stroke='%23{DANGER[1:]}' stroke-width='2.5' stroke-linecap='round'/></svg>");
+    image: url("{CLOSE_ICON_HOVER}");
 }}
 QTabBar#conn_tab_bar::tab {{
     background: transparent;
@@ -396,6 +427,8 @@ QMessageBox QLabel {{ color: {TEXT}; }}
         A, AH, AP = ThemeManager.L_BLUE, ThemeManager.L_BLUE_HOVER, ThemeManager.L_BLUE_PRESS
         SEL = ThemeManager.L_SELECTION
         DANGER, DANGER_H = ThemeManager.L_DANGER, ThemeManager.L_DANGER_HOVER
+        CLOSE_ICON = ThemeManager._close_icon_path(TEXT2)
+        CLOSE_ICON_HOVER = ThemeManager._close_icon_path(DANGER)
         return f"""
 QMainWindow {{ background: {BG}; }}
 QDialog {{ background: {RAISED}; }}
@@ -417,7 +450,7 @@ QMenu::separator {{ height: 1px; background: {BORDER}; margin: 3px 8px; }}
 QMenu::right-arrow {{ width: 6px; height: 6px; }}
 
 QTreeWidget {{
-    background: {SIDEBAR}; color: {TEXT2};
+    background: {SIDEBAR}; color: {TEXT};
     border: none; outline: none; font-size: 12.5px;
 }}
 QTreeWidget::item {{ height: 24px; padding-left: 2px; border-radius: 4px; }}
@@ -445,12 +478,12 @@ QTabBar::close-button {{
     width: 16px;
     height: 16px;
     border-radius: 3px;
-    image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'><line x1='4' y1='4' x2='12' y2='12' stroke='%23{TEXT2[1:]}' stroke-width='2' stroke-linecap='round'/><line x1='12' y1='4' x2='4' y2='12' stroke='%23{TEXT2[1:]}' stroke-width='2' stroke-linecap='round'/></svg>");
+    image: url("{CLOSE_ICON}");
 }}
 QTabBar::close-button:hover {{
     background: {DANGER}22;
     border-radius: 3px;
-    image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'><line x1='4' y1='4' x2='12' y2='12' stroke='%23{DANGER[1:]}' stroke-width='2.5' stroke-linecap='round'/><line x1='12' y1='4' x2='4' y2='12' stroke='%23{DANGER[1:]}' stroke-width='2.5' stroke-linecap='round'/></svg>");
+    image: url("{CLOSE_ICON_HOVER}");
 }}
 QTabBar#conn_tab_bar::tab {{
     background: transparent; color: {TEXT2};

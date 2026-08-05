@@ -133,6 +133,11 @@ confidential data.
 
 ## Before changing code
 
+0. If `graphify-out/graph.json` exists, orient with `graphify query "<topic>"`,
+   `graphify path "<A>" "<B>"`, or `graphify explain "<concept>"` before
+   grepping/reading whole files — these return a scoped subgraph with
+   `source_location` citations. Treat a citation as "as of the last commit,"
+   not ground truth for anything already edited this session.
 1. Read the relevant files in the code map and trace every write entry point.
 2. Check the working tree with `git status --short`; unrelated edits belong to
    the user and must be preserved.

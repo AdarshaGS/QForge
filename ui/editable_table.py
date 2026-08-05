@@ -44,7 +44,7 @@ class EditableTableWidget(QTableWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        
+
         self.original_data = None
         self.filtered_data = None  # Store filtered version
         self.column_filters = {}  # Store filter text for each column
@@ -123,6 +123,7 @@ class EditableTableWidget(QTableWidget):
                     padding: 1px 8px;
                     border: none;
                     border-bottom: 1px solid #2a2a2d;
+                    border-right: 1px solid #2a2a2d;
                 }
                 QTableWidget::item:selected {
                     background: #1a3a5c;
@@ -159,6 +160,7 @@ class EditableTableWidget(QTableWidget):
                     padding: 1px 8px;
                     border: none;
                     border-bottom: 1px solid #e8e8eb;
+                    border-right: 1px solid #e8e8eb;
                 }
                 QTableWidget::item:selected {
                     background: #d0e8ff;
@@ -228,31 +230,28 @@ class EditableTableWidget(QTableWidget):
         self.setHorizontalHeaderLabels([str(col) for col in dataframe.columns])
         
         if dataframe.empty:
-            # For empty tables, show column headers with 10 empty rows (like TablePlus)
-            self.setRowCount(10)
-            for row in range(10):
+            # For empty tables, show column headers with placeholder rows
+            # filling the grid (like TablePlus), not just a handful.
+            self.setRowCount(self._EMPTY_PLACEHOLDER_ROWS)
+            for row in range(self._EMPTY_PLACEHOLDER_ROWS):
                 for col in range(len(dataframe.columns)):
                     item = QTableWidgetItem("")
                     self.setItem(row, col, item)
-            hdr = self.horizontalHeader()
-            hdr.setSectionResizeMode(QHeaderView.Interactive)
-            hdr.setStretchLastSection(False)
-            self._set_compact_column_widths(dataframe)
-        
-        # Display actual data
-        self.setRowCount(len(dataframe))
-        
-        for row in range(len(dataframe)):
-            for col in range(len(dataframe.columns)):
-                value = dataframe.iloc[row, col]
-                
-                if pd.isna(value):
-                    value = ""
-                
-                item = QTableWidgetItem(str(value))
-                item.setData(Qt.UserRole, dataframe.iloc[row, col])  # Store original value
-                self.setItem(row, col, item)
-        
+        else:
+            # Display actual data
+            self.setRowCount(len(dataframe))
+
+            for row in range(len(dataframe)):
+                for col in range(len(dataframe.columns)):
+                    value = dataframe.iloc[row, col]
+
+                    if pd.isna(value):
+                        value = ""
+
+                    item = QTableWidgetItem(str(value))
+                    item.setData(Qt.UserRole, dataframe.iloc[row, col])  # Store original value
+                    self.setItem(row, col, item)
+
         hdr = self.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.Interactive)
         hdr.setStretchLastSection(False)
@@ -275,6 +274,12 @@ class EditableTableWidget(QTableWidget):
     _COL_WIDTH_MIN = 60     # never narrower than this
     _COL_WIDTH_MAX = 300    # never wider than this without manual resize
     _COL_WIDTH_DEF = 120    # default when content is tiny
+    # ponytail: fixed count rather than measuring the viewport at load time
+    # (viewport().height() isn't reliably final yet on first load — the tab
+    # may not have been laid out). 50 rows comfortably fills any realistic
+    # window height; upgrade to a dynamic viewport-height calculation if a
+    # pathologically tall window ever needs more (issue #26).
+    _EMPTY_PLACEHOLDER_ROWS = 50
 
     def _set_compact_column_widths(self, dataframe):
         """Set column widths: sample the first 50 rows to pick a sensible
@@ -295,6 +300,18 @@ class EditableTableWidget(QTableWidget):
             width = min(best, self._COL_WIDTH_MAX)
             width = max(width, self._COL_WIDTH_MIN)
             hdr.resizeSection(col_idx, width)
+
+        # Cap the widget itself to the columns' total width (+ row header,
+        # frame, scrollbar) so a few narrow columns don't stretch across the
+        # whole editor with dead space after the last column (issue #29).
+        # Uncapped (large) when there's nothing to size to, e.g. no columns.
+        if len(dataframe.columns):
+            from PySide6.QtWidgets import QStyle
+            vheader_w = self.verticalHeader().width() if not self.verticalHeader().isHidden() else 0
+            scrollbar_w = QApplication.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+            self.setMaximumWidth(hdr.length() + vheader_w + 2 * self.frameWidth() + scrollbar_w)
+        else:
+            self.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX — no columns, don't constrain
 
     def keyPressEvent(self, event):
         """Cmd+Enter opens a detail popup for the current cell value."""

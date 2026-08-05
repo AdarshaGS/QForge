@@ -10,7 +10,19 @@ other.
 from dataclasses import dataclass, field
 
 import sqlparse
+from sqlparse.engine import grouping
 from sqlparse.sql import Where
+
+# sqlparse's default 10,000-token grouping-safety cap (issue #30) is too low
+# for legitimately large generated SQL (long WHERE...IN chains, reporting
+# queries). Measured cost is roughly linear, not the quadratic blowup the
+# cap seems to guard against — ~1.6s at 128k tokens, ~8.5s at 512k on a
+# 2026 laptop — and every caller of classify()/split_statements() in this
+# app (DbService._guard, ConnectionPanel._guard_write, QueryVerifier) runs
+# off the main thread, so a slower parse doesn't freeze the UI. Raised
+# generously rather than disabled — still a backstop against a genuinely
+# pathological paste (e.g. non-SQL content pasted by mistake).
+grouping.MAX_GROUPING_TOKENS = 100_000
 
 WRITE_KINDS = {
     "INSERT", "UPDATE", "DELETE",

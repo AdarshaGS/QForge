@@ -22,7 +22,8 @@ class UpdateChecker(QThread):
     """Runs a single HTTP request on a worker thread; never blocks the UI."""
 
     # emitted on main thread when a newer release is found
-    update_available = Signal(str, str)   # (tag_name e.g. "v1.2.0", html_url)
+    # (tag_name e.g. "v1.2.0", html_url, macOS .dmg asset download URL or "")
+    update_available = Signal(str, str, str)
 
     def run(self):
         try:
@@ -39,9 +40,14 @@ class UpdateChecker(QThread):
 
             tag      = data.get("tag_name", "").strip()
             html_url = data.get("html_url", "")
+            dmg_url  = next(
+                (a.get("browser_download_url", "") for a in data.get("assets", [])
+                 if a.get("name", "").endswith(".dmg")),
+                "",
+            )
 
             if tag and _vtuple(tag) > _vtuple(APP_VERSION):
-                self.update_available.emit(tag, html_url)
+                self.update_available.emit(tag, html_url, dmg_url)
 
         except Exception:
             pass   # silently ignore — no network, rate-limit, etc.
