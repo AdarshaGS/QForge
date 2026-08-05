@@ -16,18 +16,41 @@ logger = get_logger()
 _MYSQL_SYSTEM_DBS = {"information_schema", "mysql", "performance_schema", "sys"}
 
 
-def fetch_schema_snapshot(config: dict) -> dict:
+def fetch_schema_snapshot(config: dict, on_tables_ready=None) -> dict:
     """Connect using `config`, gather schema metadata, then disconnect.
 
     Returns a dict with keys: dbs, tables, columns, views, functions,
     server_version, and (mysql only, when the configured database doesn't
     exist) switched_db — the database actually selected instead.
+
+    Tables and columns — the only two things autocomplete needs (issue #16)
+    — are fetched first and handed to `on_tables_ready(tables, columns)`
+    immediately, before the remaining (autocomplete-irrelevant) dbs/views/
+    functions/server_version round-trips run. On a high-latency connection
+    those extra round-trips previously delayed autocomplete for no reason.
     """
     db = DbService()
     db.connect(config)
     try:
         result = {}
         db_type = db.db_type
+
+        try:
+            result["tables"] = db.get_tables()
+        except Exception as ex:
+            logger.debug(f"Failed to list tables: {ex}")
+            result["tables"] = []
+        try:
+            result["columns"] = db.get_all_columns()
+        except Exception as ex:
+            logger.debug(f"Failed to list columns: {ex}")
+            result["columns"] = {}
+
+        if on_tables_ready:
+            try:
+                on_tables_ready(result["tables"], result["columns"])
+            except Exception as ex:
+                logger.debug(f"schema_snapshot on_tables_ready callback failed: {ex}")
 
         try:
             if db_type == "mysql":
@@ -48,16 +71,6 @@ def fetch_schema_snapshot(config: dict) -> dict:
             logger.debug(f"Failed to list databases: {ex}")
             result["dbs"] = []
 
-        try:
-            result["tables"] = db.get_tables()
-        except Exception as ex:
-            logger.debug(f"Failed to list tables: {ex}")
-            result["tables"] = []
-        try:
-            result["columns"] = db.get_all_columns()
-        except Exception as ex:
-            logger.debug(f"Failed to list columns: {ex}")
-            result["columns"] = {}
         try:
             result["views"] = db.get_views()
         except Exception as ex:

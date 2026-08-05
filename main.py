@@ -19,6 +19,7 @@ from ui.theme_manager import ThemeManager
 from utils.logger import setup_logger, get_logger
 from utils.updater import UpdateChecker, APP_VERSION
 from utils.self_updater import UpdateInstaller, running_app_bundle_path, relaunch
+from utils.paths import app_data_dir
 from utils import environment
 
 logger = setup_logger()
@@ -31,9 +32,7 @@ def _asset_path(name: str) -> str:
     return os.path.join(base, name)
 
 
-_SESSION_FILE = os.path.join(
-    os.path.expanduser("~"), "Library", "Application Support", "QForge", "session.json"
-)
+_SESSION_FILE = os.path.join(app_data_dir(), "session.json")
 
 
 class MainWindow(QMainWindow):
@@ -58,24 +57,17 @@ class MainWindow(QMainWindow):
         # Open first connection (blocks until success or user quits)
         self._prompt_new_connection(allow_cancel_quit=True)
 
-        # Keyboard shortcuts
-        QShortcut(QKeySequence("Ctrl+T"), self).activated.connect(
-            lambda: self._current_panel() and self._current_panel().add_new_tab()
-        )
-        QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(
-            lambda: self._current_panel() and self._current_panel().show_quick_search()
-        )
+        # Keyboard shortcuts. Ctrl+T/P/R/N/Q are NOT bound here — each already
+        # has an identical-key QAction in the menu bar (_create_menu_bar,
+        # below), and a bare QShortcut plus a QAction sharing one key
+        # sequence makes Qt treat it as ambiguous. That's what was actually
+        # causing issue #25 (Ctrl+T only jumped to a new Space when pressed
+        # as a keyboard shortcut, not when the same add_new_tab() was
+        # triggered via the "+" button or the menu item) — the same
+        # duplicate-binding bug already fixed for Ctrl+W under issue #40.
+        # F5 has no menu counterpart, so it's the only one still bound here.
         QShortcut(QKeySequence("F5"), self).activated.connect(
             lambda: self._current_panel() and self._current_panel().refresh_current_view()
-        )
-        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(
-            lambda: self._current_panel() and self._current_panel().refresh_current_view()
-        )
-        QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(
-            lambda: self._prompt_new_connection()
-        )
-        QShortcut(QKeySequence("Ctrl+Q"), self).activated.connect(
-            QApplication.quit
         )
 
         self.restore_session()
@@ -344,6 +336,7 @@ class MainWindow(QMainWindow):
                 progress.close()
 
                 self._add_panel(panel)
+                panel.ensure_at_least_one_tab()
                 return
 
             except Exception as ex:
@@ -456,6 +449,7 @@ class MainWindow(QMainWindow):
         # Restore pinned tabs for all panels (persists across sessions)
         for panel in self._panels:
             panel.restore_pinned_tabs()
+            panel.ensure_at_least_one_tab()
 
         logger.info("Session restored")
 
