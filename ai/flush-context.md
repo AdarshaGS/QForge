@@ -7,112 +7,114 @@ hostnames, customer data, or unredacted sensitive SQL.
 
 ## Current handoff
 
-**Status:** On branch `fix/github-issues-batch` (single shared branch, one
-commit per GitHub issue, per standing user instruction — do not create a
-new branch or commit without being asked). Production-safety Slices 1-3,
-the app icon/branding work, and issues #14/#15(partial)/#6/#9/#22/#17/#13/#24
-described in older revisions of this file are all committed (see `git log`
-— this file no longer restates them in detail).
+**Status:** `master` is at `8086157` (merge of PR #51). **v1.1.1 is tagged,
+built, and publicly released**: https://github.com/AdarshaGS/QForge/releases/tag/v1.1.1
+(`QForge.dmg` + `SHA256SUMS.txt`, built by CI from `8086157`). The working
+tree is clean except the user's own pre-existing, unrelated
+`graphify-out/manifest.json` change, which was left untouched throughout.
 
-**Last updated:** 2026-07-27.
+**Last updated:** 2026-08-05.
 
-## Uncommitted right now (working tree)
+## Why v1.1.0/v1.1.1 originally broke (root cause, confirmed)
 
-`git status --short`:
-```
- M ui/editable_table.py   (issue #29)
- M ui/sql_tab.py           (issue #2)
- M ui/theme_manager.py     (issue #28)
-?? .claude/                (graphify bootstrap — see below)
-?? CLAUDE.md               (graphify bootstrap — see below)
-```
+Both the original `v1.1.0` and `v1.1.1` tags pointed at the **same commit**
+(`39dffd2`, the tip of the `fix/github-issues-batch` branch) — confirmed via
+`gh run view --json headSha` on both tag-triggered `Build & Release` runs.
+That commit was never on `master` at release time (`git merge-base
+--is-ancestor 39dffd2 <master-at-the-time>` → false) and had not been through
+the `Tests` workflow, which only triggers on `push: [master, main]` or
+`pull_request` — **never on a tag push**. `Build & Release` (what tagging
+actually invokes) only runs `pyinstaller --clean QForge.spec`, no test suite.
+So the tag was pushed and released before any CI had run against that exact
+code. Both releases were reverted (PRs #48, #49) and master was hard-restored
+to the exact v1.0.9 tree (commit `2a26e3e`).
 
-- **Issue #2** — Cmd+F opened the generic Find bar even when focus was on
-  the SQL result grid, instead of Quick Filter. `ui/sql_tab.py`
-  `_toggle_find_bar()` now checks `self.result_table.hasFocus()` first and
-  calls `self.toggle_filter()` instead when true. Verified offscreen by
-  stubbing `hasFocus()` (real Qt focus transfer is unreliable under
-  `QT_QPA_PLATFORM=offscreen`).
-- **Issue #28** — Light theme schema-tree text (table names) used
-  `L_TEXT2` (`#687080`, muted) instead of `L_TEXT` (`#20242C`, near-black).
-  One-line swap in `ui/theme_manager.py`'s light `QTreeWidget` block.
-  Deliberately left the dark theme and the header-row label alone (not
-  reported, different elements).
-- **Issue #29** — Result grid stretched to fill the editor width even for
-  2-column queries, leaving dead space after the last column.
-  `ui/editable_table.py`'s `_set_compact_column_widths()` now also calls
-  `setMaximumWidth()` sized to the actual column-width sum (+ row header +
-  frame + scrollbar), relying on the existing `Expanding` size policy to
-  fill-then-cap. **Caveat:** verified the width computation itself
-  (narrow→254px, wide→8774px, no-columns→uncapped) but could NOT reliably
-  verify the live "still fills the viewport for wide results" half in this
-  sandbox — `QT_QPA_PLATFORM=offscreen` doesn't propagate size hints
-  correctly (same limitation hit testing issue #2's focus transfer). A
-  real on-screen check (narrow query vs. wide query) is recommended before
-  calling this done.
-- **`.claude/` / `CLAUDE.md`** — not my edits; appeared automatically when
-  the graphify skill bootstrapped itself (see below). `.claude/settings.json`
-  is graphify's shared PreToolUse hook config (safe to commit if wanted);
-  `.claude/settings.local.json` is a local permissions allowlist
-  (conventionally NOT committed). Left untracked for the user's own call.
+## What happened this session
 
-Issue #15 (new SQL tab jumping to a different macOS Space in fullscreen)
-remains **explicitly deferred** — user said "forget about this issue, i
-will check in future" after root-causing it to `EditableTableWidget`
-(QTableWidget) inside a `QSplitter` in native fullscreen; a `QTableView`
-experiment strongly suggested a fix but needs a full rewrite of
-`EditableTableWidget`, out of scope unless the user revisits it.
+1. Diagnosed the above by inspecting `gh run list`/`gh run view` history,
+   `git merge-base`, and the two workflow YAMLs — no guessing.
+2. Built the exact `39dffd2` snapshot locally (`build.sh` in a scratch git
+   worktree, isolated `$HOME` so it never touched the user's real
+   `~/Library/Application Support/QForge`) and confirmed it launches without
+   crashing — ruled out a fatal frozen-only startup bug.
+3. Reconstructed the batch on `master` via `git revert` of the two revert
+   commits (`2fe0706`, `89d54d3`) rather than cherry-picking, so master's
+   independent later fixes (dialog parenting, `sql_completer.py`'s
+   `WindowDoesNotAcceptFocus` fix — both already on master, unrelated to this
+   batch) merged cleanly instead of being clobbered.
+4. Found and fixed two real bugs while re-auditing before re-shipping:
+   - `ui/connection_panel.py` `_switch_database()` committed
+     `self.config["database"]`/the pill label to the new database **before**
+     confirming `select_db()`/reconnect succeeded. Verified directly against
+     a local MySQL server: a failed `select_db()` leaves the live connection
+     on the *previous* database while the UI would have already claimed the
+     new one — every query would then silently run against the wrong
+     database. Fixed to commit only after confirmed success.
+   - `utils/credential_store.py` `set_password()`'s stale-Keychain-item
+     recovery unconditionally force-deleted and retried on **any** failure,
+     not just the specific `errSecInvalidOwnerEdit` signature it was written
+     for — risking destroying a valid password on an unrelated failure (locked
+     keychain, denied auth prompt). Gated on that signature now.
+   - Dropped `.claude/settings.json`/`CLAUDE.md` that PR #45 had incidentally
+     picked up from a graphify bootstrap in that old session — unrelated to
+     the product change, not present on current master.
+   - Bumped `APP_VERSION` to `1.1.1` (was stuck at `1.0.6` in source despite
+     `v1.0.9` being the actual last release — pre-existing drift, now
+     corrected as part of this bump).
+5. **This time, went through the process the root-cause fix actually
+   requires**: pushed a branch, opened PR #51, waited for `Tests` to pass on
+   the PR, merged to master, waited for `Tests` to pass on master's own push,
+   *then* tagged `v1.1.1` from that verified master commit. Confirmed
+   `Build & Release` succeeded and the GitHub Release is live.
 
-## graphify codegraph (set up this session, live now)
+## Verified this session
 
-A codegraph now exists at `graphify-out/graph.json` (gitignored, derivable)
-for the ticket-to-fix workflow: 998 nodes / 1,764 edges / 70 labeled
-communities, built from `main.py`, `query_analyzer.py`, `ui/`, `services/`,
-`utils/`, `tests/`, `ai/load-context.md`, `ai/ui-design.md` (deliberately
-excludes `ai/flush-context.md` — this file — since it's single-session/
-replaced-each-time, not stable content worth graph-indexing).
+- `pytest`: 43/43 passing (both before and after the hardening fixes).
+- `py_compile` on every touched file.
+- Real `build.sh` build of both the original `39dffd2` snapshot and the
+  final hardened `v1.1.1` commit; both launch cleanly as packaged `.app`s
+  with an isolated `$HOME`.
+- Scripted, non-GUI verification against a real local MySQL 8.0 server
+  (throwaway `qforge_repro_a`/`qforge_repro_b` databases, dropped after):
+  `select_db()` to an existing database succeeds silently; `select_db()` to a
+  nonexistent database raises `OperationalError` **and** leaves the
+  connection on the previously-selected database — confirming the exact
+  mismatch scenario the `_switch_database` fix closes.
+- CI (`Tests`) green on the PR and on master's merge commit; `Build &
+  Release` green on the `v1.1.1` tag; release published with
+  `QForge.dmg` + `SHA256SUMS.txt`.
 
-- `graphify hook install` (post-commit + post-checkout) is installed and
-  fires automatically on every commit — AST-only re-extraction, no LLM
-  cost, confirmed firing on this session's commits.
-- `graphify claude install` already ran (via the skill's own bootstrap,
-  not manually) — wrote the `## graphify` section in the new project-root
-  `CLAUDE.md` above.
-- `ai/load-context.md`'s "before changing code" checklist now has a step 0
-  pointing at `graphify query/path/explain` before grepping.
-- **Real, mixed results this session** (see conversation, not restated
-  here): ~10-fold less useful than the abstract 233x benchmark suggested
-  for narrow, single-file bugs (issue #13: 42,837 vs 47,661 tokens, only
-  ~10% less, because free-text queries needed several reformulations
-  before matching the graph's vocabulary). Works best for broad
-  "where does X live" orientation, not for Qt event-wiring bugs
-  (`QShortcut`/`keyPressEvent`) which don't produce distinctive graph
-  symbols — issues #2, #24, #29 all fell back to grep after 1-3
-  unproductive `graphify query` attempts, per the documented fallback rule.
-- `graphify benchmark` and `graphify explain "dangerous-query guard"` /
-  `"read only mode"` both confirmed working (doc→code `rationale_for`
-  edges resolve correctly to `query_classifier.classify()`,
-  `db_service._guard()`, `connection_panel._guard_write()`).
+## Known, accepted limitations / not done this session
+
+- **Not live-click-verified in the packaged `.app`**: the `Ctrl+T`/`P`/`N`/`Q`
+  `QShortcut` removal in `main.py` (relies on the menu bar's own `QAction`
+  shortcuts instead). Kept as-is — it matches the same
+  full-screen-Space-switch bug family as two other fixes already
+  independently present on master and trusted — but actual keystroke testing
+  was skipped this session because the developer's real, production-connected
+  QForge instance was open at the time and `System Events` keystroke
+  automation cannot be reliably scoped away from whatever window is
+  frontmost. Recommend a quick manual check after installing v1.1.1.
+- No full manual click-through against a live MySQL/PostgreSQL server beyond
+  the scripted `select_db()` check above (e.g. the SSH-tunnel paths, the new
+  Database menu's create/drop flows, the self-update flow end-to-end against
+  a real newer release).
+- Production-safety Slices 4-6 from `ai/load-context.md` (transaction
+  controls, query limits/timeout/cancellation, audit trail) — none started;
+  unrelated to this session's scope.
+- Broader product roadmap Tier 2 items (per prior sessions' plans) — Windows/
+  Linux path verification, `pytest-qt` OS matrix in CI — still open;
+  `CROSS_PLATFORM_SUPPORTED` in `build-release.yml` is still `false`.
 
 ## Exact next step
 
-1. Review and commit the three uncommitted fixes above (issues #2, #28,
-   #29) — `git status --short` / `git diff` first; user commits/pushes
-   manually unless they explicitly ask otherwise (they have both ways this
-   session: sometimes asked for an explicit commit, sometimes not — always
-   ask or wait to be told, don't assume).
-2. Do the real on-screen check flagged for issue #29 (narrow vs. wide
-   query result grid) before considering it fully verified.
-3. Decide whether to commit `.claude/settings.json` + `CLAUDE.md` (the
-   graphify integration) — `.claude/settings.local.json` should stay
-   untracked regardless.
-4. Remaining original backlog issues, not yet touched: **#10** (light mode
-   contrast — may partially overlap with #28, check what's left), **#11**
-   (zooming issue in SQL editor), **#12** (error display issue in SQL
-   editor).
-5. Still-open, older items: the `HOMEBREW_TAP_TOKEN` secret lacks push
-   permission to `homebrew-qforge` (403 in CI, flagged earlier this
-   session's history — needs the user to regenerate/rescope the PAT);
-   production-safety Slices 4-6 (transaction controls, query limits/
-   timeout/cancellation, audit trail) per `ai/load-context.md` — none
-   started.
+1. User installs `v1.1.1` from
+   https://github.com/AdarshaGS/QForge/releases/tag/v1.1.1 and uses it
+   day-to-day; report back anything that looks off, especially the
+   MySQL fast-switch path and the four shortcuts noted above.
+2. If a future release needs to skip the branch/PR ceremony for a trivial
+   change, at minimum tag from a commit that is actually on `master` and has
+   an actual green `Tests` run against it — the process gap that caused the
+   original break (tagging an untested feature-branch tip directly) is now
+   avoided by habit, not by any new CI enforcement; nothing currently stops
+   someone from doing it again.
