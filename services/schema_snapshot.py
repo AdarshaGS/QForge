@@ -9,6 +9,7 @@ a real bug where a MySQL version string appeared in the "Tables" list and
 apply the result to your live connection/state on the main thread.
 """
 from services.db_service import DbService
+from utils import schema_cache
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -22,6 +23,11 @@ def fetch_schema_snapshot(config: dict, on_tables_ready=None) -> dict:
     Returns a dict with keys: dbs, tables, columns, views, functions,
     server_version, and (mysql only, when the configured database doesn't
     exist) switched_db — the database actually selected instead.
+
+    On success, also persists the structural subset of this result via
+    utils.schema_cache (issue #71), keyed by config["id"] + database, so the
+    next time this connection/database is opened the caller can populate the
+    UI from disk before this (network) fetch completes.
 
     Tables and columns — the only two things autocomplete needs (issue #16)
     — are fetched first and handed to `on_tables_ready(tables, columns)`
@@ -86,6 +92,9 @@ def fetch_schema_snapshot(config: dict, on_tables_ready=None) -> dict:
         except Exception as ex:
             logger.debug(f"Failed to get server version: {ex}")
             result["server_version"] = ""
+
+        db_key = result.get("switched_db", config.get("database", ""))
+        schema_cache.save(config.get("id", ""), db_key, result)
 
         return result
     finally:

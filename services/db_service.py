@@ -2,6 +2,7 @@ import pymysql
 import pandas as pd
 import sqlite3
 from utils.logger import get_logger
+from utils import schema_cache
 from services import query_classifier
 
 logger = get_logger()
@@ -525,14 +526,37 @@ class DbService:
         self._guard(query)
 
         try:
-            return self._execute_update_raw(query)
+            result = self._execute_update_raw(query)
         except Exception as ex:
             if self._is_connection_error(ex):
                 logger.warning(f"Connection lost during update, reconnecting... ({ex})")
                 self._reconnect()
-                return self._execute_update_raw(query)
-            logger.error(f"Update execution error: {str(ex)}")
-            raise
+                result = self._execute_update_raw(query)
+            else:
+                logger.error(f"Update execution error: {str(ex)}")
+                raise
+
+        self._invalidate_schema_cache_if_ddl(query)
+        return result
+
+    def _invalidate_schema_cache_if_ddl(self, query: str):
+        """Issue #72: every write in the app funnels through here, so this
+        is the single place that can catch a successful schema-changing
+        statement (raw SQL, the Create/Alter Table dialogs, etc.) and drop
+        the now-stale on-disk schema cache entry."""
+        if not self._config:
+            return
+        try:
+            stmts = query_classifier.split_statements(query)
+            changed = any(
+                query_classifier.classify(s).kind in query_classifier.SCHEMA_CHANGING_KINDS
+                for s in stmts
+            )
+            if changed:
+                schema_cache.invalidate(
+                    self._config.get("id", ""), self._config.get("database", ""))
+        except Exception as ex:
+            logger.debug(f"Schema-cache invalidation check failed: {ex}")
 
     def _execute_update_raw(self, query):
         """Internal: run DML without reconnect logic."""

@@ -37,6 +37,7 @@ from ui.theme_manager import ThemeManager
 from ui import query_guard_dialog
 from utils.logger import get_logger
 from utils import environment
+from utils import schema_cache
 from utils.df_export import export_dataframe, _to_sql_inserts
 from services import query_classifier
 
@@ -125,7 +126,7 @@ class ConnectionPanel(QWidget):
     _q_errored    = Signal(object, str,    float)  # (tab, message, elapsed)
     _q_cancelled  = Signal(object)                 # (tab,)
     # ── Public observability signals ─────────────────────────────────────
-    # 'idle' / 'running' / 'disconnected'
+    # 'idle' / 'running' / 'disconnected' / 'connecting'
     health_changed = Signal(str)
     # brief human-readable message (e.g. "Reconnected to MySQL")
     reconnected    = Signal(str)
@@ -133,13 +134,22 @@ class ConnectionPanel(QWidget):
     _schema_done   = Signal(object)   # (schema_data dict)
     _schema_error  = Signal(str)      # error message
     _schema_fast   = Signal(list, dict)   # (tables, columns) — arrives ahead of _schema_done
+    # Bridge signal for the optimistic-open background connect (issue: lag on
+    # previously-visited remote/SSH connections despite a warm schema cache)
+    _bg_connect_done = Signal(str)    # error message, "" on success
+
     def __init__(self, config: dict, db_service: DbService,
-                 query_history: QueryHistory, parent=None):
+                 query_history: QueryHistory, parent=None, already_connected: bool = True):
         super().__init__(parent)
 
         self.config = config
         self.db_service = db_service
         self.query_history = query_history
+        # True while db_service.connect() is still running on a background
+        # thread (see _connect_in_background). Cached schema is shown
+        # immediately regardless; write/reconnect actions are held off
+        # until this clears, since they'd otherwise race the connect call.
+        self._connecting = not already_connected
 
         self.all_tables = []
         self.all_table_items = {}
@@ -157,10 +167,15 @@ class ConnectionPanel(QWidget):
         self._schema_done.connect(self._on_schema_loaded, Qt.QueuedConnection)
         self._schema_error.connect(self._on_schema_error, Qt.QueuedConnection)
         self._schema_fast.connect(self._on_schema_tables_ready, Qt.QueuedConnection)
+        self._bg_connect_done.connect(self._on_background_connect_done, Qt.QueuedConnection)
         self._column_cache: dict = {}   # {table: [col, ...]} for autocomplete
 
         self._build_ui()
         self.load_schema()
+
+        if self._connecting:
+            self.health_changed.emit('connecting')
+            self._connect_in_background()
 
         # ── Periodic health check (every 30 s) ──────────────────────────
         from PySide6.QtCore import QTimer
@@ -407,8 +422,12 @@ class ConnectionPanel(QWidget):
     # ─── Schema loading ───────────────────────────────────────────────────────
 
     def load_schema(self):
-        # Don't attempt schema load if not connected
-        if not self.db_service or not self.db_service.connection:
+        # Don't attempt schema load if not connected — except while an
+        # optimistic background connect is in flight (self._connecting):
+        # the live fetch below uses its own dedicated connection anyway
+        # (services/schema_snapshot.py), so it doesn't need self.db_service
+        # to be live, and the cache check further down still applies.
+        if not self.db_service or (not self.db_service.connection and not self._connecting):
             self.schema_tree.clear()
             self.all_tables.clear()
             self.all_table_items.clear()
@@ -421,15 +440,37 @@ class ConnectionPanel(QWidget):
         self.all_table_items.clear()
         self.all_schema_items.clear()
 
-        # Show a loading indicator
-        loading_item = QTreeWidgetItem(["Loading…"])
-        self.schema_tree.addTopLevelItem(loading_item)
+        # Issue #71: a previously visited connection/database populates the
+        # tree and autocomplete instantly from disk, no network round-trip.
+        # The live fetch below still runs and silently refreshes it.
+        cached = schema_cache.load(
+            self.config.get("id", ""), self.config.get("database", ""))
+        if not self._apply_cached_schema(cached):
+            loading_item = QTreeWidgetItem(["Loading…"])
+            self.schema_tree.addTopLevelItem(loading_item)
 
-        # Fetch the schema on a daemon thread using a *dedicated* connection
-        # (see services/schema_snapshot.py) — never touches self.db_service,
-        # which the main thread may be using concurrently (query tabs, table
-        # views). Results come back via _schema_done.
-        conf = dict(self.config)
+        self._spawn_schema_fetch(dict(self.config))
+
+    def _apply_cached_schema(self, cached: dict | None) -> bool:
+        """Populate the tree/autocomplete from a cached snapshot (issue
+        #71) immediately; True on a hit. When the cache is past its
+        freshness window (issue #72), flags it in the tree — the marker
+        disappears on its own the moment the live background refresh
+        (_on_schema_loaded) rebuilds the tree with current data."""
+        if not cached:
+            return False
+        self._on_schema_tables_ready(cached.get("tables", []), cached.get("columns", {}))
+        self._on_schema_loaded(cached)
+        if schema_cache.is_stale(cached):
+            self.schema_tree.insertTopLevelItem(
+                0, QTreeWidgetItem(["⏱ Cached schema (stale) — refreshing…"]))
+        return True
+
+    def _spawn_schema_fetch(self, conf: dict):
+        """Fetch schema on a daemon thread using a *dedicated* connection
+        (see services/schema_snapshot.py) — never touches self.db_service,
+        which the main thread may be using concurrently (query tabs, table
+        views). Results come back via _schema_done/_schema_fast."""
         sig_done  = self._schema_done
         sig_error = self._schema_error
         sig_fast  = self._schema_fast
@@ -445,8 +486,41 @@ class ConnectionPanel(QWidget):
                     return  # connection not ready yet — no error shown
                 sig_error.emit(msg)
 
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _connect_in_background(self):
+        """Optimistic open (previously-visited remote/SSH connection with a
+        warm schema cache, see main.py): the panel is already showing
+        cached schema, so run the real db_service.connect() off the main
+        thread instead of blocking behind a modal dialog. Only this thread
+        touches self.db_service until _on_background_connect_done fires —
+        _switch_database/_do_reconnect refuse to run concurrently with it
+        (self._connecting guard)."""
+        conf = dict(self.config)
+        sig_done = self._bg_connect_done
+
+        def _worker():
+            try:
+                self.db_service.connect(conf)
+                sig_done.emit("")
+            except Exception as ex:
+                sig_done.emit(str(ex) or "Connection failed")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_background_connect_done(self, error: str):
+        self._connecting = False
+        self._update_pill_label()
+        if error:
+            self.health_changed.emit('disconnected')
+            QMessageBox.critical(self, "Connection Failed", error)
+        else:
+            self.health_changed.emit('idle')
+            # Now that self.db_service is genuinely live, re-run the schema
+            # fetch so the tree/autocomplete reflect the real connection
+            # (e.g. if the configured database didn't exist and MySQL fell
+            # back to another one — see fetch_schema_snapshot's switched_db).
+            self.load_schema()
 
     def _on_schema_tables_ready(self, tables: list, columns: dict):
         """Push tables/columns to autocomplete as soon as they're fetched —
@@ -565,7 +639,11 @@ class ConnectionPanel(QWidget):
         current_db = self.config.get("database", "") or "(no database)"
         suffix = "  ⌘K" if self._available_dbs else ""
         self.db_pill.setText(f"  {current_db}{suffix}")
-        self.db_pill.setEnabled(bool(self._available_dbs))
+        # Kept disabled while the background connect from an optimistic
+        # open is still in flight, even though cached "dbs" may already be
+        # populated — switching would race db_service.connect() (see
+        # _connect_in_background).
+        self.db_pill.setEnabled(bool(self._available_dbs) and not self._connecting)
 
     def show_db_switcher(self):
         """Open the Cmd+K database switcher dialog."""
@@ -581,6 +659,11 @@ class ConnectionPanel(QWidget):
 
     def _switch_database(self, new_db: str):
         if new_db == self.config.get("database", ""):
+            return
+        if self._connecting:
+            QMessageBox.information(
+                self, "Connecting…",
+                "Still connecting to the database — try switching in a moment.")
             return
 
         # Show spinner in schema tree
@@ -623,23 +706,11 @@ class ConnectionPanel(QWidget):
         self.config["database"] = new_db
         self._update_pill_label()
 
-        conf = dict(self.config)
-        sig_done  = self._schema_done
-        sig_error = self._schema_error
-        sig_fast  = self._schema_fast
+        # Issue #71: populate instantly from disk if this database was
+        # visited before; the background fetch below still refreshes it.
+        self._apply_cached_schema(schema_cache.load(self.config.get("id", ""), new_db))
 
-        def _load():
-            try:
-                sig_done.emit(fetch_schema_snapshot(
-                    conf, on_tables_ready=lambda t, c: sig_fast.emit(t, c)))
-            except Exception as ex:
-                msg = str(ex)
-                if msg in ("(0, '')", "0", "") or "not connected" in msg.lower():
-                    return
-                sig_error.emit(msg)
-
-        t = threading.Thread(target=_load, daemon=True)
-        t.start()
+        self._spawn_schema_fetch(dict(self.config))
 
     # ─── Database management (create/refresh/drop) ────────────────────────────
 
@@ -1106,6 +1177,11 @@ class ConnectionPanel(QWidget):
         """Execute the SQL in `tab` on a background thread; Cancel actually stops it."""
         query = tab.get_query().strip()
         if not query:
+            return
+        if self._connecting:
+            QMessageBox.information(
+                self, "Connecting…",
+                "Still connecting to the database — try again in a moment.")
             return
 
         # Format on run if user has the toggle active
@@ -1743,6 +1819,11 @@ class ConnectionPanel(QWidget):
 
     def _do_reconnect(self):
         """Manually reconnect to the database and reload the schema."""
+        if self._connecting:
+            QMessageBox.information(
+                self, "Connecting…",
+                "Already connecting in the background — please wait.")
+            return
         reconnected_ok = False
         try:
             self._reconnect_btn.setEnabled(False)
@@ -1770,7 +1851,6 @@ class ConnectionPanel(QWidget):
             db_type = self.config.get('type', 'DB').upper()
             self.reconnected.emit(f"Reconnected to {db_type} — {self.label}")
         except Exception as ex:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Reconnect Failed", str(ex))
             self.health_changed.emit('disconnected')
         finally:

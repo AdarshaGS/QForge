@@ -29,6 +29,11 @@ WRITE_KINDS = {
     "CREATE", "DROP", "ALTER", "TRUNCATE", "RENAME", "GRANT", "REVOKE",
 }
 DESTRUCTIVE_DDL_KINDS = {"DROP", "TRUNCATE"}
+# Statements that change table/column structure — used to invalidate the
+# on-disk schema cache (issue #72). TRUNCATE/GRANT/REVOKE are writes but
+# don't change what get_tables()/get_columns() would return, so they're
+# deliberately excluded.
+SCHEMA_CHANGING_KINDS = {"CREATE", "DROP", "ALTER", "RENAME"}
 WHERE_APPLICABLE_KINDS = {"UPDATE", "DELETE"}
 
 # sqlparse's get_type() reports UNKNOWN for these; the real keyword has to
