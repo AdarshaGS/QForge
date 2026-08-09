@@ -21,6 +21,7 @@ from utils.updater import UpdateChecker, APP_VERSION
 from utils.self_updater import UpdateInstaller, running_app_bundle_path, relaunch
 from utils.paths import app_data_dir
 from utils import environment
+from utils import schema_cache
 
 logger = setup_logger()
 
@@ -30,6 +31,21 @@ def _asset_path(name: str) -> str:
     by PyInstaller (which extracts/collects data files next to `sys._MEIPASS`)."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, name)
+
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
+
+
+def _is_remote_connection(config: dict) -> bool:
+    """True for connections where establishing db_service.connect() is slow
+    enough (SSH tunnel setup, WAN round-trip) that blocking the UI behind a
+    modal "Connecting…" dialog is actually felt — as opposed to local MySQL/
+    Postgres/SQLite, which connect in well under human-perceptible time."""
+    if config.get("type") == "sqlite":
+        return False
+    if config.get("ssh_tunnel", {}).get("enabled"):
+        return True
+    return config.get("host", "") not in _LOOPBACK_HOSTS
 
 
 _SESSION_FILE = os.path.join(app_data_dir(), "session.json")
@@ -306,34 +322,58 @@ class MainWindow(QMainWindow):
             if not config:
                 continue
 
+            # A previously-visited remote/SSH connection with a warm schema
+            # cache: skip the blocking "Connecting…" modal entirely and open
+            # the panel straight away showing cached schema/autocomplete —
+            # db_service.connect() (TCP + auth + SSH tunnel, the actual
+            # source of the lag) runs on a background thread inside the
+            # panel itself instead (ConnectionPanel._connect_in_background).
+            # Local MySQL/Postgres/SQLite connect fast enough that this
+            # wouldn't be felt, so they keep the simpler blocking path.
+            optimistic = (
+                _is_remote_connection(config)
+                and schema_cache.load(config.get("id", ""), config.get("database", "")) is not None
+            )
+
             try:
-                from PySide6.QtCore import QCoreApplication
-                progress = QProgressDialog("Connecting…", None, 0, 0, self)
-                progress.setWindowTitle("Connecting")
-                progress.setWindowModality(Qt.WindowModal)
-                progress.setCancelButton(None)
-                progress.setMinimumDuration(0)
-                progress.show()
-                QCoreApplication.processEvents()
-
                 db_service = DbService()
-                db_service.connect(config)
 
-                progress.setLabelText("Loading schema…")
-                QCoreApplication.processEvents()
+                if optimistic:
+                    panel = ConnectionPanel(
+                        config=config,
+                        db_service=db_service,
+                        query_history=self.query_history,
+                        parent=self,
+                        already_connected=False,
+                    )
+                else:
+                    from PySide6.QtCore import QCoreApplication
+                    progress = QProgressDialog("Connecting…", None, 0, 0, self)
+                    progress.setWindowTitle("Connecting")
+                    progress.setWindowModality(Qt.WindowModal)
+                    progress.setCancelButton(None)
+                    progress.setMinimumDuration(0)
+                    progress.show()
+                    QCoreApplication.processEvents()
 
-                panel = ConnectionPanel(
-                    config=config,
-                    db_service=db_service,
-                    query_history=self.query_history,
-                    parent=self
-                )
+                    db_service.connect(config)
+
+                    progress.setLabelText("Loading schema…")
+                    QCoreApplication.processEvents()
+
+                    panel = ConnectionPanel(
+                        config=config,
+                        db_service=db_service,
+                        query_history=self.query_history,
+                        parent=self,
+                    )
+                    progress.close()
+
                 panel.update_theme(self.current_theme == "dark")
                 # Server version arrives asynchronously via the schema-load
                 # result (panel.label_changed) rather than being fetched here —
                 # fetching it on this thread would race the schema-loading
                 # background thread over the same shared connection.
-                progress.close()
 
                 self._add_panel(panel)
                 panel.ensure_at_least_one_tab()
@@ -455,11 +495,12 @@ class MainWindow(QMainWindow):
 
     # ─── Connection health indicator ───────────────────────────────────────────────
 
-    _HEALTH_DOT = {'idle': '● ', 'running': '● ', 'disconnected': '● '}
+    _HEALTH_DOT = {'idle': '● ', 'running': '● ', 'disconnected': '● ', 'connecting': '● '}
     _HEALTH_COLOR = {
         'idle':         '#30d158',  # green
         'running':      '#ff9f0a',  # amber
         'disconnected': '#ff453a',  # red
+        'connecting':   '#0a84ff',  # blue — optimistic open, background connect in flight
     }
 
     def _tab_text_color(self, panel: ConnectionPanel, status: str) -> str:

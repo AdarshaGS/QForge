@@ -8,6 +8,7 @@ must never touch a caller-supplied "primary" DbService's connection.
 """
 from services.db_service import DbService
 from services.schema_snapshot import fetch_schema_snapshot
+from utils import schema_cache
 
 
 def _make_sqlite_config(tmp_path, name="test"):
@@ -70,3 +71,31 @@ def test_fetch_schema_snapshot_disconnects_its_own_connection(tmp_path):
     # here should leak a live connection back to the caller.
     assert isinstance(snapshot, dict)
     assert "tables" in snapshot
+
+
+def test_fetch_schema_snapshot_caches_result_for_next_open(tmp_path, monkeypatch):
+    """Issue #71: a successful fetch is cached so re-opening the same
+    connection/database can populate the UI without hitting the network."""
+    monkeypatch.setattr(schema_cache, "_FILE", str(tmp_path / "cache.json"))
+    config = _make_sqlite_config(tmp_path)
+    config["id"] = "conn-71"
+    setup = DbService()
+    setup.connect(config)
+    setup.execute_update("CREATE TABLE widgets (id INTEGER PRIMARY KEY)")
+    setup.disconnect()
+
+    fetch_schema_snapshot(config)
+
+    cached = schema_cache.load("conn-71", config["database"])
+    assert cached["tables"] == ["widgets"]
+    assert "SQLite" in cached["server_version"]
+
+
+def test_fetch_schema_snapshot_without_id_does_not_write_cache(tmp_path, monkeypatch):
+    cache_file = tmp_path / "cache.json"
+    monkeypatch.setattr(schema_cache, "_FILE", str(cache_file))
+    config = _make_sqlite_config(tmp_path)  # no "id" key, mirrors older callers
+
+    fetch_schema_snapshot(config)
+
+    assert not cache_file.exists()
