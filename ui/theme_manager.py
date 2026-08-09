@@ -82,6 +82,16 @@ class ThemeManager:
     ACCENT_HOVER = D_BLUE_HOVER
     ACCENT_PRESS = D_BLUE_PRESS
 
+    @staticmethod
+    def _alpha(hex_color: str, alpha_hex: str) -> str:
+        """*hex_color* ("#RRGGBB") at *alpha_hex* opacity ("00"-"ff"), as a Qt
+        stylesheet color. Qt parses 8-digit hex as #AARRGGBB (alpha first),
+        not CSS3's #RRGGBBAA (alpha last) — appending the alpha suffix
+        directly (`f"{hex_color}{alpha_hex}"`) silently shifts every channel
+        instead of blending in transparency, e.g. blue-at-14%-opacity
+        renders as solid green. This builds the alpha-first form Qt expects."""
+        return f"#{alpha_hex}{hex_color.lstrip('#')}"
+
     @classmethod
     def env_colors(cls, env: str, is_dark: bool) -> tuple:
         """(background, text, border) hex colors for a normalized environment
@@ -119,6 +129,31 @@ class ThemeManager:
             painter.setPen(pen)
             painter.drawLine(4, 4, 12, 12)
             painter.drawLine(12, 4, 4, 12)
+            painter.end()
+            pixmap.save(path, "PNG")
+        return path.replace(os.sep, "/")
+
+    @staticmethod
+    def env_dot_icon_path(color_hex: str) -> str:
+        """Render a small filled-circle indicator in *color_hex*, cached by
+        color like `_close_icon_path`. Used in place of tinting a whole row's
+        text/background for environment coloring (issue #56 — colored
+        backgrounds read as visual noise in a long connection list)."""
+        import os
+        import tempfile
+        from PySide6.QtCore import Qt as _Qt
+        from PySide6.QtGui import QColor, QPainter, QBrush, QPixmap
+
+        key = color_hex.lstrip("#").upper()
+        path = os.path.join(tempfile.gettempdir(), f"qforge_env_dot_{key}.png")
+        if not os.path.exists(path):
+            pixmap = QPixmap(12, 12)
+            pixmap.fill(_Qt.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(_Qt.NoPen)
+            painter.setBrush(QBrush(QColor(color_hex)))
+            painter.drawEllipse(2, 2, 8, 8)
             painter.end()
             pixmap.save(path, "PNG")
         return path.replace(os.sep, "/")
@@ -185,7 +220,7 @@ QTreeWidget::item {{
     border-radius: 4px;
 }}
 QTreeWidget::item:hover  {{ background: {HOVER}; }}
-QTreeWidget::item:selected {{ background: {A}22; color: {A}; }}
+QTreeWidget::item:selected {{ background: {ThemeManager._alpha(A, "22")}; color: {A}; }}
 QTreeWidget QHeaderView::section {{
     background: {SIDEBAR};
     color: {TEXT3};
@@ -229,7 +264,7 @@ QTabBar::close-button {{
     image: url("{CLOSE_ICON}");
 }}
 QTabBar::close-button:hover {{
-    background: {DANGER}33;
+    background: {ThemeManager._alpha(DANGER, "33")};
     border-radius: 3px;
     image: url("{CLOSE_ICON_HOVER}");
 }}
@@ -290,17 +325,17 @@ QPushButton:disabled {{ background: {RAISED}; color: {TEXT3}; }}
 QPushButton[flat="true"] {{
     background: transparent;
     color: {A};
-    border: 1px solid {A}66;
+    border: 1px solid {ThemeManager._alpha(A, "66")};
 }}
-QPushButton[flat="true"]:hover {{ background: {A}22; }}
+QPushButton[flat="true"]:hover {{ background: {ThemeManager._alpha(A, "22")}; }}
 /* destructive — explicit danger treatment, never primary blue */
 QPushButton[danger="true"] {{
     background: transparent;
     color: {DANGER};
-    border: 1px solid {DANGER}88;
+    border: 1px solid {ThemeManager._alpha(DANGER, "88")};
 }}
-QPushButton[danger="true"]:hover {{ background: {DANGER}22; border-color: {DANGER}; }}
-QPushButton[danger="true"]:pressed {{ background: {DANGER}33; }}
+QPushButton[danger="true"]:hover {{ background: {ThemeManager._alpha(DANGER, "22")}; border-color: {DANGER}; }}
+QPushButton[danger="true"]:pressed {{ background: {ThemeManager._alpha(DANGER, "33")}; }}
 
 /* ── Combo box ──────────────────────────────────────────────────── */
 QComboBox {{
@@ -455,7 +490,7 @@ QTreeWidget {{
 }}
 QTreeWidget::item {{ height: 24px; padding-left: 2px; border-radius: 4px; }}
 QTreeWidget::item:hover {{ background: {HOVER}; }}
-QTreeWidget::item:selected {{ background: {A}22; color: {A}; }}
+QTreeWidget::item:selected {{ background: {ThemeManager._alpha(A, "22")}; color: {A}; }}
 QTreeWidget QHeaderView::section {{
     background: {SIDEBAR}; color: {TEXT3};
     font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
@@ -481,7 +516,7 @@ QTabBar::close-button {{
     image: url("{CLOSE_ICON}");
 }}
 QTabBar::close-button:hover {{
-    background: {DANGER}22;
+    background: {ThemeManager._alpha(DANGER, "22")};
     border-radius: 3px;
     image: url("{CLOSE_ICON_HOVER}");
 }}
@@ -516,14 +551,14 @@ QPushButton:hover {{ background: {AH}; }}
 QPushButton:pressed {{ background: {AP}; }}
 QPushButton:disabled {{ background: {HOVER}; color: {TEXT3}; }}
 QPushButton[flat="true"] {{
-    background: transparent; color: {A}; border: 1px solid {A}66;
+    background: transparent; color: {A}; border: 1px solid {ThemeManager._alpha(A, "66")};
 }}
-QPushButton[flat="true"]:hover {{ background: {A}1a; }}
+QPushButton[flat="true"]:hover {{ background: {ThemeManager._alpha(A, "1a")}; }}
 QPushButton[danger="true"] {{
-    background: transparent; color: {DANGER}; border: 1px solid {DANGER}88;
+    background: transparent; color: {DANGER}; border: 1px solid {ThemeManager._alpha(DANGER, "88")};
 }}
-QPushButton[danger="true"]:hover {{ background: {DANGER}1a; border-color: {DANGER}; }}
-QPushButton[danger="true"]:pressed {{ background: {DANGER}33; }}
+QPushButton[danger="true"]:hover {{ background: {ThemeManager._alpha(DANGER, "1a")}; border-color: {DANGER}; }}
+QPushButton[danger="true"]:pressed {{ background: {ThemeManager._alpha(DANGER, "33")}; }}
 
 QComboBox {{
     background: {RAISED}; color: {TEXT};

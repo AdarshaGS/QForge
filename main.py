@@ -613,9 +613,9 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        act = file_menu.addAction("Export Data…")
+        act = file_menu.addAction("Export Database…")
         act.setShortcut("Ctrl+E")
-        act.triggered.connect(self._export_current_data)
+        act.triggered.connect(self._export_database)
 
         act = file_menu.addAction("Import Data…")
         act.setShortcut("Ctrl+Shift+E")
@@ -756,17 +756,11 @@ class MainWindow(QMainWindow):
 
     # ─── File operations ─────────────────────────────────────────────────────
 
-    def _export_current_data(self):
+    def _export_database(self):
         panel = self._current_panel()
         if not panel:
             return
-        from ui.sql_tab import SqlTab
-        w = panel.tabs.currentWidget()
-        if isinstance(w, SqlTab) and w.current_df is not None:
-            w.export_data()
-        else:
-            QMessageBox.information(self, "Export",
-                                    "Open a query tab with results to export.")
+        panel.export_database()
 
     def _import_data(self):
         panel = self._current_panel()
@@ -811,6 +805,12 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     logger.info("Starting QForge")
     app = QApplication(sys.argv)
+    # Force Fusion so every widget is drawn from our stylesheet/palette alone
+    # (issue #52): native styles (QMacStyle in particular) paint some chrome
+    # — e.g. QTabBar's own background — from the live OS theme regardless of
+    # our QSS, which is why two machines on the same version and Dark Mode
+    # setting rendered different tab colors depending on macOS version.
+    app.setStyle("Fusion")
     app.setWindowIcon(QIcon(_asset_path("logo.png")))
     window = MainWindow()
     window.show()

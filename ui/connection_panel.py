@@ -38,6 +38,7 @@ from ui import query_guard_dialog
 from utils.logger import get_logger
 from utils import environment
 from utils import schema_cache
+from utils.df_export import export_dataframe, _to_sql_inserts
 from services import query_classifier
 
 logger = get_logger()
@@ -823,6 +824,7 @@ class ConnectionPanel(QWidget):
         edit_action = menu.addAction("✏️ Edit Structure")
         menu.addSeparator()
         import_action = menu.addAction("📥 Import CSV into Table…")
+        export_action = menu.addAction("📤 Export Table…")
         menu.addSeparator()
         refresh_action = menu.addAction("🔄 Refresh Schema")
 
@@ -835,6 +837,8 @@ class ConnectionPanel(QWidget):
             self.show_alter_table_editor(item.text(0))
         elif action == import_action:
             self._import_csv_into_table(item.text(0))
+        elif action == export_action:
+            self._export_table(item.text(0))
         elif action == refresh_action:
             self.load_schema()
 
@@ -1405,6 +1409,65 @@ class ConnectionPanel(QWidget):
                 QMessageBox.critical(self, "Error", str(ex))
 
     # ─── CSV Import ──────────────────────────────────────────────────────────
+
+    def export_database(self):
+        """Export every table's structure + data to a single SQL dump
+        (issue #39: whole-database export, independent of any query tab)."""
+        from PySide6.QtWidgets import QFileDialog, QProgressDialog
+
+        tables = self.db_service.get_tables()
+        if not tables:
+            QMessageBox.information(self, "Export Database", "No tables to export.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Database", "database.sql", "SQL Dump (*.sql)"
+        )
+        if not file_path:
+            return
+
+        progress = QProgressDialog(
+            "Exporting tables…", "Cancel", 0, len(tables), self)
+        progress.setWindowTitle("Export Database")
+        progress.setMinimumDuration(0)
+
+        failures = []
+        try:
+            with open(file_path, "w") as fh:
+                for i, table in enumerate(tables):
+                    if progress.wasCanceled():
+                        break
+                    progress.setLabelText(f"Exporting {table}…")
+                    progress.setValue(i)
+                    try:
+                        fh.write(f"-- Table: {table}\n")
+                        fh.write(self.db_service.get_table_ddl(table) + "\n\n")
+                        df = self.db_service.execute_query(f"SELECT * FROM {table}")
+                        if not df.empty:
+                            fh.write(_to_sql_inserts(df, table) + "\n\n")
+                    except Exception as ex:
+                        failures.append(f"{table}: {ex}")
+                progress.setValue(len(tables))
+        except OSError as ex:
+            QMessageBox.critical(self, "Export Error", f"Could not write file:\n{ex}")
+            return
+
+        summary = f"Exported {len(tables) - len(failures)}/{len(tables)} tables to:\n{file_path}"
+        if failures:
+            summary += "\n\nFailed:\n" + "\n".join(failures)
+            QMessageBox.warning(self, "Export Database", summary)
+        else:
+            QMessageBox.information(self, "Export Database", summary)
+
+    def _export_table(self, table_name: str):
+        """Export a table's full contents without needing an open query tab
+        (issue #39: export was previously only reachable from a result set)."""
+        try:
+            df = self.db_service.execute_query(f"SELECT * FROM {table_name}")
+        except Exception as ex:
+            QMessageBox.critical(self, "Export Error", f"Could not read table:\n{ex}")
+            return
+        export_dataframe(self, df, f"{table_name}.csv", table_name)
 
     def _import_csv_into_table(self, table_name: str):
         """Read a CSV file and INSERT all rows into *table_name*."""

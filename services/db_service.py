@@ -758,6 +758,50 @@ class DbService:
         else:
             return []
 
+    def get_table_ddl(self, table_name: str) -> str:
+        """Return this table's CREATE TABLE statement.
+
+        MySQL/SQLite store the exact original DDL and are asked directly
+        (SHOW CREATE TABLE / sqlite_master.sql). PostgreSQL has no single
+        built-in equivalent, so it's reconstructed from information_schema
+        columns + the primary key — a reasonable approximation, not a full
+        pg_dump (no indexes/constraints/comments)."""
+        cursor = self.connection.cursor()
+        if self.db_type == "mysql":
+            cursor.execute(f"SHOW CREATE TABLE `{table_name}`")
+            row = cursor.fetchone()
+            return list(row.values())[1] + ";" if row else ""
+
+        elif self.db_type == "sqlite":
+            cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            )
+            row = cursor.fetchone()
+            return (row[0] + ";") if row and row[0] else ""
+
+        elif self.db_type == "postgresql":
+            cursor.execute(
+                "SELECT a.attname FROM pg_index i "
+                "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+                "WHERE i.indrelid = %s::regclass AND i.indisprimary",
+                (table_name,),
+            )
+            pk_cols = [r[0] for r in cursor.fetchall()]
+            col_defs = []
+            for c in self.get_columns(table_name):
+                line = f'"{c["Field"]}" {c["Type"]}'
+                if c["Null"] == "NO":
+                    line += " NOT NULL"
+                if c["Default"] is not None:
+                    line += f' DEFAULT {c["Default"]}'
+                col_defs.append(line)
+            if pk_cols:
+                col_defs.append(f'PRIMARY KEY ({", ".join(pk_cols)})')
+            return f'CREATE TABLE "{table_name}" (\n  ' + ",\n  ".join(col_defs) + "\n);"
+
+        return ""
+
     def get_all_columns(self) -> dict:
         """Return {table_name: [col_name, ...]} for all tables in one query.
         Used to populate autocomplete — much faster than N individual SHOW COLUMNS calls."""
