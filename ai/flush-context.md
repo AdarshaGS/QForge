@@ -7,114 +7,128 @@ hostnames, customer data, or unredacted sensitive SQL.
 
 ## Current handoff
 
-**Status:** `master` is at `8086157` (merge of PR #51). **v1.1.1 is tagged,
-built, and publicly released**: https://github.com/AdarshaGS/QForge/releases/tag/v1.1.1
-(`QForge.dmg` + `SHA256SUMS.txt`, built by CI from `8086157`). The working
-tree is clean except the user's own pre-existing, unrelated
-`graphify-out/manifest.json` change, which was left untouched throughout.
+**Status:** `master` is at `be117b2` (v1.1.1). This session's work — eight
+GitHub issue fixes across two work sessions — is committed on branch
+`fix/connection-manager-issues-53-55-56` and pushed for PR review, not yet
+merged to `master`. The working tree's pre-existing, unrelated
+`graphify-out/*` regenerated-data changes and the untracked `benchmarks/`
+harness + `tests/test_benchmarks_harness.py` were deliberately left out of
+this branch/PR (user's explicit choice when scoping the PR) and remain
+uncommitted in the local working tree, same as prior sessions.
 
-**Last updated:** 2026-08-05.
-
-## Why v1.1.0/v1.1.1 originally broke (root cause, confirmed)
-
-Both the original `v1.1.0` and `v1.1.1` tags pointed at the **same commit**
-(`39dffd2`, the tip of the `fix/github-issues-batch` branch) — confirmed via
-`gh run view --json headSha` on both tag-triggered `Build & Release` runs.
-That commit was never on `master` at release time (`git merge-base
---is-ancestor 39dffd2 <master-at-the-time>` → false) and had not been through
-the `Tests` workflow, which only triggers on `push: [master, main]` or
-`pull_request` — **never on a tag push**. `Build & Release` (what tagging
-actually invokes) only runs `pyinstaller --clean QForge.spec`, no test suite.
-So the tag was pushed and released before any CI had run against that exact
-code. Both releases were reverted (PRs #48, #49) and master was hard-restored
-to the exact v1.0.9 tree (commit `2a26e3e`).
+**Last updated:** 2026-08-09.
 
 ## What happened this session
 
-1. Diagnosed the above by inspecting `gh run list`/`gh run view` history,
-   `git merge-base`, and the two workflow YAMLs — no guessing.
-2. Built the exact `39dffd2` snapshot locally (`build.sh` in a scratch git
-   worktree, isolated `$HOME` so it never touched the user's real
-   `~/Library/Application Support/QForge`) and confirmed it launches without
-   crashing — ruled out a fatal frozen-only startup bug.
-3. Reconstructed the batch on `master` via `git revert` of the two revert
-   commits (`2fe0706`, `89d54d3`) rather than cherry-picking, so master's
-   independent later fixes (dialog parenting, `sql_completer.py`'s
-   `WindowDoesNotAcceptFocus` fix — both already on master, unrelated to this
-   batch) merged cleanly instead of being clobbered.
-4. Found and fixed two real bugs while re-auditing before re-shipping:
-   - `ui/connection_panel.py` `_switch_database()` committed
-     `self.config["database"]`/the pill label to the new database **before**
-     confirming `select_db()`/reconnect succeeded. Verified directly against
-     a local MySQL server: a failed `select_db()` leaves the live connection
-     on the *previous* database while the UI would have already claimed the
-     new one — every query would then silently run against the wrong
-     database. Fixed to commit only after confirmed success.
-   - `utils/credential_store.py` `set_password()`'s stale-Keychain-item
-     recovery unconditionally force-deleted and retried on **any** failure,
-     not just the specific `errSecInvalidOwnerEdit` signature it was written
-     for — risking destroying a valid password on an unrelated failure (locked
-     keychain, denied auth prompt). Gated on that signature now.
-   - Dropped `.claude/settings.json`/`CLAUDE.md` that PR #45 had incidentally
-     picked up from a graphify bootstrap in that old session — unrelated to
-     the product change, not present on current master.
-   - Bumped `APP_VERSION` to `1.1.1` (was stuck at `1.0.6` in source despite
-     `v1.0.9` being the actual last release — pre-existing drift, now
-     corrected as part of this bump).
-5. **This time, went through the process the root-cause fix actually
-   requires**: pushed a branch, opened PR #51, waited for `Tests` to pass on
-   the PR, merged to master, waited for `Tests` to pass on master's own push,
-   *then* tagged `v1.1.1` from that verified master commit. Confirmed
-   `Build & Release` succeeded and the GitHub Release is live.
+Building on the prior session's four fixes (#50, #39, #46, #52 — see git
+history on this branch for details), fixed three more open GitHub issues plus
+one bug found while implementing them, each verified with offscreen
+(`QT_QPA_PLATFORM=offscreen`) scripted checks plus the full `pytest` suite
+(45/45 passing after every change):
+
+1. **Issue #56** — "Remove colored backgrounds from connection names in
+   Connection Manager." The list never actually had a background fill (the
+   issue's premise) — `ConnectionDialog.load_connections()`
+   (`ui/connection_dialog.py`) was tinting the whole row's *text* color via
+   `setForeground()` per environment, which read as visual noise. Replaced
+   with a small colored dot icon (`ThemeManager.env_dot_icon_path()`, a new
+   cached-PNG helper mirroring the existing `_close_icon_path()` pattern),
+   leaving row text in the default color. Selection highlight (separate QSS
+   path) untouched.
+
+2. **Theme alpha-color bug** (found while investigating a selection-highlight
+   visual glitch, not filed as a numbered issue) — `ui/theme_manager.py`.
+   Root cause: Qt stylesheets parse 8-digit hex as `#AARRGGBB` (alpha
+   *first*), but 14 call sites across both light/dark theme blocks built
+   colors as `f"{hex_color}{alpha_suffix}"` (CSS3's alpha-*last*
+   `#RRGGBBAA` convention), which silently shifted every color channel by a
+   byte — e.g. a blue selection highlight at 14% opacity rendered as solid
+   green. Affected: `QTreeWidget::item:selected` (both themes — this is what
+   made the connection list's selected row look wrong), flat/danger button
+   borders and hover/pressed states, tab close-button hover. Fixed by adding
+   `ThemeManager._alpha(hex_color, alpha_hex)` (builds the correct
+   `#AARRGGBB` form) and updating all 14 sites to use it.
+
+3. **Issue #55** — "Make Connection Manager input fields size dynamically
+   based on content" (`ui/connection_dialog.py`). Per the issue's suggested
+   width table: Type/Port/SSH Port capped small (110px); Environment/
+   Name/User/Password/SSH User/SSH Password capped medium (220px); Group
+   capped large (320px). Host/Database/SSH Host/SSH Key Path — the issue's
+   "Flexible" fields — initially just had their `maximumWidth` left uncapped,
+   but a follow-up screenshot from the user showed that stretched them to
+   the full dialog width even for short values (e.g. `127.0.0.1`) in a
+   maximized window. Replaced with `_fit_field_to_content()`: floors at the
+   220px medium width, grows only as far as the actual text needs (via
+   `fontMetrics().horizontalAdvance()`), capped at `_FIT_CAP_WIDTH` (520px),
+   wired to each field's `textChanged`.
+   - **Second follow-up**: capping `password_input`'s width (inside an
+     `QHBoxLayout` with the eye-toggle button) exposed a pre-existing Qt
+     box-layout quirk — an `Expanding`-policy `QLineEdit` capped via
+     `setMaximumWidth()` next to a fixed-width button, with no trailing
+     stretch item, misdistributes leftover row space as a *leading* gap
+     instead of trailing space, visually detaching the button from the
+     field. Reproduced in an isolated `QHBoxLayout` outside this app
+     entirely (not app-specific). Fixed by adding `addStretch()` after the
+     button in all three affected rows: password, SSH password, SSH key
+     path (browse button).
+
+4. **Issue #53** — "Add search/filter support for Columns, Indexes, and
+   Foreign Keys in Structure view" (`ui/table_view_widget.py`). Added
+   `_filter_table_rows()` (case-insensitive, in-memory `setRowHidden` filter,
+   mirroring the existing `filter_connections`/`filter_tables` idiom used
+   elsewhere) and `_wrap_with_search()` (puts a `QLineEdit` above a table,
+   wired via `textChanged`, no Enter required). Each structure sub-table is
+   now wrapped in a search container instead of being added to the tab bar
+   directly: Columns matches name/type/key (columns 0,1,3), Indexes matches
+   name/columns (0,1), Foreign Keys matches all three fields (0,1,2), per the
+   issue's spec. `_on_view_tab_changed` (from the prior session's #46 work)
+   now also auto-focuses the active tab's search box, the issue's
+   optional-but-recommended behavior.
 
 ## Verified this session
 
-- `pytest`: 43/43 passing (both before and after the hardening fixes).
+- `pytest`: 45/45 passing after every change, confirmed again at handoff.
 - `py_compile` on every touched file.
-- Real `build.sh` build of both the original `39dffd2` snapshot and the
-  final hardened `v1.1.1` commit; both launch cleanly as packaged `.app`s
-  with an isolated `$HOME`.
-- Scripted, non-GUI verification against a real local MySQL 8.0 server
-  (throwaway `qforge_repro_a`/`qforge_repro_b` databases, dropped after):
-  `select_db()` to an existing database succeeds silently; `select_db()` to a
-  nonexistent database raises `OperationalError` **and** leaves the
-  connection on the previously-selected database — confirming the exact
-  mismatch scenario the `_switch_database` fix closes.
-- CI (`Tests`) green on the PR and on master's merge commit; `Build &
-  Release` green on the `v1.1.1` tag; release published with
-  `QForge.dmg` + `SHA256SUMS.txt`.
+- Scripted, offscreen (`QT_QPA_PLATFORM=offscreen`) functional checks: row
+  foreground/icon for #56, `ThemeManager._alpha()` output plus the rendered
+  `QTreeWidget::item:selected` stylesheet string for the alpha bug, per-field
+  `maximumWidth`/`minimumWidth` values (both static caps and dynamic
+  content-fit growth on short vs. long text) for #55, the isolated
+  `QHBoxLayout` repro-then-fix for the password/SSH-field alignment bug, and
+  filter-as-you-type row-hiding behavior (match/no-match/clear) for #53.
+- Could **not** visually confirm any of these in a live GUI session (no real
+  display in this environment) — all verification is mechanical/offscreen.
+  The prior session's #52 (Fusion style) and #46 (flattened tab bar) are
+  similarly still only mechanically verified, per that session's notes.
 
 ## Known, accepted limitations / not done this session
 
-- **Not live-click-verified in the packaged `.app`**: the `Ctrl+T`/`P`/`N`/`Q`
-  `QShortcut` removal in `main.py` (relies on the menu bar's own `QAction`
-  shortcuts instead). Kept as-is — it matches the same
-  full-screen-Space-switch bug family as two other fixes already
-  independently present on master and trusted — but actual keystroke testing
-  was skipped this session because the developer's real, production-connected
-  QForge instance was open at the time and `System Events` keystroke
-  automation cannot be reliably scoped away from whatever window is
-  frontmost. Recommend a quick manual check after installing v1.1.1.
-- No full manual click-through against a live MySQL/PostgreSQL server beyond
-  the scripted `select_db()` check above (e.g. the SSH-tunnel paths, the new
-  Database menu's create/drop flows, the self-update flow end-to-end against
-  a real newer release).
-- Production-safety Slices 4-6 from `ai/load-context.md` (transaction
-  controls, query limits/timeout/cancellation, audit trail) — none started;
-  unrelated to this session's scope.
-- Broader product roadmap Tier 2 items (per prior sessions' plans) — Windows/
-  Linux path verification, `pytest-qt` OS matrix in CI — still open;
-  `CROSS_PLATFORM_SUPPORTED` in `build-release.yml` is still `false`.
+- Carried over from the prior session, still true: #39's `_to_sql_inserts()`
+  MySQL-only backtick quoting, Postgres DDL in `get_table_ddl()` being
+  columns+PK only, and the full production-safety roadmap
+  (`ai/load-context.md` slices 1-6) being entirely unstarted.
+- `graphify-out/*`'s pre-existing regenerated-data diff and the untracked
+  `benchmarks/`/`tests/test_benchmarks_harness.py` harness remain uncommitted
+  in the local working tree — deliberately excluded from this PR at the
+  user's explicit direction, not evaluated or touched otherwise.
+- Issue #55's field-width constants (`SMALL_FIELD_WIDTH`=110,
+  `MEDIUM_FIELD_WIDTH`=220, `LARGE_FIELD_WIDTH`=320, `_FIT_CAP_WIDTH`=520 on
+  `ConnectionDialog`) are hand-picked pixel values matched to the issue's
+  small/medium/large/flexible table, not derived from font metrics or a
+  design system — reasonable but arbitrary if the app's default font size
+  changes later.
 
 ## Exact next step
 
-1. User installs `v1.1.1` from
-   https://github.com/AdarshaGS/QForge/releases/tag/v1.1.1 and uses it
-   day-to-day; report back anything that looks off, especially the
-   MySQL fast-switch path and the four shortcuts noted above.
-2. If a future release needs to skip the branch/PR ceremony for a trivial
-   change, at minimum tag from a commit that is actually on `master` and has
-   an actual green `Tests` run against it — the process gap that caused the
-   original break (tagging an untested feature-branch tip directly) is now
-   avoided by habit, not by any new CI enforcement; nothing currently stops
-   someone from doing it again.
+1. Review and merge the PR on branch `fix/connection-manager-issues-53-55-56`
+   (covers #39, #46, #50, #52, #53, #55, #56, plus the unfiled theme
+   alpha-color bug) once CI/review is clean.
+2. Live-click-verify in the actual packaged/dev-run app — this and the prior
+   session only had offscreen scripted checks. Particularly: the dot
+   indicators and selection highlight color (#56 + alpha bug) actually look
+   right together, the field-width behavior in a maximized window (#55),
+   password/SSH field+button alignment (#55 follow-up), and the Structure
+   search boxes against a table with 100+ columns (#53).
+3. Decide separately whether/when to commit the excluded `graphify-out/*`
+   regeneration and the `benchmarks/` harness — both remain pending in the
+   working tree, unrelated to this PR.

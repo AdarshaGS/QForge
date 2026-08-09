@@ -24,8 +24,8 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMenu,
 )
-from PySide6.QtGui import QShortcut, QKeySequence, QFont, QColor
-from PySide6.QtCore import Qt
+from PySide6.QtGui import QShortcut, QKeySequence, QFont, QColor, QIcon
+from PySide6.QtCore import Qt, QTimer
 
 
 class ConnectionDialog(QDialog):
@@ -33,6 +33,15 @@ class ConnectionDialog(QDialog):
     _APP_DIR = str(app_data_dir())
     CONNECTION_FILE = os.path.join(_APP_DIR, "connections.json")
     LAST_CONNECTION_FILE = os.path.join(_APP_DIR, "last_connection.json")
+
+    # Form field widths (issue #55) — small/medium/large are fixed caps;
+    # content-fit fields (host, database, ssh key path) start at the medium
+    # floor and grow only as far as their actual text needs, up to _FIT_CAP,
+    # instead of stretching to the dialog's full width.
+    SMALL_FIELD_WIDTH = 110
+    MEDIUM_FIELD_WIDTH = 220
+    LARGE_FIELD_WIDTH = 320
+    _FIT_CAP_WIDTH = 520
 
     def __init__(self, auto_connect_last=False, parent=None):
         super().__init__(parent)
@@ -120,11 +129,18 @@ class ConnectionDialog(QDialog):
         form_layout.setContentsMargins(20, 16, 20, 8)
         form_layout.setSpacing(8)
         form_layout.setHorizontalSpacing(12)
+        # QFormLayout stretches every field to the row's full width by default;
+        # cap short/medium fields so they don't waste space.
+        SMALL_FIELD_WIDTH = self.SMALL_FIELD_WIDTH
+        MEDIUM_FIELD_WIDTH = self.MEDIUM_FIELD_WIDTH
+        LARGE_FIELD_WIDTH = self.LARGE_FIELD_WIDTH
         self.type_input = QComboBox()
         self.type_input.addItems(["MySQL", "PostgreSQL", "SQLite"])
         self.type_input.currentTextChanged.connect(self.on_type_changed)
+        self.type_input.setMaximumWidth(SMALL_FIELD_WIDTH)
 
         self.name_input = QLineEdit()
+        self.name_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)
         # Fixed enum, not free text — see utils/environment.py. Index 0 is
         # "Unclassified" so new connections default to it until the user
         # deliberately chooses a real tier.
@@ -133,16 +149,26 @@ class ConnectionDialog(QDialog):
             [environment.COMBO_LABELS[e] for e in environment.ENVIRONMENTS]
         )
         self.environment_input.currentIndexChanged.connect(self._on_environment_changed)
+        self.environment_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)
         self.read_only_check = QCheckBox("Read-only (block writes in QForge)")
         # Editable combo that lists existing groups; typing a new name is allowed
         self.group_input = QComboBox()
         self.group_input.setEditable(True)
         self.group_input.setInsertPolicy(QComboBox.NoInsert)
         self.group_input.lineEdit().setPlaceholderText("e.g. Production, Staging, Local…")
+        self.group_input.setMaximumWidth(LARGE_FIELD_WIDTH)
         self.host_input = QLineEdit()
+        self.host_input.setMinimumWidth(MEDIUM_FIELD_WIDTH)
+        self.host_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)
+        self.host_input.textChanged.connect(lambda: self._fit_field_to_content(self.host_input))
         self.port_input = QLineEdit("3306")
+        self.port_input.setMaximumWidth(SMALL_FIELD_WIDTH)
         self.database_input = QLineEdit()
+        self.database_input.setMinimumWidth(MEDIUM_FIELD_WIDTH)
+        self.database_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)
+        self.database_input.textChanged.connect(lambda: self._fit_field_to_content(self.database_input))
         self.user_input = QLineEdit()
+        self.user_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)
 
         # Password with visibility toggle
         password_widget = QWidget()
@@ -150,6 +176,7 @@ class ConnectionDialog(QDialog):
         password_layout.setContentsMargins(0, 0, 0, 0)
         self.password_input = QLineEdit()
         self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)
         self.password_visible_btn = QPushButton("👁")
         self.password_visible_btn.setMaximumWidth(30)
         self.password_visible_btn.setStyleSheet(
@@ -160,6 +187,11 @@ class ConnectionDialog(QDialog):
         self.password_visible_btn.clicked.connect(self.toggle_password_visibility)
         password_layout.addWidget(self.password_input)
         password_layout.addWidget(self.password_visible_btn)
+        # Without a trailing stretch, Qt's box layout misdistributes the
+        # leftover space from password_input's capped max-width as a leading
+        # gap instead of trailing space, floating the eye button away from
+        # the field — reproduced in isolation, not specific to this widget.
+        password_layout.addStretch()
 
         form_layout.addRow("Type", self.type_input)
         form_layout.addRow("Name", self.name_input)
@@ -190,14 +222,20 @@ class ConnectionDialog(QDialog):
         ssh_inner.setHorizontalSpacing(12)
 
         self.ssh_host_input = QLineEdit()
+        self.ssh_host_input.setMinimumWidth(MEDIUM_FIELD_WIDTH)
+        self.ssh_host_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)
+        self.ssh_host_input.textChanged.connect(lambda: self._fit_field_to_content(self.ssh_host_input))
         self.ssh_port_input = QLineEdit("22")
+        self.ssh_port_input.setMaximumWidth(SMALL_FIELD_WIDTH)
         self.ssh_user_input = QLineEdit()
+        self.ssh_user_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)
 
         ssh_password_widget = QWidget()
         ssh_password_layout = QHBoxLayout(ssh_password_widget)
         ssh_password_layout.setContentsMargins(0, 0, 0, 0)
         self.ssh_password_input = QLineEdit()
         self.ssh_password_input.setEchoMode(QLineEdit.Password)
+        self.ssh_password_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)
         self.ssh_password_visible_btn = QPushButton("👁")
         self.ssh_password_visible_btn.setMaximumWidth(30)
         self.ssh_password_visible_btn.setStyleSheet(
@@ -208,6 +246,7 @@ class ConnectionDialog(QDialog):
         self.ssh_password_visible_btn.clicked.connect(self.toggle_ssh_password_visibility)
         ssh_password_layout.addWidget(self.ssh_password_input)
         ssh_password_layout.addWidget(self.ssh_password_visible_btn)
+        ssh_password_layout.addStretch()
 
         self.ssh_use_key_checkbox = QCheckBox("Use SSH Key")
         self.ssh_use_key_checkbox.stateChanged.connect(self.on_ssh_key_checkbox_changed)
@@ -215,6 +254,9 @@ class ConnectionDialog(QDialog):
         self.ssh_key_path_input = QLineEdit()
         self.ssh_key_path_input.setPlaceholderText("Path to private key file (e.g., ~/.ssh/id_rsa)")
         self.ssh_key_path_input.setEnabled(False)
+        self.ssh_key_path_input.setMinimumWidth(MEDIUM_FIELD_WIDTH)
+        self.ssh_key_path_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)
+        self.ssh_key_path_input.textChanged.connect(lambda: self._fit_field_to_content(self.ssh_key_path_input))
 
         self.ssh_key_browse_btn = QPushButton("📁")
         self.ssh_key_browse_btn.setFixedWidth(40)
@@ -224,6 +266,7 @@ class ConnectionDialog(QDialog):
         ssh_key_layout = QHBoxLayout()
         ssh_key_layout.addWidget(self.ssh_key_path_input)
         ssh_key_layout.addWidget(self.ssh_key_browse_btn)
+        ssh_key_layout.addStretch()
         ssh_key_layout.setContentsMargins(0, 0, 0, 0)
         ssh_key_widget = QWidget()
         ssh_key_widget.setLayout(ssh_key_layout)
@@ -405,7 +448,6 @@ class ConnectionDialog(QDialog):
     def on_ssh_enabled_toggled(self, checked):
         self.ssh_section.setVisible(checked)
         # Resize dialog to compact or expanded height
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(0, lambda: self.resize(
             self.width(), self._expanded_height if checked else self._compact_height
         ))
@@ -428,6 +470,15 @@ class ConnectionDialog(QDialog):
         self.ssh_password_visible_btn.setEnabled(not use_key)
         self.ssh_key_path_input.setEnabled(use_key)
         self.ssh_key_browse_btn.setEnabled(use_key)
+
+    def _fit_field_to_content(self, edit: QLineEdit):
+        """Size *edit* to its own text, not the row's full width: stays at
+        the medium floor for short values, grows only as far as long values
+        (e.g. a long RDS hostname) actually need, capped at `_FIT_CAP_WIDTH`."""
+        needed = edit.fontMetrics().horizontalAdvance(edit.text()) + 24
+        width = max(self.MEDIUM_FIELD_WIDTH, min(needed, self._FIT_CAP_WIDTH))
+        edit.setMinimumWidth(width)
+        edit.setMaximumWidth(width)
 
     def toggle_password_visibility(self):
         if self.password_input.echoMode() == QLineEdit.Password:
@@ -544,8 +595,8 @@ class ConnectionDialog(QDialog):
                 child.setData(0, Qt.UserRole, conn_idx)
                 child.setToolTip(0, f"{db_type} — {host}")
                 if env != environment.UNCLASSIFIED:
-                    _, text_color, _ = ThemeManager.env_colors(env, self._is_dark_theme())
-                    child.setForeground(0, QColor(text_color))
+                    _, _, border_color = ThemeManager.env_colors(env, self._is_dark_theme())
+                    child.setIcon(0, QIcon(ThemeManager.env_dot_icon_path(border_color)))
 
         # Refresh the group combo with all known group names
         self._populate_group_combo()
@@ -778,6 +829,26 @@ class ConnectionDialog(QDialog):
 
     # ── Save (unified add / update) ──────────────────────────────
 
+    def _flash_status(self, message: str, ok: bool = True):
+        """Show a status pill next to the buttons that clears itself after a
+        few seconds (issue #50: visible save confirmation). Reuses the same
+        env-colored pill styling as the Test Connection result."""
+        bg, text_color, _ = ThemeManager.env_colors(
+            "local" if ok else "production", self._is_dark_theme()
+        )
+        self.test_status_label.setText(message)
+        self.test_status_label.setStyleSheet(
+            f"color: {text_color}; background: {bg}; padding: 6px 8px;"
+            " border-radius: 4px; font-weight: 600;"
+        )
+        QTimer.singleShot(4000, lambda: self._clear_status_if_unchanged(message))
+
+    def _clear_status_if_unchanged(self, message: str):
+        if self.test_status_label.text() != message:
+            return
+        self.test_status_label.setText("")
+        self.test_status_label.setStyleSheet("padding: 5px; border-radius: 3px;")
+
     def save_connection(self):
         selected_item = self._get_selected_conn_item()
 
@@ -792,9 +863,14 @@ class ConnectionDialog(QDialog):
             data["id"] = self.connections[conn_idx].get("id") or uuid.uuid4().hex
             self._remember_form_password(data)
             self.connections[conn_idx] = data
-            self.save_connections()
+            try:
+                self.save_connections()
+            except OSError as ex:
+                self._flash_status(f"✗ Save failed: {ex}", ok=False)
+                return
             self.load_connections()
             self._select_connection_by_index(conn_idx)
+            self._flash_status("✓ Connection updated successfully.")
             return
 
         # ── No connection selected: look up by details first ─────
@@ -824,9 +900,15 @@ class ConnectionDialog(QDialog):
         data["id"] = uuid.uuid4().hex
         self._remember_form_password(data)
         self.connections.append(data)
-        self.save_connections()
+        try:
+            self.save_connections()
+        except OSError as ex:
+            self.connections.pop()
+            self._flash_status(f"✗ Save failed: {ex}", ok=False)
+            return
         self.load_connections()
         self._select_connection_by_index(len(self.connections) - 1)
+        self._flash_status("✓ Connection created successfully.")
 
     def delete_connection(self):
         selected_item = self._get_selected_conn_item()

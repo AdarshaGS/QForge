@@ -25,56 +25,73 @@ import pandas as pd
 logger = get_logger()
 
 
-def build_structure_tabs(cols, idxs, fks) -> QTabWidget:
-    """Build a read-only Columns/Indexes/Foreign Keys QTabWidget from schema
-    metadata. Shared by the in-tab Structure view (issue #27) and the
-    schema-tree "View Structure" popup so both stay in sync."""
-    tabs = QTabWidget()
+def _new_readonly_table(headers: list) -> QTableWidget:
+    tbl = QTableWidget(0, len(headers))
+    tbl.setHorizontalHeaderLabels(headers)
+    tbl.verticalHeader().setVisible(False)
+    tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+    tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+    tbl.horizontalHeader().setStretchLastSection(True)
+    return tbl
 
-    col_tbl = QTableWidget(len(cols), 5)
-    col_tbl.setHorizontalHeaderLabels(["Column", "Type", "Null", "Key", "Default"])
-    col_tbl.verticalHeader().setVisible(False)
-    col_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-    col_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-    col_tbl.horizontalHeader().setStretchLastSection(True)
+
+def _fill_columns_table(tbl: QTableWidget, cols):
+    tbl.setRowCount(len(cols))
     for r, c in enumerate(cols):
         if isinstance(c, dict):
-            col_tbl.setItem(r, 0, QTableWidgetItem(str(c.get("Field", ""))))
-            col_tbl.setItem(r, 1, QTableWidgetItem(str(c.get("Type",  ""))))
-            col_tbl.setItem(r, 2, QTableWidgetItem(str(c.get("Null",  ""))))
-            col_tbl.setItem(r, 3, QTableWidgetItem(str(c.get("Key",   ""))))
-            col_tbl.setItem(r, 4, QTableWidgetItem(str(c.get("Default", ""))))
+            tbl.setItem(r, 0, QTableWidgetItem(str(c.get("Field", ""))))
+            tbl.setItem(r, 1, QTableWidgetItem(str(c.get("Type",  ""))))
+            tbl.setItem(r, 2, QTableWidgetItem(str(c.get("Null",  ""))))
+            tbl.setItem(r, 3, QTableWidgetItem(str(c.get("Key",   ""))))
+            tbl.setItem(r, 4, QTableWidgetItem(str(c.get("Default", ""))))
         else:
             for ci, val in enumerate(list(c)[:5]):
-                col_tbl.setItem(r, ci, QTableWidgetItem(str(val)))
-    tabs.addTab(col_tbl, f"Columns ({len(cols)})")
+                tbl.setItem(r, ci, QTableWidgetItem(str(val)))
 
-    idx_tbl = QTableWidget(len(idxs), 4)
-    idx_tbl.setHorizontalHeaderLabels(["Name", "Columns", "Unique", "Type"])
-    idx_tbl.verticalHeader().setVisible(False)
-    idx_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-    idx_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-    idx_tbl.horizontalHeader().setStretchLastSection(True)
+
+def _fill_indexes_table(tbl: QTableWidget, idxs):
+    tbl.setRowCount(len(idxs))
     for r, idx in enumerate(idxs):
-        idx_tbl.setItem(r, 0, QTableWidgetItem(str(idx.get("name", ""))))
-        idx_tbl.setItem(r, 1, QTableWidgetItem(str(idx.get("columns", ""))))
-        idx_tbl.setItem(r, 2, QTableWidgetItem("✔" if idx.get("unique") else ""))
-        idx_tbl.setItem(r, 3, QTableWidgetItem(str(idx.get("type", ""))))
-    tabs.addTab(idx_tbl, f"Indexes ({len(idxs)})")
+        tbl.setItem(r, 0, QTableWidgetItem(str(idx.get("name", ""))))
+        tbl.setItem(r, 1, QTableWidgetItem(str(idx.get("columns", ""))))
+        tbl.setItem(r, 2, QTableWidgetItem("✔" if idx.get("unique") else ""))
+        tbl.setItem(r, 3, QTableWidgetItem(str(idx.get("type", ""))))
 
-    fk_tbl = QTableWidget(len(fks), 3)
-    fk_tbl.setHorizontalHeaderLabels(["Column", "References Table", "References Column"])
-    fk_tbl.verticalHeader().setVisible(False)
-    fk_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-    fk_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-    fk_tbl.horizontalHeader().setStretchLastSection(True)
+
+def _fill_fk_table(tbl: QTableWidget, fks):
+    tbl.setRowCount(len(fks))
     for r, fk in enumerate(fks):
-        fk_tbl.setItem(r, 0, QTableWidgetItem(str(fk.get("column", ""))))
-        fk_tbl.setItem(r, 1, QTableWidgetItem(str(fk.get("ref_table", ""))))
-        fk_tbl.setItem(r, 2, QTableWidgetItem(str(fk.get("ref_column", ""))))
-    tabs.addTab(fk_tbl, f"Foreign Keys ({len(fks)})")
+        tbl.setItem(r, 0, QTableWidgetItem(str(fk.get("column", ""))))
+        tbl.setItem(r, 1, QTableWidgetItem(str(fk.get("ref_table", ""))))
+        tbl.setItem(r, 2, QTableWidgetItem(str(fk.get("ref_column", ""))))
 
-    return tabs
+
+def _filter_table_rows(tbl: QTableWidget, text: str, match_columns: tuple):
+    """Live, in-memory, case-insensitive row filter (issue #53)."""
+    needle = text.strip().lower()
+    for row in range(tbl.rowCount()):
+        if not needle:
+            tbl.setRowHidden(row, False)
+            continue
+        haystack = " ".join(
+            tbl.item(row, c).text() for c in match_columns if tbl.item(row, c)
+        ).lower()
+        tbl.setRowHidden(row, needle not in haystack)
+
+
+def _wrap_with_search(tbl: QTableWidget, placeholder: str, match_columns: tuple) -> tuple:
+    """A search box above *tbl* that filters its rows as the user types."""
+    container = QWidget()
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+    search = QLineEdit()
+    search.setPlaceholderText(placeholder)
+    search.setClearButtonEnabled(True)
+    search.textChanged.connect(lambda text: _filter_table_rows(tbl, text, match_columns))
+    layout.addWidget(search)
+    layout.addWidget(tbl)
+    return container, search
 
 
 class TableViewWidget(QWidget):
@@ -124,6 +141,7 @@ class TableViewWidget(QWidget):
         outer_layout.setSpacing(0)
 
         self.view_tabs = QTabWidget()
+        self.view_tabs.setDocumentMode(True)  # left-align tabs (macOS centers by default)
         outer_layout.addWidget(self.view_tabs)
 
         data_page = QWidget()
@@ -132,9 +150,42 @@ class TableViewWidget(QWidget):
         layout.setSpacing(0)
         self.view_tabs.addTab(data_page, "Data")
 
+        # "Structure" is a group header, not real content (issue #46): clicking
+        # it just reveals and jumps to Columns/Indexes/Foreign Keys, which live
+        # as ordinary tabs on this same bar, hidden until then via
+        # setTabVisible so they never show as a second row of tabs.
         self.structure_page = QWidget()
         QVBoxLayout(self.structure_page).setContentsMargins(0, 0, 0, 0)
         self.view_tabs.addTab(self.structure_page, "Structure")
+
+        self.col_tbl = _new_readonly_table(["Column", "Type", "Null", "Key", "Default"])
+        self.idx_tbl = _new_readonly_table(["Name", "Columns", "Unique", "Type"])
+        self.fk_tbl = _new_readonly_table(["Column", "References Table", "References Column"])
+        # Match columns per issue #53's spec: name always, type/key for Columns,
+        # name+columns for Indexes, all fields for Foreign Keys.
+        self.col_container, self.col_search = _wrap_with_search(
+            self.col_tbl, "🔍 Search columns...", (0, 1, 3)
+        )
+        self.idx_container, self.idx_search = _wrap_with_search(
+            self.idx_tbl, "🔍 Search indexes...", (0, 1)
+        )
+        self.fk_container, self.fk_search = _wrap_with_search(
+            self.fk_tbl, "🔍 Search foreign keys...", (0, 1, 2)
+        )
+        for container, label in (
+            (self.col_container, "Columns"),
+            (self.idx_container, "Indexes"),
+            (self.fk_container, "Foreign Keys"),
+        ):
+            self.view_tabs.addTab(container, label)
+        self._structure_tab_indices = (
+            self.view_tabs.indexOf(self.col_container),
+            self.view_tabs.indexOf(self.idx_container),
+            self.view_tabs.indexOf(self.fk_container),
+        )
+        for i in self._structure_tab_indices:
+            self.view_tabs.setTabVisible(i, False)
+
         self.view_tabs.currentChanged.connect(self._on_view_tab_changed)
 
         # Top controls bar - only shown when filtering
@@ -717,8 +768,24 @@ class TableViewWidget(QWidget):
         self.view_tabs.setCurrentWidget(self.structure_page)
 
     def _on_view_tab_changed(self, index):
-        if self.view_tabs.widget(index) is self.structure_page and not self._structure_loaded:
-            self._load_structure_tab()
+        widget = self.view_tabs.widget(index)
+        if widget is self.structure_page:
+            if not self._structure_loaded:
+                self._load_structure_tab()
+            for i in self._structure_tab_indices:
+                self.view_tabs.setTabVisible(i, True)
+            self.view_tabs.setCurrentWidget(self.col_container)
+        elif widget not in (self.col_container, self.idx_container, self.fk_container):
+            for i in self._structure_tab_indices:
+                self.view_tabs.setTabVisible(i, False)
+        else:
+            # Auto-focus that tab's search box (issue #53)
+            search = {
+                self.col_container: self.col_search,
+                self.idx_container: self.idx_search,
+                self.fk_container: self.fk_search,
+            }[widget]
+            search.setFocus()
 
     def _load_structure_tab(self):
         self._structure_loaded = True
@@ -730,9 +797,15 @@ class TableViewWidget(QWidget):
             except Exception:
                 idxs = []
         except Exception as ex:
-            self.structure_page.layout().addWidget(QLabel(f"Could not load structure: {ex}"))
+            QMessageBox.warning(self, "Structure", f"Could not load structure:\n{ex}")
             return
-        self.structure_page.layout().addWidget(build_structure_tabs(cols, idxs, fks))
+        _fill_columns_table(self.col_tbl, cols)
+        _fill_indexes_table(self.idx_tbl, idxs)
+        _fill_fk_table(self.fk_tbl, fks)
+        col_i, idx_i, fk_i = self._structure_tab_indices
+        self.view_tabs.setTabText(col_i, f"Columns ({len(cols)})")
+        self.view_tabs.setTabText(idx_i, f"Indexes ({len(idxs)})")
+        self.view_tabs.setTabText(fk_i, f"Foreign Keys ({len(fks)})")
 
     # ─── Structure editor ─────────────────────────────────────────────────────
 
