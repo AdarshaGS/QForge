@@ -11,19 +11,30 @@ from PySide6.QtGui import QKeyEvent, QShortcut, QKeySequence
 
 
 class QuickSearchDialog(QDialog):
-    """Quick search dialog for searching tables, databases, functions, views"""
-    
-    item_selected = Signal(str, str)  # (item_type, item_name)
-    
+    """Command palette: search tables, columns, views, functions/procedures,
+    query history, and SQL snippets, then act on the selected item."""
+
+    # item_type -> label shown before each result
+    TYPE_LABELS = {
+        "table": "Table",
+        "view": "View",
+        "function": "Function",
+        "column": "Column",
+        "history": "History",
+        "snippet": "Snippet",
+    }
+
+    item_selected = Signal(str, str, str)  # (item_type, display_text, payload)
+
     def __init__(self, all_items, parent=None):
         super().__init__(parent)
-        
+
         # Add Cmd+W shortcut to close dialog
         close_shortcut = QShortcut(QKeySequence("Ctrl+W"), self)
         close_shortcut.activated.connect(self.reject)
-        
-        
-        self.all_items = all_items  # List of (type, name) tuples
+
+
+        self.all_items = all_items  # List of (item_type, display_text, payload) tuples
         self.setWindowTitle("Quick Search")
         self.setMinimumWidth(700)
         self.setMinimumHeight(500)
@@ -77,7 +88,8 @@ class QuickSearchDialog(QDialog):
         
         # Search input
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Type 2-3 letters to search tables, functions, views...")
+        self.search_input.setPlaceholderText(
+            "Search tables, columns, views, functions, history, snippets...")
         self.search_input.textChanged.connect(self.filter_items)
         self.search_input.installEventFilter(self)  # Install event filter for arrow keys
         layout.addWidget(self.search_input)
@@ -123,53 +135,48 @@ class QuickSearchDialog(QDialog):
                     self.on_item_selected(self.results_list.currentItem())
                 return True
         return super().eventFilter(obj, event)
-        self.count_label.setText("Type to search...")
-        
-        # Focus on search input
-        self.search_input.setFocus()
-    
+
     def filter_items(self, search_text):
         """Filter items based on search text"""
         self.results_list.clear()
         search_text = search_text.lower().strip()
-        
+
         # Allow 1+ characters for search (improved from 2)
         if len(search_text) < 1:
             self.count_label.setText("Type to search...")
             return
-        
+
         matching_items = []
         exact_matches = []
         starts_with_matches = []
         contains_matches = []
         fuzzy_matches = []
-        
-        for item_type, item_name in self.all_items:
-            item_name_lower = item_name.lower()
-            
+
+        for entry in self.all_items:
+            item_type, display_text, payload = entry
+            display_lower = display_text.lower()
+
             # Prioritize exact matches
-            if search_text == item_name_lower:
-                exact_matches.append((item_type, item_name))
+            if search_text == display_lower:
+                exact_matches.append(entry)
             # Then starts with matches
-            elif item_name_lower.startswith(search_text):
-                starts_with_matches.append((item_type, item_name))
+            elif display_lower.startswith(search_text):
+                starts_with_matches.append(entry)
             # Then contains matches
-            elif search_text in item_name_lower:
-                contains_matches.append((item_type, item_name))
+            elif search_text in display_lower:
+                contains_matches.append(entry)
             # Finally fuzzy matches
-            elif self.fuzzy_match(search_text, item_name_lower):
-                fuzzy_matches.append((item_type, item_name))
-        
+            elif self.fuzzy_match(search_text, display_lower):
+                fuzzy_matches.append(entry)
+
         # Combine in priority order
         matching_items = exact_matches + starts_with_matches + contains_matches + fuzzy_matches
-        
+
         # Limit to 15 results for best UX (like Spotlight)
-        for item_type, item_name in matching_items[:15]:
-            # Create display text without icon
-            display_text = item_name
-            
-            item = QListWidgetItem(display_text)
-            item.setData(Qt.UserRole, (item_type, item_name))
+        for item_type, display_text, payload in matching_items[:15]:
+            label = self.TYPE_LABELS.get(item_type, item_type.title())
+            item = QListWidgetItem(f"[{label}]  {display_text}")
+            item.setData(Qt.UserRole, (item_type, display_text, payload))
             self.results_list.addItem(item)
         
         # Update count
@@ -200,8 +207,8 @@ class QuickSearchDialog(QDialog):
     
     def on_item_selected(self, item):
         """Handle item selection"""
-        item_type, item_name = item.data(Qt.UserRole)
-        self.item_selected.emit(item_type, item_name)
+        item_type, display_text, payload = item.data(Qt.UserRole)
+        self.item_selected.emit(item_type, display_text, payload or "")
         self.accept()
     
     def keyPressEvent(self, event: QKeyEvent):

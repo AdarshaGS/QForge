@@ -792,7 +792,7 @@ class MainWindow(QMainWindow):
 • Ctrl+Space   —  Autocomplete
 
 <b>Navigation:</b>
-• Ctrl+P / Cmd+P  —  Quick search tables/views
+• Ctrl+P / Cmd+P  —  Quick search tables, columns, views, functions, history, snippets
 • Ctrl+R / F5     —  Refresh current view
 
 <b>Application:</b>

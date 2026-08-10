@@ -82,8 +82,11 @@ Use the **Schema** sidebar to browse database objects. Double-click a table or
 view to open it in a paginated data tab. Right-click a table to open it, edit
 its structure, import CSV data into it, or refresh the schema.
 
-Use **Ctrl+P** for quick search across schema items, and **Ctrl+R** or **F5**
-to refresh the current view.
+Use **Ctrl+P** for quick search across tables, columns, views, functions/
+procedures, recent query history, and SQL snippets — selecting a table or
+view opens it, other item types insert their name (or, for snippets/history,
+their text) into the active SQL tab. Use **Ctrl+R** or **F5** to refresh the
+current view.
 
 ### Run SQL
 
@@ -117,7 +120,7 @@ table in the schema browser and choose **Import CSV into Table…**.
 | `Ctrl+T` | New query tab |
 | `Ctrl+W` | Close current tab / dialog |
 | `Ctrl+R` or `F5` | Refresh current view |
-| `Ctrl+P` | Search database objects |
+| `Ctrl+P` | Search tables, columns, views, functions, history, snippets |
 | `Ctrl+E` | Export current query results |
 | `Ctrl+Shift+E` | Import data into the current query tab |
 | `Ctrl+Q` | Quit |

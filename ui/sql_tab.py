@@ -1468,6 +1468,22 @@ class SqlTab(QWidget):
         """Set the editor content."""
         self.editor.setPlainText(text)
 
+    def insert_text_at_cursor(self, text: str):
+        """Insert text at the cursor (replacing any selection), placing the
+        cursor at the `{cursor}` marker if present — same placeholder
+        convention SQL snippets use."""
+        cursor = self.editor.textCursor()
+        marker = "{cursor}"
+        if marker in text:
+            offset = text.index(marker)
+            start = cursor.selectionStart() if cursor.hasSelection() else cursor.position()
+            cursor.insertText(text.replace(marker, ""))
+            cursor.setPosition(start + offset)
+        else:
+            cursor.insertText(text)
+        self.editor.setTextCursor(cursor)
+        self.editor.setFocus()
+
     def update_theme(self, is_dark=True):
         """Update editor palette and filter container theme."""
         if is_dark:

@@ -30,6 +30,7 @@ from services.schema_snapshot import fetch_schema_snapshot
 from ui.sql_tab import SqlTab
 from ui.table_view_widget import TableViewWidget
 from ui.quick_search_dialog import QuickSearchDialog
+from ui.snippet_manager import SnippetManager
 from ui.structure_editor import StructureEditorDialog
 from ui.db_switcher_dialog import DbSwitcherDialog
 from ui.query_history_dialog import QueryHistoryDialog
@@ -1567,18 +1568,52 @@ class ConnectionPanel(QWidget):
 
     # ─── Quick search ─────────────────────────────────────────────────────────
 
+    def _gather_quick_search_items(self):
+        """Build the full (item_type, display_text, payload) list for the
+        command palette: schema items plus columns, recent query history,
+        and SQL snippets. Rebuilt on every open since history/snippets
+        change independently of schema reloads."""
+        items = [(item_type, name, None) for item_type, name in self.all_schema_items]
+
+        for table, cols in self._column_cache.items():
+            for col in cols:
+                items.append(("column", f"{table}.{col}", col))
+
+        for entry in self.query_history.get_recent_queries(limit=100):
+            query = entry.get("query", "").strip()
+            if query:
+                items.append(("history", query.replace("\n", " ")[:80], query))
+
+        for trigger, data in SnippetManager().get_all().items():
+            label = f"{trigger} — {data.get('name', trigger)}"
+            items.append(("snippet", label, data.get("body", "")))
+
+        return items
+
     def show_quick_search(self):
-        if not self.all_schema_items:
-            QMessageBox.information(self, "No Items",
-                                    "No tables, views, or functions available")
+        items = self._gather_quick_search_items()
+        if not items:
+            QMessageBox.information(self, "No Items", "Nothing to search yet")
             return
-        dialog = QuickSearchDialog(self.all_schema_items, self)
+        dialog = QuickSearchDialog(items, self)
         dialog.item_selected.connect(self._on_quick_search)
         dialog.exec()
 
-    def _on_quick_search(self, item_type, item_name):
+    def _active_sql_tab(self) -> SqlTab:
+        """Return the current tab if it's a SQL editor, else open a new one."""
+        current = self.tabs.currentWidget()
+        if isinstance(current, SqlTab):
+            return current
+        self.add_new_tab()
+        return self.tabs.currentWidget()
+
+    def _on_quick_search(self, item_type, display_text, payload):
         if item_type in ("table", "view"):
-            self.open_table_view(item_name)
+            self.open_table_view(display_text)
+        elif item_type == "history":
+            self._active_sql_tab().set_query(payload)
+        else:  # function, column, snippet — insert at cursor
+            self._active_sql_tab().insert_text_at_cursor(payload or display_text)
 
     # ─── Query history ────────────────────────────────────────────────────────
 
@@ -1587,12 +1622,7 @@ class ConnectionPanel(QWidget):
         if dialog.exec():
             query = dialog.get_selected_query()
             if query:
-                current = self.tabs.currentWidget()
-                if isinstance(current, SqlTab):
-                    current.set_query(query)
-                else:
-                    self.add_new_tab()
-                    self.tabs.currentWidget().set_query(query)
+                self._active_sql_tab().set_query(query)
 
     # ─── Sidebar schema/history toggle ─────────────────────────────────────────
 
@@ -1627,12 +1657,7 @@ class ConnectionPanel(QWidget):
         query = item.data(Qt.UserRole)
         if not query:
             return
-        current = self.tabs.currentWidget()
-        if isinstance(current, SqlTab):
-            current.set_query(query)
-        else:
-            self.add_new_tab()
-            self.tabs.currentWidget().set_query(query)
+        self._active_sql_tab().set_query(query)
         self._switch_sidebar(0)
 
     def _clear_history(self):
