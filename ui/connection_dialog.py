@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QMenu,
+    QCompleter,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QFont, QColor, QIcon
 from PySide6.QtCore import Qt, QTimer
@@ -157,6 +158,18 @@ class ConnectionDialog(QDialog):
         self.group_input.setInsertPolicy(QComboBox.NoInsert)
         self.group_input.lineEdit().setPlaceholderText("e.g. Production, Staging, Local…")
         self.group_input.setMaximumWidth(LARGE_FIELD_WIDTH)
+        # Issue #41: an editable QComboBox auto-installs a completer, but its
+        # default mode only inline-completes the single closest match — no
+        # popup of every matching group, and no substring matching (typing
+        # "Prod" wouldn't surface "MFI Production"). Replace it with one in
+        # popup mode using the combo's own model, so _populate_group_combo()
+        # rebuilding that model (below) is the only place group names need
+        # to be kept in sync.
+        group_completer = QCompleter(self.group_input.model(), self)
+        group_completer.setCaseSensitivity(Qt.CaseInsensitive)
+        group_completer.setFilterMode(Qt.MatchContains)
+        group_completer.setCompletionMode(QCompleter.PopupCompletion)
+        self.group_input.setCompleter(group_completer)
         self.host_input = QLineEdit()
         self.host_input.setMinimumWidth(MEDIUM_FIELD_WIDTH)
         self.host_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)

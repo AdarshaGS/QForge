@@ -101,16 +101,43 @@ SQL snippets. Enable **Auto-Format** to format SQL before it runs. The
 **Verify** compares the current query with an alternative query for equivalent
 results and performance information.
 
+### Control a transaction
+
+Every query tab has **Begin Tx**, **Commit**, and **Rollback** buttons.
+By default, every statement still commits immediately (autocommit) exactly
+as before — nothing changes unless you click **Begin Tx**.
+
+Clicking **Begin Tx** opens a dedicated connection for that tab and keeps it
+open across subsequent **Run** clicks in the same tab, so you can run a
+statement, inspect its results, and only then decide to **Commit** or
+**Rollback**. Transactions are per-tab, not shared across tabs. If a
+statement fails while a transaction is open, the transaction is left open
+rather than silently rolled back, so you keep the choice. Closing a tab or
+connection with an open transaction asks for confirmation first, since that
+rolls back whatever hasn't been committed.
+
 ### Edit and move data
 
 Run a `SELECT`, then edit cells in the result grid or use its context menu to
 add or delete rows. QForge tracks unsaved changes. Choose **Commit Changes**
-to review and apply them, or **Revert** to discard them.
+to review and apply them, or **Revert** to discard them. Drag a column
+header to reorder columns for the current view — copy, paste, and export
+all follow the new visual order.
 
-Use **File → Export Data…** to save query results as CSV, JSON, Excel, or SQL
-inserts. **File → Import Data…** loads CSV, JSON, or Excel data into the
-current query tab. To insert a CSV/TSV into an existing table, right-click the
-table in the schema browser and choose **Import CSV into Table…**.
+Use **File → Export Data…** to save the current query's results as CSV, JSON,
+Excel, or SQL inserts. Right-click a result grid for **Export result...**
+(everything) or **Export Selected Rows...** (just the highlighted rows).
+**File → Import Data…** loads CSV, JSON, or Excel data into the current
+query tab. To insert a CSV/TSV into an existing table, right-click the table
+in the schema browser and choose **Import CSV into Table…**.
+
+Exporting a whole database or a single table is independent of any query
+tab: use **File → Export Database…**, or right-click a table and choose
+**Export Table…**. Either way, you first choose what to include — structure
+only, data only, or both — and for a database export, which tables. Data-only
+table exports keep the full CSV/JSON/Excel/SQL format choice; structure
+(alone or with data) always writes a single SQL dump, since schema DDL
+doesn't fit the other formats.
 
 ## Keyboard shortcuts
 
@@ -121,6 +148,8 @@ table in the schema browser and choose **Import CSV into Table…**.
 | `Ctrl+W` | Close current tab / dialog |
 | `Ctrl+R` or `F5` | Refresh current view |
 | `Ctrl+P` | Search tables, columns, views, functions, history, snippets |
+| `Ctrl+F` | Find in the current query |
+| `Ctrl+Alt+F` | Find and Replace in the current query |
 | `Ctrl+E` | Export current query results |
 | `Ctrl+Shift+E` | Import data into the current query tab |
 | `Ctrl+Q` | Quit |

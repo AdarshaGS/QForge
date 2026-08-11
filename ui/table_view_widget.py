@@ -435,7 +435,19 @@ class TableViewWidget(QWidget):
         """Load the current page for current filter and sort, refreshing row count"""
         try:
             if self.current_filter:
-                count_query = f"SELECT COUNT(*) as total FROM {self.table_name} WHERE {self.current_filter}"
+                # Bug: this branch built count_query but never ran it, so
+                # self.total_rows stayed None after applying any filter —
+                # the pagination math a few lines below then crashed with
+                # "unsupported operand type(s) for +: 'NoneType' and 'int'"
+                # on the very next page load. Actually run it now, with the
+                # same fallback-on-failure shape as the unfiltered branch.
+                try:
+                    count_query = f"SELECT COUNT(*) as total FROM {self.table_name} WHERE {self.current_filter}"
+                    count_df = self.db_service.execute_query(count_query)
+                    self.total_rows = int(count_df.iloc[0]['total'])
+                except Exception as ex:
+                    logger.debug(f"Filtered row count failed for {self.table_name}: {ex}")
+                    self.total_rows = 1000000
             else:
                 # For large unfiltered tables, use approximation or skip count
                 try:

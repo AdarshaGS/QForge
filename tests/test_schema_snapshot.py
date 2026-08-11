@@ -6,7 +6,10 @@ string ending up in the "Tables" list, or duplicated "Views" entries).
 fetch_schema_snapshot() must always use its own dedicated connection and
 must never touch a caller-supplied "primary" DbService's connection.
 """
+import pandas as pd
+
 from services.db_service import DbService
+from services import schema_snapshot
 from services.schema_snapshot import fetch_schema_snapshot
 from utils import schema_cache
 
@@ -99,3 +102,68 @@ def test_fetch_schema_snapshot_without_id_does_not_write_cache(tmp_path, monkeyp
     fetch_schema_snapshot(config)
 
     assert not cache_file.exists()
+
+
+class _FakeMysqlConnection:
+    def __init__(self):
+        self.selected_db = None
+
+    def select_db(self, name):
+        self.selected_db = name
+
+
+class _FakeMysqlDbService:
+    """Simulates pymysql's real failure mode: get_tables()/get_all_columns()
+    raise "No database selected" until connection.select_db() has actually
+    been called — mirroring a MySQL connection profile with no configured
+    database. Used to test fetch_schema_snapshot's fetch ordering without
+    needing a live MySQL server."""
+
+    def __init__(self):
+        self.db_type = "mysql"
+        self.connection = _FakeMysqlConnection()
+
+    def connect(self, config):
+        pass
+
+    def execute_query(self, sql):
+        assert sql == "SHOW DATABASES"
+        return pd.DataFrame({"Database": ["shop"]})
+
+    def get_tables(self):
+        if self.connection.selected_db is None:
+            raise Exception("No database selected")
+        return ["orders"]
+
+    def get_all_columns(self):
+        if self.connection.selected_db is None:
+            raise Exception("No database selected")
+        return {"orders": ["id"]}
+
+    def get_views(self):
+        return []
+
+    def get_functions(self):
+        return []
+
+    def get_server_version(self):
+        return "MySQL 8.0.46"
+
+    def disconnect(self):
+        pass
+
+
+def test_fetch_schema_snapshot_mysql_with_no_database_selected_still_lists_tables(monkeypatch):
+    """Regression test: a MySQL connection profile with no database
+    configured used to come back with an empty tables list on first
+    connect (and stay empty until the user manually switched databases),
+    because get_tables()/get_all_columns() ran before the "no db selected
+    -> fall back to the first available db" logic ever executed."""
+    monkeypatch.setattr(schema_snapshot, "DbService", _FakeMysqlDbService)
+    config = {"type": "mysql", "name": "test", "database": ""}
+
+    snapshot = fetch_schema_snapshot(config)
+
+    assert snapshot["switched_db"] == "shop"
+    assert snapshot["tables"] == ["orders"]
+    assert snapshot["columns"] == {"orders": ["id"]}

@@ -394,10 +394,21 @@ class MainWindow(QMainWindow):
             self._prompt_new_connection(allow_cancel_quit=True)
 
     def _close_connection_at(self, index: int):
-        """Close the connection panel at *index* without confirmation."""
+        """Close the connection panel at *index*. No confirmation unless
+        one of its tabs has an open transaction (Slice 4, ai/load-
+        context.md) — closing would silently roll it back otherwise."""
         if index < 0 or index >= len(self._panels):
             return
         panel = self._panels[index]
+        if panel.has_open_transactions():
+            reply = QMessageBox.question(
+                self, "Open Transaction",
+                f"'{panel.config.get('name', 'This connection')}' has an "
+                "open transaction — closing it will roll back any "
+                "uncommitted changes.\n\nClose anyway?",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
         panel.disconnect()
         self.stack.removeWidget(panel)
         panel.deleteLater()
@@ -422,8 +433,14 @@ class MainWindow(QMainWindow):
             return
         if panel.tabs.count() > 0:
             idx = panel.tabs.currentIndex()
+            count_before = panel.tabs.count()
             if idx >= 0:
-                panel.tabs.removeTab(idx)
+                # Routes through ConnectionPanel._close_tab rather than
+                # tabs.removeTab() directly, so the open-transaction warning
+                # applies here too (Slice 4, ai/load-context.md).
+                panel._close_tab(idx)
+            if panel.tabs.count() == count_before:
+                return  # user cancelled the close (open-transaction warning)
             if panel.tabs.count() > 0:
                 return
         self._close_connection_tab(self.conn_tab_bar.currentIndex())

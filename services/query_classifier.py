@@ -39,7 +39,14 @@ WHERE_APPLICABLE_KINDS = {"UPDATE", "DELETE"}
 # sqlparse's get_type() reports UNKNOWN for these; the real keyword has to
 # come from the first non-comment token instead (verified against the
 # installed sqlparse version — see tests/test_query_classifier.py).
-_UNKNOWN_TYPE_FALLBACKS = {"GRANT", "REVOKE", "RENAME"}
+_UNKNOWN_TYPE_FALLBACKS = {"GRANT", "REVOKE", "RENAME", "BEGIN"}
+
+# Transaction-control statements (Slice 4, ai/load-context.md). Not writes,
+# not dangerous — used by services/db_service.py to route BEGIN/COMMIT/
+# ROLLBACK (however the user wrote it: typed directly or via the UI's
+# Begin/Commit/Rollback buttons) through its transaction state machine
+# instead of sending them as ordinary SQL.
+TRANSACTION_KINDS = {"BEGIN", "COMMIT", "ROLLBACK"}
 
 
 @dataclass
@@ -74,6 +81,11 @@ def classify(stmt_text: str) -> Classification:
         first = stmt.token_first(skip_cm=True)
         value = first.value.upper() if first else ""
         kind = value if value in _UNKNOWN_TYPE_FALLBACKS else "OTHER"
+    elif kind == "START":
+        # sqlparse types "START TRANSACTION" as "START" rather than
+        # UNKNOWN — fold it into the same bucket as "BEGIN"/"BEGIN
+        # TRANSACTION" so callers only need to check one kind.
+        kind = "BEGIN"
 
     is_write = kind in WRITE_KINDS
     is_destructive_ddl = kind in DESTRUCTIVE_DDL_KINDS

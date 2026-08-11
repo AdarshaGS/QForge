@@ -41,23 +41,13 @@ def fetch_schema_snapshot(config: dict, on_tables_ready=None) -> dict:
         result = {}
         db_type = db.db_type
 
-        try:
-            result["tables"] = db.get_tables()
-        except Exception as ex:
-            logger.debug(f"Failed to list tables: {ex}")
-            result["tables"] = []
-        try:
-            result["columns"] = db.get_all_columns()
-        except Exception as ex:
-            logger.debug(f"Failed to list columns: {ex}")
-            result["columns"] = {}
-
-        if on_tables_ready:
-            try:
-                on_tables_ready(result["tables"], result["columns"])
-            except Exception as ex:
-                logger.debug(f"schema_snapshot on_tables_ready callback failed: {ex}")
-
+        # MySQL alone allows connecting with no database selected (issue:
+        # schema tree stayed empty on first connect). Resolve that — and
+        # list every other db for the switcher UI — *before* fetching
+        # tables/columns below, so that fetch actually has a database to
+        # query against instead of failing/returning empty and never being
+        # retried. PostgreSQL always lands in a real database via libpq's
+        # own defaults, so it needs no equivalent fallback here.
         try:
             if db_type == "mysql":
                 df = db.execute_query("SHOW DATABASES")
@@ -76,6 +66,23 @@ def fetch_schema_snapshot(config: dict, on_tables_ready=None) -> dict:
         except Exception as ex:
             logger.debug(f"Failed to list databases: {ex}")
             result["dbs"] = []
+
+        try:
+            result["tables"] = db.get_tables()
+        except Exception as ex:
+            logger.debug(f"Failed to list tables: {ex}")
+            result["tables"] = []
+        try:
+            result["columns"] = db.get_all_columns()
+        except Exception as ex:
+            logger.debug(f"Failed to list columns: {ex}")
+            result["columns"] = {}
+
+        if on_tables_ready:
+            try:
+                on_tables_ready(result["tables"], result["columns"])
+            except Exception as ex:
+                logger.debug(f"schema_snapshot on_tables_ready callback failed: {ex}")
 
         try:
             result["views"] = db.get_views()

@@ -97,6 +97,12 @@ class EditableTableWidget(QTableWidget):
         hdr.sectionClicked.connect(self.on_header_clicked)
         hdr.setSortIndicatorShown(True)   # show ▲▼ arrows without enabling Qt sort
         hdr.setHighlightSections(False)
+        # Issue #122: drag-to-reorder columns. sectionClicked above still
+        # fires with the *logical* index regardless of visual position, so
+        # sorting is unaffected — but copy/paste below had to be audited
+        # separately, since those iterated logical indices assuming that
+        # matched left-to-right visual order (true before this, not after).
+        hdr.setSectionsMovable(True)
         
         # Theme will be set by update_theme method
         self.current_theme = 'dark'
@@ -737,6 +743,12 @@ class EditableTableWidget(QTableWidget):
 
             # ── Export ────────────────────────────────────────────────────────
             menu.addAction("Export result...").triggered.connect(self.export_selected)
+            # Issue #123: "Export result..." above exports everything
+            # regardless of selection despite export_selected()'s name —
+            # this is the actual selection-aware counterpart, kept
+            # alongside it rather than changing the existing action.
+            menu.addAction("Export Selected Rows...").triggered.connect(
+                self.export_selected_rows)
             menu.addSeparator()
 
             # ── Delete / NULL / Default ───────────────────────────────────────
@@ -781,9 +793,13 @@ class EditableTableWidget(QTableWidget):
     # ── Copy rows in multiple formats ─────────────────────────────────────────
 
     def _selected_rows_data(self) -> tuple[list[str], list[list[str]]]:
-        """Return (headers, [[row values], ...]) for currently selected rows."""
+        """Return (headers, [[row values], ...]) for currently selected rows,
+        in the columns' current *visual* (on-screen) order — matters once
+        columns are drag-reordered (issue #122); logical column index no
+        longer matches display order at that point."""
         rows = sorted({item.row() for item in self.selectedItems()})
-        cols = list(range(self.columnCount()))
+        hdr = self.horizontalHeader()
+        cols = [hdr.logicalIndex(v) for v in range(self.columnCount())]
         headers = [self.horizontalHeaderItem(c).text()
                    if self.horizontalHeaderItem(c) else str(c) for c in cols]
         data = []
@@ -876,13 +892,16 @@ class EditableTableWidget(QTableWidget):
         self.copy_rows_as(_map.get(format_type, format_type))
 
     def copy_to_clipboard(self):
-        """Copy selected cells to clipboard"""
+        """Copy selected cells to clipboard, in visual column order (issue
+        #122 — plain sorted() on logical index would silently reorder
+        pasted output once columns have been drag-reordered)."""
         from PySide6.QtWidgets import QApplication
         selected = self.selectedItems()
         if not selected:
             return
         rows = sorted(set(item.row() for item in selected))
-        cols = sorted(set(item.column() for item in selected))
+        hdr = self.horizontalHeader()
+        cols = sorted(set(item.column() for item in selected), key=hdr.visualIndex)
         text = []
         for row in rows:
             row_data = [self.item(row, col).text() if self.item(row, col) else "" for col in cols]
@@ -908,29 +927,34 @@ class EditableTableWidget(QTableWidget):
         QApplication.clipboard().setText("\n".join(values))
 
     def paste_from_clipboard(self):
-        """Paste from clipboard"""
+        """Paste from clipboard, walking *visually* adjacent columns from
+        the anchor cell (issue #122) — walking logical index would paste
+        into the wrong columns once they've been drag-reordered, since
+        adjacent logical indices are no longer adjacent on screen."""
         from PySide6.QtWidgets import QApplication
         clipboard = QApplication.clipboard()
         text = clipboard.text()
-        
+
         if not text:
             return
-        
+
         current = self.currentItem()
         if not current:
             return
-        
+
         start_row = current.row()
-        start_col = current.column()
-        
+        hdr = self.horizontalHeader()
+        start_visual_col = hdr.visualIndex(current.column())
+
         # Parse clipboard (tab-separated)
         lines = text.split("\n")
         for i, line in enumerate(lines):
             values = line.split("\t")
             for j, value in enumerate(values):
                 row = start_row + i
-                col = start_col + j
-                if row < self.rowCount() and col < self.columnCount():
+                visual_col = start_visual_col + j
+                if row < self.rowCount() and visual_col < self.columnCount():
+                    col = hdr.logicalIndex(visual_col)
                     item = self.item(row, col)
                     if item:
                         item.setText(value)
@@ -955,9 +979,32 @@ class EditableTableWidget(QTableWidget):
         self._repaint_row(source_row + 1)
     
     def export_selected(self):
-        """Export visible table data to CSV / JSON / Excel / SQL."""
+        """Export visible table data to CSV / JSON / Excel / SQL — despite
+        the name, this has always exported *all* rows (filtered/original),
+        not the current selection; kept as-is since it's a useful action on
+        its own. export_selected_rows() below is the actual
+        selection-scoped export (issue #123)."""
         df = self.filtered_data if self.filtered_data is not None else self.original_data
         export_dataframe(self, df, f"{self.table_name or 'data'}.csv", self.table_name or "table")
+
+    def export_selected_rows(self):
+        """Export only the currently-selected rows (issue #123). Reads
+        from the same typed DataFrame export_selected() uses (not the
+        grid's stringified cell text, unlike copy_rows_as()) so numeric/
+        date columns keep their real types in JSON/Excel output — row
+        positions in filtered_data/original_data always match the grid's
+        row indices 1:1, since load_data() reloads both together."""
+        selected_rows = sorted({item.row() for item in self.selectedItems()})
+        if not selected_rows:
+            QMessageBox.information(self, "Export", "No rows selected.")
+            return
+        base_df = self.filtered_data if self.filtered_data is not None else self.original_data
+        if base_df is None:
+            QMessageBox.information(self, "Export", "No data to export.")
+            return
+        df = base_df.iloc[selected_rows]
+        export_dataframe(
+            self, df, f"{self.table_name or 'data'}_selection.csv", self.table_name or "table")
     
     def set_cell_null(self):
         """Set current cell to NULL"""

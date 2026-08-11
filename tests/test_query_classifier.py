@@ -4,7 +4,9 @@
 # sqlparse>=0.4.4 with no upper bound). If these tests start failing after a
 # sqlparse upgrade, that's exactly what they're here to catch.
 
-from services.query_classifier import classify, is_dangerous, split_statements
+from services.query_classifier import (
+    TRANSACTION_KINDS, classify, is_dangerous, split_statements,
+)
 
 
 def test_split_statements_splits_on_semicolons():
@@ -132,3 +134,27 @@ def test_plain_single_row_insert_is_not_flagged_dangerous():
     # themselves. A single-row INSERT alone is not in the "at minimum flag"
     # list.
     assert not is_dangerous(classify("INSERT INTO users (id) VALUES (1)"))
+
+
+# ─── Transaction-control statements (Slice 4, ai/load-context.md) ──────────
+
+
+def test_transaction_control_statements_classify_into_transaction_kinds():
+    cases = {
+        "BEGIN": "BEGIN",
+        "BEGIN TRANSACTION": "BEGIN",
+        "START TRANSACTION": "BEGIN",
+        "COMMIT": "COMMIT",
+        "ROLLBACK": "ROLLBACK",
+    }
+    for sql, expected_kind in cases.items():
+        c = classify(sql)
+        assert c.kind == expected_kind, sql
+        assert c.kind in TRANSACTION_KINDS, sql
+
+
+def test_transaction_control_statements_are_not_writes_or_dangerous():
+    for sql in ("BEGIN", "BEGIN TRANSACTION", "START TRANSACTION", "COMMIT", "ROLLBACK"):
+        c = classify(sql)
+        assert c.is_write is False, sql
+        assert not is_dangerous(c), sql

@@ -493,8 +493,17 @@ class QueryVerifierDialog(QDialog):
                     self._opt_editor.toPlainText())
         params = _extract_params(combined)
 
-        # Remove inputs no longer present, add new ones, keep existing values
-        existing = dict(self._param_inputs)
+        # Remove inputs no longer present, add new ones, keep existing values.
+        # Read out the *text*, not the widget, before tearing the row down —
+        # QFormLayout.removeRow() deletes the row's widgets (unlike
+        # takeRow()), so a reference captured beforehand and read afterward
+        # (as this used to do) is a dangling C++ object. Reading .text() on
+        # it raised a RuntimeError ("already deleted") that aborted the rest
+        # of this method, including the setVisible() call below — silently
+        # leaving the parameter panel empty/stale until a later refresh
+        # happened not to hit a pre-existing name and slipped past the bug
+        # (issue #44: looked like only Enter, never paste, could refresh it).
+        existing_values = {name: inp.text() for name, inp in self._param_inputs.items()}
         # Clear form
         while self._param_form.rowCount():
             self._param_form.removeRow(0)
@@ -511,8 +520,8 @@ class QueryVerifierDialog(QDialog):
                 f" border-radius:4px; padding:0 6px; font-size:12px;"
             )
             # Restore previous value if the param already existed
-            if name in existing:
-                inp.setText(existing[name].text())
+            if name in existing_values:
+                inp.setText(existing_values[name])
             self._param_form.addRow(lbl, inp)
             self._param_inputs[name] = inp
 

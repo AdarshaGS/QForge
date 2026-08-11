@@ -48,6 +48,14 @@ class ReadOnlyViolation(Exception):
     pass
 
 
+class TransactionError(Exception):
+    """Raised on transaction-state misuse (double BEGIN, COMMIT/ROLLBACK
+    with nothing open, or a connection lost while a transaction was open).
+    Kept distinct from a raw driver error so the UI can show a clear
+    message instead of a database-specific one."""
+    pass
+
+
 class DbService:
 
     def __init__(self):
@@ -56,6 +64,7 @@ class DbService:
         self.db_type = None  # 'mysql', 'postgresql', 'sqlite'
         self.ssh_tunnel = None  # SSH tunnel object
         self.read_only = False
+        self.in_transaction = False
         self._config = None   # stored for auto-reconnect
 
     def _guard(self, sql: str):
@@ -72,12 +81,68 @@ class DbService:
                     f"This connection is read-only — blocked: {stmt[:200]}"
                 )
 
+    def begin_transaction(self):
+        """Start a manual transaction, turning off this connection's
+        per-statement autocommit until commit_transaction()/
+        rollback_transaction() is called. Dialect-specific: MySQL and
+        PostgreSQL drivers autocommit by default (see connect()), so
+        starting a manual transaction means explicitly disabling that;
+        SQLite already opens an implicit transaction on the first write
+        under its default isolation level, so an explicit BEGIN just makes
+        that transaction start immediately (covering leading SELECTs too)
+        instead of on the first DML statement."""
+        if not self.connection:
+            raise TransactionError("No active database connection.")
+        if self.in_transaction:
+            raise TransactionError("A transaction is already open on this connection.")
+
+        if self.db_type == "mysql":
+            self.connection.autocommit(False)
+            with self.connection.cursor() as cur:
+                cur.execute("BEGIN")
+        elif self.db_type == "postgresql":
+            self.connection.autocommit = False
+        elif self.db_type == "sqlite":
+            self.connection.execute("BEGIN")
+        else:
+            raise TransactionError(f"Transactions are not supported for {self.db_type}")
+
+        self.in_transaction = True
+
+    def commit_transaction(self):
+        """Commit the open manual transaction and restore autocommit."""
+        if not self.in_transaction:
+            raise TransactionError("No open transaction to commit.")
+        self.connection.commit()
+        self._restore_autocommit()
+        self.in_transaction = False
+
+    def rollback_transaction(self):
+        """Roll back the open manual transaction and restore autocommit."""
+        if not self.in_transaction:
+            raise TransactionError("No open transaction to roll back.")
+        self.connection.rollback()
+        self._restore_autocommit()
+        self.in_transaction = False
+
+    def _restore_autocommit(self):
+        """Undo the autocommit=False set by begin_transaction() for
+        drivers that need it explicitly re-enabled (MySQL/PostgreSQL).
+        SQLite has no persistent autocommit flag to restore — its default
+        isolation level already re-opens an implicit transaction on the
+        next write and commits it via _execute_query_raw as before."""
+        if self.db_type == "mysql":
+            self.connection.autocommit(True)
+        elif self.db_type == "postgresql":
+            self.connection.autocommit = True
+
     def connect(self, config):
         """Connect to database based on type"""
 
         db_type = config.get("type", "mysql").lower()
         self.db_type = db_type
         self.read_only = bool(config.get("read_only"))
+        self.in_transaction = False
 
         logger.info(f"Connecting to {db_type} database: {config['name']}")
 
@@ -268,7 +333,8 @@ class DbService:
             self.connection.close()
 
         self.connection = None
-        
+        self.in_transaction = False
+
         # Close SSH tunnel if active
         if self.ssh_tunnel:
             try:
@@ -376,6 +442,33 @@ class DbService:
         except Exception:
             return False
 
+    def _transaction_kind(self, query: str) -> str | None:
+        """Return 'BEGIN'/'COMMIT'/'ROLLBACK' if *query* is exactly one
+        transaction-control statement (however the user wrote it — typed
+        directly in the editor or via the Begin/Commit/Rollback buttons),
+        else None. Keeping this the single detection point means
+        in_transaction stays accurate regardless of entry point."""
+        stmts = query_classifier.split_statements(query)
+        if len(stmts) != 1:
+            return None
+        kind = query_classifier.classify(stmts[0]).kind
+        return kind if kind in query_classifier.TRANSACTION_KINDS else None
+
+    def _run_transaction_kind(self, kind: str):
+        """Execute a detected transaction-control statement and return a
+        status DataFrame, matching the existing DML-feedback shape used by
+        _execute_query_raw's 'Query OK, rows affected' rows."""
+        if kind == "BEGIN":
+            self.begin_transaction()
+            status = "Started"
+        elif kind == "COMMIT":
+            self.commit_transaction()
+            status = "Committed"
+        else:
+            self.rollback_transaction()
+            status = "Rolled back"
+        return pd.DataFrame([{"Transaction": status}])
+
     def execute_query(self, query):
         """Execute a SELECT query and return results as DataFrame"""
 
@@ -384,10 +477,21 @@ class DbService:
 
         self._guard(query)
 
+        tx_kind = self._transaction_kind(query)
+        if tx_kind:
+            return self._run_transaction_kind(tx_kind)
+
         try:
             return self._execute_query_raw(query)
         except Exception as ex:
             if self._is_connection_error(ex):
+                if self.in_transaction:
+                    self.in_transaction = False
+                    self._reconnect()
+                    raise TransactionError(
+                        "Connection was lost while a transaction was open — "
+                        "it was rolled back. Reconnected; please retry."
+                    ) from ex
                 logger.warning(f"Connection lost during query, reconnecting... ({ex})")
                 self._reconnect()
                 return self._execute_query_raw(query)
@@ -511,7 +615,8 @@ class DbService:
                 return pd.DataFrame(data, columns=cols) if data else pd.DataFrame(columns=cols)
             else:
                 affected = cursor.rowcount
-                self.connection.commit()
+                if not self.in_transaction:
+                    self.connection.commit()
                 cursor.close()
                 return pd.DataFrame([{"Query OK, rows affected": affected}])
 
@@ -529,6 +634,13 @@ class DbService:
             result = self._execute_update_raw(query)
         except Exception as ex:
             if self._is_connection_error(ex):
+                if self.in_transaction:
+                    self.in_transaction = False
+                    self._reconnect()
+                    raise TransactionError(
+                        "Connection was lost while a transaction was open — "
+                        "it was rolled back. Reconnected; please retry."
+                    ) from ex
                 logger.warning(f"Connection lost during update, reconnecting... ({ex})")
                 self._reconnect()
                 result = self._execute_update_raw(query)
@@ -559,12 +671,18 @@ class DbService:
             logger.debug(f"Schema-cache invalidation check failed: {ex}")
 
     def _execute_update_raw(self, query):
-        """Internal: run DML without reconnect logic."""
+        """Internal: run DML without reconnect logic. The explicit commit()
+        is a no-op for MySQL/PostgreSQL under normal autocommit=True but is
+        what actually persists SQLite writes — skipped while a manual
+        transaction is open so a script's own COMMIT/ROLLBACK decides when
+        these statements take effect instead of each one committing
+        immediately, which would end the transaction after the first write."""
         cursor = self.connection.cursor()
         cursor.execute(query)
         affected_rows = cursor.rowcount
         cursor.close()
-        self.connection.commit()
+        if not self.in_transaction:
+            self.connection.commit()
         return affected_rows
 
     def execute_batch(self, query, rows, batch_size=500, on_batch=None, should_cancel=None):

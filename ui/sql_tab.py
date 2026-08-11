@@ -261,6 +261,50 @@ class SqlTab(QWidget):
         self.pin_btn.toggled.connect(self._on_pin_toggled)
         run_layout.addWidget(self.pin_btn)
 
+        # ── Transaction controls (Slice 4, ai/load-context.md) ──────────────
+        # Tab-scoped: this tab gets its own persistent connection once a
+        # transaction is open (see ConnectionPanel._run_query_in_tab), so the
+        # status/buttons here reflect only this tab, not the whole connection.
+        self.tx_status_lbl = QLabel("")
+        self.tx_status_lbl.setStyleSheet(
+            "color: #ff9f0a; font-size: 12px; font-weight: 600;"
+        )
+        self.tx_status_lbl.hide()
+        run_layout.addWidget(self.tx_status_lbl)
+
+        _tx_btn_style = """
+            QPushButton {
+                background: transparent;
+                color: #8e8e93;
+                border: 1px solid #3a3a3c;
+                border-radius: 5px;
+                padding: 0 10px;
+                font-size: 12px;
+            }
+            QPushButton:hover:!disabled { color: #e5e5ea; border-color: #636366; }
+            QPushButton:disabled { color: #48484a; border-color: #2c2c2e; }
+        """
+
+        self.begin_tx_btn = QPushButton("Begin Tx")
+        self.begin_tx_btn.setFixedHeight(28)
+        self.begin_tx_btn.setToolTip("Start a manual transaction on a dedicated connection for this tab")
+        self.begin_tx_btn.setStyleSheet(_tx_btn_style)
+        run_layout.addWidget(self.begin_tx_btn)
+
+        self.commit_tx_btn = QPushButton("Commit")
+        self.commit_tx_btn.setFixedHeight(28)
+        self.commit_tx_btn.setEnabled(False)
+        self.commit_tx_btn.setToolTip("Commit the open transaction")
+        self.commit_tx_btn.setStyleSheet(_tx_btn_style)
+        run_layout.addWidget(self.commit_tx_btn)
+
+        self.rollback_tx_btn = QPushButton("Rollback")
+        self.rollback_tx_btn.setFixedHeight(28)
+        self.rollback_tx_btn.setEnabled(False)
+        self.rollback_tx_btn.setToolTip("Roll back the open transaction, discarding its changes")
+        self.rollback_tx_btn.setStyleSheet(_tx_btn_style)
+        run_layout.addWidget(self.rollback_tx_btn)
+
         run_layout.addStretch()
 
         self.cancel_btn = QPushButton("Cancel")
@@ -353,6 +397,17 @@ class SqlTab(QWidget):
         self._fb_regex_btn.setFixedSize(26, 22)
         self._fb_regex_btn.setStyleSheet(_toggle_style)
 
+        # Visible toggle for the replace row (issue #112) — Replace was only
+        # reachable via a keyboard shortcut that macOS intercepted for its
+        # own "Hide Application" command, so there was no way to discover or
+        # open it at all from the UI. Checkable so its state stays in sync
+        # with however the row was actually opened/closed (shortcut or Esc).
+        self._fb_replace_toggle_btn = QPushButton("⇄ Replace")
+        self._fb_replace_toggle_btn.setCheckable(True)
+        self._fb_replace_toggle_btn.setToolTip("Toggle Replace (Ctrl+Alt+F)")
+        self._fb_replace_toggle_btn.setFixedHeight(22)
+        self._fb_replace_toggle_btn.setStyleSheet(_toggle_style)
+
         _prev_btn = QPushButton("▲")
         _prev_btn.setFixedSize(22, 26)
         _prev_btn.setStyleSheet(_action_style)
@@ -378,7 +433,9 @@ class SqlTab(QWidget):
         _replace_btn.setStyleSheet(_action_style)
         _replace_all_btn = QPushButton("Replace All")
         _replace_all_btn.setStyleSheet(_action_style)
-        rr_layout.addWidget(QLabel("Replace:"))
+        _replace_lbl = QLabel("Replace:")
+        _replace_lbl.setFixedWidth(52)
+        rr_layout.addWidget(_replace_lbl)
         rr_layout.addWidget(self._replace_input, 2)
         rr_layout.addWidget(_replace_btn)
         rr_layout.addWidget(_replace_all_btn)
@@ -398,11 +455,14 @@ class SqlTab(QWidget):
         find_row_l = QHBoxLayout(find_row_w)
         find_row_l.setContentsMargins(0, 0, 0, 0)
         find_row_l.setSpacing(6)
-        find_row_l.addWidget(QLabel("Find:"))
+        _find_lbl = QLabel("Find:")
+        _find_lbl.setFixedWidth(52)
+        find_row_l.addWidget(_find_lbl)
         find_row_l.addWidget(self._find_input, 2)
         find_row_l.addWidget(self._fb_case_btn)
         find_row_l.addWidget(self._fb_word_btn)
         find_row_l.addWidget(self._fb_regex_btn)
+        find_row_l.addWidget(self._fb_replace_toggle_btn)
         find_row_l.addWidget(self._find_match_lbl)
         find_row_l.addWidget(_prev_btn)
         find_row_l.addWidget(_next_btn)
@@ -419,6 +479,7 @@ class SqlTab(QWidget):
         self._fb_case_btn.toggled.connect(self._find_live_update)
         self._fb_word_btn.toggled.connect(self._find_live_update)
         self._fb_regex_btn.toggled.connect(self._find_live_update)
+        self._fb_replace_toggle_btn.toggled.connect(self._on_replace_toggle_clicked)
         _next_btn.clicked.connect(self._find_next)
         _prev_btn.clicked.connect(self._find_prev)
         _close_find_btn.clicked.connect(self._hide_find_bar)
@@ -630,8 +691,14 @@ class SqlTab(QWidget):
         self.minify_shortcut = QShortcut(QKeySequence("Ctrl+Shift+I"), self)
         self.minify_shortcut.activated.connect(self.minify_sql)
 
-        # Ctrl+H — find & replace (shows replace row)
-        self.find_shortcut = QShortcut(QKeySequence("Ctrl+H"), self)
+        # Ctrl+Alt+F (Cmd+Option+F on macOS) — find & replace (shows replace
+        # row). NOT Ctrl+H/Cmd+H (issue #112): on macOS, Cmd+H is the
+        # system-wide "Hide Application" shortcut and is intercepted by the
+        # OS before Qt ever sees it, so that binding silently hid the whole
+        # window instead of opening Replace — indistinguishable, from the
+        # user's side, from Replace not existing at all. Cmd+Option+F
+        # matches the convention used by Xcode/Sublime/VS Code on Mac.
+        self.find_shortcut = QShortcut(QKeySequence("Ctrl+Alt+F"), self)
         self.find_shortcut.activated.connect(self._toggle_find_replace)
 
         # Ctrl+F — find only (hides replace row)
@@ -1773,7 +1840,7 @@ class SqlTab(QWidget):
             self.toggle_filter()
             return
         if self._find_bar.isHidden():
-            self._replace_row.hide()
+            self._set_replace_row_visible(False)
             self._find_bar.show()
             self._find_input.setFocus()
             self._find_input.selectAll()
@@ -1782,15 +1849,34 @@ class SqlTab(QWidget):
             self._hide_find_bar()
 
     def _toggle_find_replace(self):
-        """Cmd+H: show find+replace bar."""
-        self._replace_row.show()
+        """Ctrl+Alt+F (Cmd+Option+F on macOS): show find+replace bar."""
+        self._set_replace_row_visible(True)
         self._find_bar.show()
         self._find_input.setFocus()
         self._find_input.selectAll()
         self._find_live_update()
 
+    def _on_replace_toggle_clicked(self, checked: bool):
+        """The visible 'Replace' toggle button in the find bar (issue #112)
+        — lets Replace be discovered and opened without needing to know any
+        keyboard shortcut."""
+        self._set_replace_row_visible(checked)
+        if not self._find_bar.isHidden() and checked:
+            self._replace_input.setFocus()
+
+    def _set_replace_row_visible(self, visible: bool):
+        """Single place that shows/hides the replace row and keeps the
+        toggle button's checked state in sync with it, regardless of which
+        entry point (shortcut, button, Esc) drove the change."""
+        self._replace_row.setVisible(visible)
+        if self._fb_replace_toggle_btn.isChecked() != visible:
+            self._fb_replace_toggle_btn.blockSignals(True)
+            self._fb_replace_toggle_btn.setChecked(visible)
+            self._fb_replace_toggle_btn.blockSignals(False)
+
     def _hide_find_bar(self):
         self._find_bar.hide()
+        self._set_replace_row_visible(False)
         self._find_matches.clear()
         self._find_match_idx = -1
         self._find_match_lbl.setText("")
@@ -1993,3 +2079,17 @@ class SqlTab(QWidget):
                 panel._save_pinned_tabs()
                 break
             panel = panel.parent()
+
+    def set_transaction_state(self, active: bool):
+        """Reflect whether this tab has an open manual transaction:
+        toggles Begin/Commit/Rollback availability and the status label.
+        Driven by ConnectionPanel._refresh_transaction_indicator — this
+        tab has no transaction state of its own, it just displays it."""
+        self.begin_tx_btn.setEnabled(not active)
+        self.commit_tx_btn.setEnabled(active)
+        self.rollback_tx_btn.setEnabled(active)
+        if active:
+            self.tx_status_lbl.setText("● Transaction open")
+            self.tx_status_lbl.show()
+        else:
+            self.tx_status_lbl.hide()

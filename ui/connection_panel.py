@@ -34,6 +34,7 @@ from ui.snippet_manager import SnippetManager
 from ui.structure_editor import StructureEditorDialog
 from ui.db_switcher_dialog import DbSwitcherDialog
 from ui.query_history_dialog import QueryHistoryDialog
+from ui.export_scope_dialog import ExportScopeDialog
 from ui.theme_manager import ThemeManager
 from ui import query_guard_dialog
 from utils.logger import get_logger
@@ -57,7 +58,12 @@ MASS_WRITE_ROW_THRESHOLD = 5000
 class _QueryWorker(QObject):
     """Runs one or more SQL statements on a QThread and emits the result.
     Receives a *dedicated* DbService connection so it never shares state
-    with the main connection used for schema browsing."""
+    with the main connection used for schema browsing. That connection is
+    normally closed once this run finishes (see `finally` below) — but if
+    the run left it inside a manual transaction (Slice 4, ai/load-
+    context.md), closing it here would silently lose or half-commit the
+    user's open transaction, so the caller (ConnectionPanel) is responsible
+    for keeping it alive across subsequent runs in that case."""
     done       = Signal(object, float)   # (DataFrame, elapsed_seconds)
     multi_done = Signal(list,  float)    # ([(label, df|Exception), ...], elapsed)
     errored    = Signal(str,   float)    # (error_message, elapsed_seconds)
@@ -102,11 +108,14 @@ class _QueryWorker(QObject):
             else:
                 self.errored.emit(str(ex), elapsed)
         finally:
-            # Close the dedicated query connection when done
-            try:
-                self._db.disconnect()
-            except Exception:
-                pass
+            # Close the dedicated query connection when done — unless this
+            # run left it inside an open transaction, in which case it must
+            # survive to the next Run/Commit/Rollback click on this tab.
+            if not self._db.in_transaction:
+                try:
+                    self._db.disconnect()
+                except Exception:
+                    pass
 
 
 class ConnectionPanel(QWidget):
@@ -158,6 +167,16 @@ class ConnectionPanel(QWidget):
         self.all_schema_items = []
         self.current_theme = "dark"
         self._available_dbs: list[str] = []
+
+        # Schema-loading progress indicator (issue #57) — ticks the elapsed
+        # time on whichever top-level tree row represents an in-flight
+        # fetch (first-time "Loading…" or a stale-cache "refreshing…" row),
+        # so it reads as visibly active rather than a frozen placeholder.
+        self._schema_load_timer = None
+        self._schema_load_start = 0.0
+        self._schema_status_item = None
+        self._schema_tables_seen = 0
+        self._schema_retry_item = None
 
         # Wire bridge signals → main-thread handlers (connected once here so
         # QueuedConnection always delivers on the main thread event loop).
@@ -429,6 +448,7 @@ class ConnectionPanel(QWidget):
         # (services/schema_snapshot.py), so it doesn't need self.db_service
         # to be live, and the cache check further down still applies.
         if not self.db_service or (not self.db_service.connection and not self._connecting):
+            self._stop_schema_loading_indicator()
             self.schema_tree.clear()
             self.all_tables.clear()
             self.all_table_items.clear()
@@ -436,6 +456,8 @@ class ConnectionPanel(QWidget):
             return
 
         # Clear immediately so the user sees empty tree straight away
+        self._stop_schema_loading_indicator()
+        self._schema_retry_item = None
         self.schema_tree.clear()
         self.all_tables.clear()
         self.all_table_items.clear()
@@ -447,8 +469,16 @@ class ConnectionPanel(QWidget):
         cached = schema_cache.load(
             self.config.get("id", ""), self.config.get("database", ""))
         if not self._apply_cached_schema(cached):
-            loading_item = QTreeWidgetItem(["Loading…"])
+            # Issue #57: a first-time connect had nothing but a static
+            # "Loading…" row for however long the fetch took — easy to
+            # mistake for a frozen app on a large schema. Tick elapsed time
+            # (mirrors the Run button's own "⏳ 0.0s" ticker) so it visibly
+            # keeps moving, and upgrade the text with a table count the
+            # moment that's known (_on_schema_tables_ready, ahead of the
+            # slower dbs/views/functions round-trips per issue #16).
+            loading_item = QTreeWidgetItem(["⏳ Loading schema…"])
             self.schema_tree.addTopLevelItem(loading_item)
+            self._start_schema_loading_indicator(loading_item)
 
         self._spawn_schema_fetch(dict(self.config))
 
@@ -463,9 +493,40 @@ class ConnectionPanel(QWidget):
         self._on_schema_tables_ready(cached.get("tables", []), cached.get("columns", {}))
         self._on_schema_loaded(cached)
         if schema_cache.is_stale(cached):
-            self.schema_tree.insertTopLevelItem(
-                0, QTreeWidgetItem(["⏱ Cached schema (stale) — refreshing…"]))
+            stale_item = QTreeWidgetItem(["⏱ Cached schema (stale) — refreshing…"])
+            self.schema_tree.insertTopLevelItem(0, stale_item)
+            self._start_schema_loading_indicator(stale_item)
         return True
+
+    def _start_schema_loading_indicator(self, item: QTreeWidgetItem):
+        """Attach a live elapsed-time ticker to *item* (already inserted in
+        the tree) for the duration of the in-flight fetch (issue #57)."""
+        self._schema_status_item = item
+        self._schema_tables_seen = 0
+        self._schema_load_start = time.time()
+        if self._schema_load_timer is None:
+            from PySide6.QtCore import QTimer
+            self._schema_load_timer = QTimer(self)
+            self._schema_load_timer.setInterval(200)
+            self._schema_load_timer.timeout.connect(self._tick_schema_loading)
+        self._tick_schema_loading()
+        self._schema_load_timer.start()
+
+    def _tick_schema_loading(self):
+        if self._schema_status_item is None:
+            return
+        elapsed = time.time() - self._schema_load_start
+        if self._schema_tables_seen:
+            text = (f"⏳ {self._schema_tables_seen:,} table(s) found — "
+                    f"loading details… {elapsed:.1f}s")
+        else:
+            text = f"⏳ Loading schema… {elapsed:.1f}s"
+        self._schema_status_item.setText(0, text)
+
+    def _stop_schema_loading_indicator(self):
+        if self._schema_load_timer is not None:
+            self._schema_load_timer.stop()
+        self._schema_status_item = None
 
     def _spawn_schema_fetch(self, conf: dict):
         """Fetch schema on a daemon thread using a *dedicated* connection
@@ -532,9 +593,16 @@ class ConnectionPanel(QWidget):
             tab = self.tabs.widget(i)
             if isinstance(tab, SqlTab):
                 tab.set_schema(tables, columns)
+        # Issue #57: surface the table count on the loading indicator the
+        # moment it's known, rather than leaving it a bare "Loading…" for
+        # the remainder of the (slower) dbs/views/functions round-trips.
+        if self._schema_status_item is not None:
+            self._schema_tables_seen = len(tables)
+            self._tick_schema_loading()
 
     def _on_schema_loaded(self, result: dict):
         """Main-thread: populate the schema tree from background result."""
+        self._stop_schema_loading_indicator()
         # Update DB list + pill
         dbs = result.get("dbs", [])
         self._available_dbs = dbs
@@ -605,9 +673,17 @@ class ConnectionPanel(QWidget):
                 tab.set_schema(tables, columns)
 
     def _on_schema_error(self, msg: str):
+        self._stop_schema_loading_indicator()
         self.schema_tree.clear()
-        err = QTreeWidgetItem([f"⚠ {msg}"])
+        err = QTreeWidgetItem([f"⚠ Failed to load schema: {msg}"])
         self.schema_tree.addTopLevelItem(err)
+        # Issue #57: give failure an explicit retry affordance rather than
+        # just leaving a dead-end error row — reuses load_schema() via the
+        # existing itemClicked wiring (_on_item_clicked), same action as
+        # the "↺ Schema" toolbar button.
+        retry = QTreeWidgetItem(["↺  Click to retry"])
+        self.schema_tree.addTopLevelItem(retry)
+        self._schema_retry_item = retry
         logger.error(f"Schema load error: {msg}")
 
     def _load_databases(self):
@@ -807,6 +883,10 @@ class ConnectionPanel(QWidget):
 
     def _on_item_clicked(self, item, column):
         if item.parent() is None:
+            # Issue #57: the "↺ Click to retry" row shown after a failed
+            # schema load — same action as the toolbar's "↺ Schema" button.
+            if item is self._schema_retry_item:
+                self.load_schema()
             return
         if item.parent().text(0) in ("Tables", "Views"):
             self.open_table_view(item.text(0))
@@ -944,6 +1024,9 @@ class ConnectionPanel(QWidget):
         idx = self.tabs.addTab(tab, f"Tab {count}")
         tab.run_btn.clicked.connect(lambda: self._run_query_in_tab(tab))
         tab.verify_btn.clicked.connect(lambda: self._open_verify_dialog(tab))
+        tab.begin_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "BEGIN"))
+        tab.commit_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "COMMIT"))
+        tab.rollback_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "ROLLBACK"))
         # Wire inline-edit commit: execute SQL with our db_service
         tab.commit_sql.connect(lambda sqls, t=tab: self._execute_commit_sql(sqls, t))
         # Push current schema so autocomplete works immediately
@@ -1049,6 +1132,7 @@ class ConnectionPanel(QWidget):
         if self.tabs.currentWidget() is not tab:
             tab_name = self.tabs.tabText(self.tabs.indexOf(tab))
             self._show_query_toast(tab_name, len(df), elapsed)
+        self._finalize_query_connection(tab)
 
     def _on_query_multi_done(self, tab, results: list, elapsed: float):
         """Multi-statement result handler — shows each SELECT in its own sub-tab."""
@@ -1086,6 +1170,7 @@ class ConnectionPanel(QWidget):
             tab.show_error(msgs, elapsed=elapsed)
 
         self.health_changed.emit('idle')
+        self._finalize_query_connection(tab)
 
 
     def _on_query_errored(self, tab, message, elapsed):
@@ -1102,6 +1187,7 @@ class ConnectionPanel(QWidget):
             self.health_changed.emit('disconnected')
         else:
             self.health_changed.emit('idle')
+        self._finalize_query_connection(tab)
 
     def _on_query_cancelled(self, tab):
         """Receives worker `cancelled` signal via bridge — guaranteed main thread."""
@@ -1111,6 +1197,7 @@ class ConnectionPanel(QWidget):
         if hasattr(tab, '_query_thread'):
             tab._query_thread.quit()
         tab.show_cancelled()
+        self._finalize_query_connection(tab)
 
     # ── Parameterised query helpers ────────────────────────────────────────────
 
@@ -1174,9 +1261,14 @@ class ConnectionPanel(QWidget):
             query = query.replace(f"{{{{{name}}}}}", le.text())
         return query
 
-    def _run_query_in_tab(self, tab):
-        """Execute the SQL in `tab` on a background thread; Cancel actually stops it."""
-        query = tab.get_query().strip()
+    def _run_query_in_tab(self, tab, override_query: str = None):
+        """Execute the SQL in `tab` on a background thread; Cancel actually
+        stops it. *override_query* (set by the Begin/Commit/Rollback
+        buttons) bypasses the editor content and the format/param-prompt
+        steps below, but still goes through the same guard, connection
+        handling, and worker dispatch as typed SQL — a single code path so
+        transaction control can't accidentally skip the write guard."""
+        query = override_query if override_query is not None else tab.get_query().strip()
         if not query:
             return
         if self._connecting:
@@ -1185,20 +1277,21 @@ class ConnectionPanel(QWidget):
                 "Still connecting to the database — try again in a moment.")
             return
 
-        # Format on run if user has the toggle active
-        if getattr(tab, '_format_on_run', False):
-            import sqlparse
-            try:
-                query = sqlparse.format(query, reindent=True, keyword_case="upper")
-                tab.editor.setPlainText(query)
-            except Exception:
-                pass  # query too large for sqlparse — run as-is
+        if override_query is None:
+            # Format on run if user has the toggle active
+            if getattr(tab, '_format_on_run', False):
+                import sqlparse
+                try:
+                    query = sqlparse.format(query, reindent=True, keyword_case="upper")
+                    tab.editor.setPlainText(query)
+                except Exception:
+                    pass  # query too large for sqlparse — run as-is
 
-        # ── Parameterised queries: prompt for {{var}} values ──────────────────
-        resolved = self._prompt_params(query)
-        if resolved is None:
-            return          # user cancelled
-        query = resolved
+            # ── Parameterised queries: prompt for {{var}} values ───────────────
+            resolved = self._prompt_params(query)
+            if resolved is None:
+                return          # user cancelled
+            query = resolved
 
         if not self._guard_write(query):
             return
@@ -1247,16 +1340,23 @@ class ConnectionPanel(QWidget):
         elapsed_timer.start()
         tab._elapsed_timer = elapsed_timer
 
-        # ── Dedicated connection for this query (prevents shared-connection races) ──
-        query_db = DbService()
-        try:
-            query_db.connect(self.config)
-        except Exception as ex:
-            tab._query_running = False
-            self._restore_run_btn(tab)
-            tab.cancel_btn.setEnabled(False)
-            tab.show_error(str(ex))
-            return
+        # ── Dedicated connection for this query (prevents shared-connection
+        # races) — reused across runs if this tab already has an open
+        # transaction, so BEGIN...COMMIT can span multiple Run clicks.
+        existing_tx_db = getattr(tab, '_tx_db_service', None)
+        if existing_tx_db is not None:
+            query_db = existing_tx_db
+        else:
+            query_db = DbService()
+            try:
+                query_db.connect(self.config)
+            except Exception as ex:
+                tab._query_running = False
+                self._restore_run_btn(tab)
+                tab.cancel_btn.setEnabled(False)
+                tab.show_error(str(ex))
+                return
+        tab._active_query_db = query_db
 
         worker = _QueryWorker(query_db, query, tab._cancel_flag)
         thread = QThread(self)
@@ -1303,6 +1403,47 @@ class ConnectionPanel(QWidget):
 
         thread.start()
 
+    def _run_transaction_control(self, tab, stmt: str):
+        """Handler for the tab's Begin/Commit/Rollback buttons — runs
+        *stmt* through the exact same path as typed SQL (see
+        _run_query_in_tab's override_query)."""
+        if getattr(tab, '_query_running', False):
+            return
+        self._run_query_in_tab(tab, override_query=stmt)
+
+    def _finalize_query_connection(self, tab):
+        """Called at the end of every query-completion handler. Decides
+        whether this tab's connection survives past the run that just
+        finished (it does iff that run left a transaction open) and
+        refreshes the tab's transaction indicator either way."""
+        query_db = getattr(tab, '_active_query_db', None)
+        if query_db is None:
+            return
+        tab._tx_db_service = query_db if query_db.in_transaction else None
+        self._refresh_transaction_indicator(tab)
+
+    def _refresh_transaction_indicator(self, tab):
+        active = getattr(tab, '_tx_db_service', None) is not None
+        tab.set_transaction_state(active)
+        idx = self.tabs.indexOf(tab)
+        if idx < 0:
+            return
+        title = self.tabs.tabText(idx)
+        has_marker = title.endswith(" ⏳")
+        if active and not has_marker:
+            self.tabs.setTabText(idx, f"{title} ⏳")
+        elif not active and has_marker:
+            self.tabs.setTabText(idx, title[:-2])
+
+    def has_open_transactions(self) -> bool:
+        """True if any tab in this connection has an open manual
+        transaction — used to warn before closing the connection/tab."""
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if getattr(w, '_tx_db_service', None) is not None:
+                return True
+        return False
+
     def _open_verify_dialog(self, tab):
         """Open the Query Verifier dialog pre-populated with the current tab's query."""
         from ui.query_verifier_dialog import QueryVerifierDialog
@@ -1333,6 +1474,21 @@ class ConnectionPanel(QWidget):
         self.tabs.tabBar().setTabButton(index, QTabBar.RightSide, btn)
 
     def _close_tab(self, index):
+        w = self.tabs.widget(index)
+        tx_db = getattr(w, '_tx_db_service', None)
+        if tx_db is not None:
+            reply = QMessageBox.question(
+                self, "Open Transaction",
+                "This tab has an open transaction — closing it will roll "
+                "back any uncommitted changes.\n\nClose anyway?",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            try:
+                tx_db.disconnect()
+            except Exception as ex:
+                logger.debug(f"Failed to close tab transaction connection: {ex}")
+            w._tx_db_service = None
         self.tabs.removeTab(index)
 
     def _rename_tab(self, index):
@@ -1412,13 +1568,25 @@ class ConnectionPanel(QWidget):
     # ─── CSV Import ──────────────────────────────────────────────────────────
 
     def export_database(self):
-        """Export every table's structure + data to a single SQL dump
-        (issue #39: whole-database export, independent of any query tab)."""
+        """Export chosen tables' structure and/or data to a single SQL dump
+        (issue #39: whole-database export, independent of any query tab).
+        Structure-only/data-only/both and which tables to include are all
+        chosen up front via ExportScopeDialog — previously this always did
+        every table's structure + data with no way to narrow either."""
         from PySide6.QtWidgets import QFileDialog, QProgressDialog
 
-        tables = self.db_service.get_tables()
-        if not tables:
+        all_tables = self.db_service.get_tables()
+        if not all_tables:
             QMessageBox.information(self, "Export Database", "No tables to export.")
+            return
+
+        scope = ExportScopeDialog(all_tables, parent=self)
+        if not scope.exec():
+            return
+        tables = scope.selected_tables()
+        content = scope.content_mode()
+        if not tables:
+            QMessageBox.information(self, "Export Database", "No tables selected.")
             return
 
         file_path, _ = QFileDialog.getSaveFileName(
@@ -1441,11 +1609,7 @@ class ConnectionPanel(QWidget):
                     progress.setLabelText(f"Exporting {table}…")
                     progress.setValue(i)
                     try:
-                        fh.write(f"-- Table: {table}\n")
-                        fh.write(self.db_service.get_table_ddl(table) + "\n\n")
-                        df = self.db_service.execute_query(f"SELECT * FROM {table}")
-                        if not df.empty:
-                            fh.write(_to_sql_inserts(df, table) + "\n\n")
+                        self._write_table_export(fh, table, content)
                     except Exception as ex:
                         failures.append(f"{table}: {ex}")
                 progress.setValue(len(tables))
@@ -1460,15 +1624,49 @@ class ConnectionPanel(QWidget):
         else:
             QMessageBox.information(self, "Export Database", summary)
 
+    def _write_table_export(self, fh, table: str, content: str):
+        """Write *table*'s structure and/or data to the already-open file
+        handle *fh*, per content mode ('structure' | 'data' | 'both')."""
+        if content in ("structure", "both"):
+            fh.write(f"-- Table: {table}\n")
+            fh.write(self.db_service.get_table_ddl(table) + "\n\n")
+        if content in ("data", "both"):
+            df = self.db_service.execute_query(f"SELECT * FROM {table}")
+            if not df.empty:
+                fh.write(_to_sql_inserts(df, table) + "\n\n")
+
     def _export_table(self, table_name: str):
-        """Export a table's full contents without needing an open query tab
-        (issue #39: export was previously only reachable from a result set)."""
-        try:
-            df = self.db_service.execute_query(f"SELECT * FROM {table_name}")
-        except Exception as ex:
-            QMessageBox.critical(self, "Export Error", f"Could not read table:\n{ex}")
+        """Export a single table without needing an open query tab (issue
+        #39). 'Data only' keeps the existing multi-format path (CSV/JSON/
+        Excel/SQL inserts via export_dataframe) — structure doesn't fit
+        those formats, so 'Structure only'/'Structure + Data' write a
+        single .sql file instead, matching export_database()'s shape."""
+        scope = ExportScopeDialog([table_name], parent=self)
+        if not scope.exec():
             return
-        export_dataframe(self, df, f"{table_name}.csv", table_name)
+        content = scope.content_mode()
+
+        if content == "data":
+            try:
+                df = self.db_service.execute_query(f"SELECT * FROM {table_name}")
+            except Exception as ex:
+                QMessageBox.critical(self, "Export Error", f"Could not read table:\n{ex}")
+                return
+            export_dataframe(self, df, f"{table_name}.csv", table_name)
+            return
+
+        from PySide6.QtWidgets import QFileDialog
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Table", f"{table_name}.sql", "SQL Dump (*.sql)"
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, "w", encoding="utf-8") as fh:
+                self._write_table_export(fh, table_name, content)
+            QMessageBox.information(self, "Export Table", f"Exported to:\n{file_path}")
+        except Exception as ex:
+            QMessageBox.critical(self, "Export Error", str(ex))
 
     def _import_csv_into_table(self, table_name: str):
         """Read a CSV file and INSERT all rows into *table_name*."""
@@ -1963,6 +2161,21 @@ class ConnectionPanel(QWidget):
             self._health_timer.stop()
         except Exception as ex:
             logger.debug(f"Failed to stop health timer: {ex}")
+        # Close any per-tab transaction connections too — closing rolls
+        # back whatever hadn't been committed, matching normal database
+        # semantics for a dropped connection. main.py warns the user before
+        # calling disconnect() if a transaction is open; this is the cleanup
+        # once that's confirmed (or for a tab that never got a warning, e.g.
+        # app quit).
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            tx_db = getattr(w, '_tx_db_service', None)
+            if tx_db is not None:
+                try:
+                    tx_db.disconnect()
+                except Exception as ex:
+                    logger.debug(f"Failed to close tab transaction connection: {ex}")
+                w._tx_db_service = None
         try:
             self.db_service.disconnect()
         except Exception as ex:
