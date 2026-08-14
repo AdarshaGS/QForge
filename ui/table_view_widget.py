@@ -609,20 +609,26 @@ class TableViewWidget(QWidget):
 
         row_layout.addStretch()
 
-        # Remove button
-        remove_btn = QPushButton("−")
+        # Remove button. No padding override previously meant the inherited
+        # default QPushButton padding (5px 16px) squeezed the glyph out of
+        # a 24px box, leaving what looked like a solid red block.
+        remove_btn = QPushButton("×")
         remove_btn.setObjectName("remove_btn")
+        remove_btn.setToolTip("Remove this filter condition")
         remove_btn.setFixedSize(24, 24)
         remove_btn.setStyleSheet("""
             QPushButton {
-                background-color: #d13438;
-                color: #ffffff;
-                border-radius: 2px;
-                font-size: 16px;
+                background: transparent;
+                color: #d13438;
+                border: 1px solid #d13438;
+                border-radius: 4px;
+                padding: 0;
+                font-size: 15px;
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #e04348;
+                background-color: #d13438;
+                color: #ffffff;
             }
         """)
         remove_btn.clicked.connect(lambda: self.remove_filter_row(row_widget))

@@ -253,6 +253,7 @@ class SqlTab(QWidget):
                 color: #636366;
                 border: 1px solid #3a3a3c;
                 border-radius: 5px;
+                padding: 0;
                 font-size: 14px;
             }
             QPushButton:checked { color: #ffd60a; border-color: #ffd60a; }
@@ -367,6 +368,14 @@ class SqlTab(QWidget):
             "border-radius:4px;background:transparent;color:#e5e5ea;font-size:12px;}"
             "QPushButton:hover{background:#3a3a3c;}"
         )
+        # Icon-only nav buttons are too narrow for _action_style's 10px
+        # horizontal padding (it eats the whole fixed width, hiding the glyph).
+        _nav_style = (
+            "QPushButton{padding:0;height:26px;border:1px solid #3a3a3c;"
+            "border-radius:4px;background:transparent;color:#e5e5ea;font-size:12px;}"
+            "QPushButton:hover{background:#3a3a3c;}"
+            "QPushButton:disabled{color:#48484a;border-color:#2c2c2e;}"
+        )
 
         # Find row
         self._find_input = QLineEdit()
@@ -408,15 +417,17 @@ class SqlTab(QWidget):
         self._fb_replace_toggle_btn.setFixedHeight(22)
         self._fb_replace_toggle_btn.setStyleSheet(_toggle_style)
 
-        _prev_btn = QPushButton("▲")
-        _prev_btn.setFixedSize(22, 26)
-        _prev_btn.setStyleSheet(_action_style)
-        _prev_btn.setToolTip("Previous match (Shift+Enter)")
+        self._prev_match_btn = QPushButton("▲")
+        self._prev_match_btn.setFixedSize(24, 26)
+        self._prev_match_btn.setStyleSheet(_nav_style)
+        self._prev_match_btn.setToolTip("Previous match (Shift+Enter)")
+        self._prev_match_btn.setEnabled(False)
 
-        _next_btn = QPushButton("▼")
-        _next_btn.setFixedSize(22, 26)
-        _next_btn.setStyleSheet(_action_style)
-        _next_btn.setToolTip("Next match (Enter)")
+        self._next_match_btn = QPushButton("▼")
+        self._next_match_btn.setFixedSize(24, 26)
+        self._next_match_btn.setStyleSheet(_nav_style)
+        self._next_match_btn.setToolTip("Next match (Enter)")
+        self._next_match_btn.setEnabled(False)
 
         # Replace row (hidden unless Cmd+H)
         self._replace_row = QWidget()
@@ -464,8 +475,8 @@ class SqlTab(QWidget):
         find_row_l.addWidget(self._fb_regex_btn)
         find_row_l.addWidget(self._fb_replace_toggle_btn)
         find_row_l.addWidget(self._find_match_lbl)
-        find_row_l.addWidget(_prev_btn)
-        find_row_l.addWidget(_next_btn)
+        find_row_l.addWidget(self._prev_match_btn)
+        find_row_l.addWidget(self._next_match_btn)
         fb_rows.addWidget(find_row_w)
         fb_rows.addWidget(self._replace_row)
 
@@ -480,8 +491,8 @@ class SqlTab(QWidget):
         self._fb_word_btn.toggled.connect(self._find_live_update)
         self._fb_regex_btn.toggled.connect(self._find_live_update)
         self._fb_replace_toggle_btn.toggled.connect(self._on_replace_toggle_clicked)
-        _next_btn.clicked.connect(self._find_next)
-        _prev_btn.clicked.connect(self._find_prev)
+        self._next_match_btn.clicked.connect(self._find_next)
+        self._prev_match_btn.clicked.connect(self._find_prev)
         _close_find_btn.clicked.connect(self._hide_find_bar)
         _replace_btn.clicked.connect(self._replace_current)
         _replace_all_btn.clicked.connect(self._replace_all)
@@ -1189,8 +1200,8 @@ class SqlTab(QWidget):
         self._multi_results = results
         bar.blockSignals(True)
         for i, (lbl, df) in enumerate(results):
-            short = lbl[:30] + ("…" if len(lbl) > 30 else "")
-            bar.addTab(f"Result {i+1}: {short}")
+            bar.addTab(f"Query {i+1}")
+            bar.setTabToolTip(i, lbl)
         bar.blockSignals(False)
         bar.show()
 
@@ -1931,6 +1942,8 @@ class SqlTab(QWidget):
             self._find_input.setStyleSheet(
                 self._find_input.styleSheet().replace("border-color:#ff453a;", "")
             )
+            self._prev_match_btn.setEnabled(False)
+            self._next_match_btn.setEnabled(False)
             return
 
         content = self.editor.toPlainText()
@@ -1957,6 +1970,8 @@ class SqlTab(QWidget):
         self.editor.setExtraSelections(base + cursors)
 
         count = len(self._find_matches)
+        self._prev_match_btn.setEnabled(count > 0)
+        self._next_match_btn.setEnabled(count > 0)
         if count == 0:
             self._find_match_lbl.setText("not found")
             self._find_match_lbl.setStyleSheet("color:#ff453a;font-size:11px;min-width:60px;")

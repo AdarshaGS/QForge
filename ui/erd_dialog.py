@@ -504,12 +504,32 @@ class ErdDialog(QDialog):
         self.search_box.textChanged.connect(self._apply_filter)
         toolbar.addWidget(self.search_box)
 
+        # Dedicated icon-button style: the default QPushButton padding
+        # (5px 16px) leaves no room for a single glyph in a 28px-wide button,
+        # squishing "+"/"−" into invisibility.
+        _zoom_btn_style = """
+            QPushButton {
+                background: transparent;
+                color: palette(text);
+                border: 1px solid palette(mid);
+                border-radius: 4px;
+                padding: 0;
+                font-size: 15px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: palette(midlight); }
+        """
+
         zoom_in = QPushButton("+")
-        zoom_in.setFixedWidth(28)
+        zoom_in.setFixedSize(28, 28)
+        zoom_in.setStyleSheet(_zoom_btn_style)
+        zoom_in.setToolTip("Zoom In")
         toolbar.addWidget(zoom_in)
 
         zoom_out = QPushButton("−")
-        zoom_out.setFixedWidth(28)
+        zoom_out.setFixedSize(28, 28)
+        zoom_out.setStyleSheet(_zoom_btn_style)
+        zoom_out.setToolTip("Zoom Out")
         toolbar.addWidget(zoom_out)
 
         fit_btn = QPushButton("Fit to Screen")

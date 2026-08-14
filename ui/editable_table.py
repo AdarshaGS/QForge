@@ -454,6 +454,7 @@ class EditableTableWidget(QTableWidget):
         hdr.setSectionResizeMode(QHeaderView.Interactive)
         hdr.setStretchLastSection(False)
         self._set_compact_column_widths(dataframe)
+        self._apply_sort_header_labels()
         
         # Reconnect signal
         self.itemChanged.connect(self.on_item_changed)
@@ -1081,6 +1082,21 @@ class EditableTableWidget(QTableWidget):
         
         return changes
     
+    def _apply_sort_header_labels(self):
+        """Draw the active sort column/direction directly into the header
+        text. Qt's native QHeaderView sort arrow (setSortIndicator) is
+        unreliable once QHeaderView::section carries a custom stylesheet —
+        the arrow sub-control silently stops rendering — so the indicator
+        is spelled out in the label itself instead."""
+        if self.filtered_data is None:
+            return
+        arrow = " ▲" if self._sort_asc else " ▼"
+        for col, name in enumerate(self.filtered_data.columns):
+            item = self.horizontalHeaderItem(col)
+            if item is None:
+                continue
+            item.setText(f"{name}{arrow}" if col == self._sort_col else str(name))
+
     def on_header_clicked(self, col: int):
         """Sort the currently displayed data by the clicked column (client-side)."""
         if self.filtered_data is None or self.filtered_data.empty:

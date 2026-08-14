@@ -255,8 +255,9 @@ class MainWindow(QMainWindow):
         dismiss_btn.setFlat(True)
         dismiss_btn.setCursor(Qt.PointingHandCursor)
         dismiss_btn.setStyleSheet(
-            "color:#5cdb5c; font-size:12px; border:none; background:transparent;"
-            " QPushButton:hover{color:#ffffff;}"
+            "QPushButton{color:#5cdb5c; font-size:14px; font-weight:600;"
+            " border:none; background:transparent; padding:0;}"
+            "QPushButton:hover{color:#ffffff;}"
         )
         dismiss_btn.clicked.connect(self._dismiss_update_banner)
         banner_layout.addWidget(dismiss_btn)
