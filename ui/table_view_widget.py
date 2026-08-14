@@ -425,8 +425,27 @@ class TableViewWidget(QWidget):
         # Reset and reload with new sort settings
         self.reset_and_load_first_page()
 
+    def _warn_and_discard_changes(self):
+        """Every reload path (refresh, page change, sort, filter) overwrites
+        the grid with a fresh query result — there was previously no warning
+        anywhere except inside the Cmd+S commit handler, so uncommitted
+        edits could vanish with no trace. A blocking confirmation dialog on
+        every refresh/page/sort turned out to be too disruptive in
+        practice, so this discards and surfaces it via a brief non-blocking
+        toast instead — losing a still-uncommitted grid edit is low-stakes
+        (nothing's reached the database yet), it just shouldn't be silent."""
+        if not self.data_table.has_changes():
+            return
+        n = len(self.data_table.modified_rows | self.data_table.new_rows | self.data_table.deleted_rows)
+        from utils.toast import show_toast
+        show_toast(
+            self, f"Discarded {n} uncommitted change{'s' if n != 1 else ''} to {self.table_name}",
+            icon="⚠", kind="warning",
+        )
+
     def reset_and_load_first_page(self):
         """Reset to the first page and load it"""
+        self._warn_and_discard_changes()
         self.current_page = 1
         self.total_rows = None
         self.load_table_data()
@@ -545,13 +564,15 @@ class TableViewWidget(QWidget):
     def prev_page(self):
         """Load previous page"""
         if self.current_page > 1:
+            self._warn_and_discard_changes()
             self.current_page -= 1
             self.load_table_data()
-    
+
     def next_page(self):
         """Load next page"""
         total_pages = (self.total_rows + self.page_size - 1) // self.page_size
         if self.current_page < total_pages:
+            self._warn_and_discard_changes()
             self.current_page += 1
             self.load_table_data()
 
@@ -897,6 +918,17 @@ class TableViewWidget(QWidget):
 
         if not self.data_table.has_changes():
             logger.info("⚪ No changes to save")
+            return
+
+        if self.db_service.read_only:
+            logger.info("🔒 Commit blocked — connection is read-only")
+            QMessageBox.warning(
+                self, "Read-only Connection",
+                "This connection is read-only, so QForge blocked these changes "
+                "before sending them to the database.\n\n"
+                "Turn off Read-only for this connection in the Connection Manager "
+                "if you intend to make changes."
+            )
             return
 
         logger.info(f"📝 Found changes: {len(self.data_table.modified_rows)} modified, {len(self.data_table.new_rows)} new, {len(self.data_table.deleted_rows)} deleted")

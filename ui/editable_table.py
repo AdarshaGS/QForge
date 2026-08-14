@@ -1,14 +1,16 @@
 from PySide6.QtWidgets import (
-    QTableWidget, 
-    QTableWidgetItem, 
+    QTableWidget,
+    QTableWidgetItem,
+    QTableView,
     QHeaderView,
     QMenu,
     QMessageBox,
     QAbstractItemView,
     QApplication,
+    QFrame,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QBrush
+from PySide6.QtGui import QColor, QBrush, QShortcut, QKeySequence, QCursor
 import pandas as pd
 from utils.df_export import export_dataframe
 
@@ -36,6 +38,132 @@ _L_DEL_ROW   = QColor("#ffe6e6")
 _L_DEL_TEXT  = QColor("#b00020")
 
 
+# ── Undo/redo command stack (issue #124) ────────────────────────────────
+# Each command stores absolute row indices. Any operation that physically
+# inserts/removes a grid row (add/duplicate/undo-of-add) must renumber every
+# row index still held by pending commands and by the dirty-state tracking
+# sets — see EditableTableWidget._shift_row_refs — otherwise a later undo
+# would act on the wrong row once rows have shifted underneath it.
+
+def _shift_row(row: int, at_row: int, delta: int) -> int:
+    if delta > 0:  # a row was inserted at at_row
+        return row + delta if row >= at_row else row
+    return row + delta if row > at_row else row  # a row was removed at at_row
+
+
+class _CellEditCommand:
+    """One cell's text changed from old_text to new_text."""
+    __slots__ = ("row", "col", "old_text", "new_text")
+
+    def __init__(self, row, col, old_text, new_text):
+        self.row = row
+        self.col = col
+        self.old_text = old_text
+        self.new_text = new_text
+
+    def undo(self, table):
+        table._restore_cell_text(self.row, self.col, self.old_text)
+
+    def redo(self, table):
+        table._restore_cell_text(self.row, self.col, self.new_text)
+
+    def shift_rows(self, at_row, delta):
+        self.row = _shift_row(self.row, at_row, delta)
+
+    def row_shift_effect(self, is_undo):
+        """(at_row, delta) this command's own undo/redo causes to every
+        OTHER row index — None for commands that never change row count."""
+        return None
+
+
+class _RowInsertCommand:
+    """A new row was inserted at row with the given per-column text values."""
+    __slots__ = ("row", "values")
+
+    def __init__(self, row, values):
+        self.row = row
+        self.values = list(values)
+
+    def undo(self, table):
+        table._remove_row_and_shift(self.row)
+
+    def redo(self, table):
+        table._insert_row_with_values(self.row, self.values)
+
+    def shift_rows(self, at_row, delta):
+        self.row = _shift_row(self.row, at_row, delta)
+
+    def row_shift_effect(self, is_undo):
+        return (self.row, -1) if is_undo else (self.row, +1)
+
+
+class _RowDeleteMarkCommand:
+    """row was toggled into/out of the pending-deletion set."""
+    __slots__ = ("row",)
+
+    def __init__(self, row):
+        self.row = row
+
+    def undo(self, table):
+        table.deleted_rows.discard(self.row)
+        table._repaint_row(self.row)
+        table.changes_made.emit()
+
+    def redo(self, table):
+        table.deleted_rows.add(self.row)
+        table._repaint_row(self.row)
+        table.changes_made.emit()
+
+    def shift_rows(self, at_row, delta):
+        self.row = _shift_row(self.row, at_row, delta)
+
+    def row_shift_effect(self, is_undo):
+        return None  # toggling deleted_rows never changes row count
+
+
+class _CompositeCommand:
+    """Groups several commands (e.g. a paste or a multi-row duplicate) into
+    one undo/redo step.
+
+    A sub-command's own undo()/redo() only renumbers the table's flat
+    _undo_stack/_redo_stack (via _shift_row_refs) — it has no way to reach
+    its *siblings* inside this same composite, since the composite itself
+    isn't sitting in either stack while it's mid-execution. So after each
+    sub-command runs, explicitly apply the same row shift to every other
+    sibling here. Excluding the just-run command itself matters: it was
+    already invoked with its own pre-shift row value, so re-shifting it
+    afterwards would double-count its own insertion/removal.
+    """
+    __slots__ = ("commands",)
+
+    def __init__(self, commands):
+        self.commands = list(commands)
+
+    def undo(self, table):
+        for cmd in reversed(self.commands):
+            effect = cmd.row_shift_effect(is_undo=True)
+            cmd.undo(table)
+            if effect:
+                at_row, delta = effect
+                for other in self.commands:
+                    if other is not cmd:
+                        other.shift_rows(at_row, delta)
+
+    def redo(self, table):
+        for cmd in self.commands:
+            effect = cmd.row_shift_effect(is_undo=False)
+            cmd.redo(table)
+            if effect:
+                at_row, delta = effect
+                for other in self.commands:
+                    if other is not cmd:
+                        other.shift_rows(at_row, delta)
+
+    def shift_rows(self, at_row, delta):
+        for cmd in self.commands:
+            cmd.shift_rows(at_row, delta)
+
+
 class EditableTableWidget(QTableWidget):
     """Enhanced table widget with inline editing capabilities"""
     
@@ -53,13 +181,40 @@ class EditableTableWidget(QTableWidget):
         self.new_rows = set()         # newly inserted rows
         self.deleted_rows = set()     # rows marked for deletion
 
+        # Issue #124: step-by-step undo/redo. _cell_snapshot tracks each
+        # cell's last-known text (distinct from Qt.UserRole, which holds the
+        # original DB value) so a cell edited more than once still undoes
+        # one step at a time. Reset on every full redisplay (load/filter/
+        # sort) rather than trying to keep row indices valid across it.
+        self._undo_stack = []
+        self._redo_stack = []
+        self._undo_batch = None   # None, or a list accumulating one grouped step
+        self._cell_snapshot = {}
+        self._UNDO_LIMIT = 500
+
         # Client-side sort state
         self._sort_col = -1   # -1 = no active sort
         self._sort_asc = True
 
         self.table_name = None
         self.primary_key_column = None
-        
+
+        # Issue #125: freeze/pin leading columns. QTableWidget is item-based
+        # (no QAbstractTableModel of its own to split into a model/view
+        # pair), but it IS a QTableView over a private internal model —
+        # self.model() returns that same model instance for the widget's
+        # whole lifetime (clear()/setRowCount()/setColumnCount() mutate it
+        # in place, they don't replace it). So a second, plain QTableView
+        # sharing that model + selection model can overlay the leading
+        # columns with zero data duplication: edits, dirty-highlighting
+        # (background/foreground are model data), and undo/redo all operate
+        # on the same QTableWidgetItem objects regardless of which view
+        # touched them.
+        self._frozen_col_count = 0
+        self._frozen_view = None
+        self._movable_before_freeze = None
+        self._syncing_frozen_width = False
+
         # Enable editing
         self.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
 
@@ -71,7 +226,6 @@ class EditableTableWidget(QTableWidget):
         self.customContextMenuRequested.connect(self.show_context_menu)
 
         # Add keyboard shortcuts
-        from PySide6.QtGui import QShortcut, QKeySequence
 
         # Cmd+D to duplicate row
         self.duplicate_shortcut = QShortcut(QKeySequence("Ctrl+D"), self)
@@ -80,7 +234,20 @@ class EditableTableWidget(QTableWidget):
         # Cmd+Backspace to delete selected row(s)
         self.delete_shortcut = QShortcut(QKeySequence("Ctrl+Backspace"), self)
         self.delete_shortcut.activated.connect(self.delete_selected_rows)
-        
+
+        # Issue #124: Cmd+Z / Cmd+Shift+Z undo/redo. Scoped to
+        # WidgetWithChildrenShortcut (not the default WindowShortcut) so it
+        # only fires while focus is in this grid or one of its cell editors
+        # — otherwise it would also hijack the SQL editor's own Cmd+Z
+        # elsewhere in the same window.
+        self.undo_shortcut = QShortcut(QKeySequence.Undo, self)
+        self.undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.undo_shortcut.activated.connect(self.undo)
+
+        self.redo_shortcut = QShortcut(QKeySequence.Redo, self)
+        self.redo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.redo_shortcut.activated.connect(self.redo)
+
         # Full-row selection (like TablePlus)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -103,7 +270,12 @@ class EditableTableWidget(QTableWidget):
         # separately, since those iterated logical indices assuming that
         # matched left-to-right visual order (true before this, not after).
         hdr.setSectionsMovable(True)
-        
+
+        # Issue #125: right-click a header section to freeze/unfreeze.
+        hdr.setContextMenuPolicy(Qt.CustomContextMenu)
+        hdr.customContextMenuRequested.connect(self._show_header_context_menu)
+        hdr.sectionResized.connect(self._on_main_section_resized)
+
         # Theme will be set by update_theme method
         self.current_theme = 'dark'
         self.update_theme(is_dark=True)
@@ -186,9 +358,19 @@ class EditableTableWidget(QTableWidget):
                 QHeaderView::section:hover { background: #e8e8eb; color: #1c1c1e; }
                 QHeaderView::section:first { border-left: none; }
             """)
-        
+
+        if self._frozen_view is not None:
+            accent = "#0A84FF"
+            self._frozen_view.setStyleSheet(
+                self.styleSheet() + f"\nQTableView {{ border: none; border-right: 2px solid {accent}; }}"
+            )
+
     def load_data(self, dataframe: pd.DataFrame, table_name=None):
         """Load data from DataFrame"""
+        # Issue #125: a fresh dataset may have entirely different columns —
+        # don't carry a stale freeze count over from whatever was loaded
+        # before.
+        self.set_frozen_columns(0)
         self.original_data = dataframe.copy() if dataframe is not None else None
         self.filtered_data = dataframe.copy() if dataframe is not None else None
         self.table_name = table_name
@@ -223,10 +405,18 @@ class EditableTableWidget(QTableWidget):
             self.itemChanged.disconnect(self.on_item_changed)
         except Exception:
             pass  # already disconnected; safe to continue
-        
+
+        # Issue #124: a full redisplay (load/revert/filter/sort) invalidates
+        # any row indices held by pending undo/redo commands, so reset
+        # history here rather than trying to keep it consistent across it.
+        self._undo_stack = []
+        self._redo_stack = []
+        self._undo_batch = None
+        self._cell_snapshot = {}
+
         self.clear()
         self.setRowCount(0)
-        
+
         if dataframe is None:
             self.itemChanged.connect(self.on_item_changed)
             return
@@ -243,6 +433,7 @@ class EditableTableWidget(QTableWidget):
                 for col in range(len(dataframe.columns)):
                     item = QTableWidgetItem("")
                     self.setItem(row, col, item)
+                    self._cell_snapshot[(row, col)] = ""
         else:
             # Display actual data
             self.setRowCount(len(dataframe))
@@ -257,6 +448,7 @@ class EditableTableWidget(QTableWidget):
                     item = QTableWidgetItem(str(value))
                     item.setData(Qt.UserRole, dataframe.iloc[row, col])  # Store original value
                     self.setItem(row, col, item)
+                    self._cell_snapshot[(row, col)] = str(value)
 
         hdr = self.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.Interactive)
@@ -269,13 +461,162 @@ class EditableTableWidget(QTableWidget):
         # Re-apply colour for any rows that were already dirty before this
         # display call (e.g. after a client-side sort or filter refresh).
         self._restore_dirty_highlights()
-    
+
+        # Issue #125: clear()/setColumnCount() rebuilt columns from scratch
+        # above — the frozen view's per-column hidden state is view-local
+        # and stale until reapplied. Freeze state itself (the count) is
+        # deliberately NOT reset here so it survives a filter/sort refresh;
+        # load_data() resets it explicitly for a genuinely new dataset.
+        if self._frozen_col_count > 0:
+            self._frozen_col_count = min(self._frozen_col_count, self.columnCount())
+            self._apply_frozen_visibility()
+            self._update_frozen_geometry()
+
     def _restore_dirty_highlights(self):
         """Re-apply colour to all rows that have a known dirty state.
         Called after every _display_data so highlights survive sort/filter refreshes."""
         for row in (self.modified_rows | self.new_rows | self.deleted_rows):
             if 0 <= row < self.rowCount():
                 self._repaint_row(row)
+
+    # ── Freeze/pin leading columns (issue #125) ─────────────────────────
+    # See the __init__ comment above _frozen_col_count for why a second
+    # QTableView sharing this widget's own model is the chosen technique.
+
+    def _ensure_frozen_view(self):
+        """Lazily create the overlay view the first time a freeze is requested."""
+        if self._frozen_view is not None:
+            return
+        fv = QTableView(self)
+        fv.setModel(self.model())
+        fv.setSelectionModel(self.selectionModel())
+        fv.setFocusPolicy(Qt.NoFocus)
+        fv.verticalHeader().setVisible(False)
+        fv.setEditTriggers(self.editTriggers())
+        fv.setAlternatingRowColors(self.alternatingRowColors())
+        fv.setSelectionBehavior(QAbstractItemView.SelectRows)
+        fv.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        fv.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        fv.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        fv.setFrameShape(QFrame.NoFrame)
+        fv.horizontalHeader().setSectionsMovable(False)
+        fv.horizontalHeader().setHighlightSections(False)
+        fv.horizontalHeader().setSortIndicatorShown(True)
+        fv.horizontalHeader().sectionClicked.connect(self.on_header_clicked)
+        fv.horizontalHeader().sectionResized.connect(self._on_frozen_section_resized)
+        fv.setContextMenuPolicy(Qt.CustomContextMenu)
+        fv.customContextMenuRequested.connect(lambda _pos: self.show_context_menu(_pos))
+        self.verticalScrollBar().valueChanged.connect(fv.verticalScrollBar().setValue)
+        fv.verticalScrollBar().valueChanged.connect(self.verticalScrollBar().setValue)
+        fv.hide()
+        self._frozen_view = fv
+        self.update_theme(is_dark=(self.current_theme == 'dark'))
+
+    def set_frozen_columns(self, count: int):
+        """Freeze the leading *count* (current visual order) columns so they
+        stay visible while scrolling horizontally. count=0 unfreezes."""
+        count = max(0, min(count, self.columnCount()))
+        if count == self._frozen_col_count:
+            return
+        was_frozen = self._frozen_col_count > 0
+        self._frozen_col_count = count
+        hdr = self.horizontalHeader()
+
+        if count > 0:
+            self._ensure_frozen_view()
+            if not was_frozen:
+                # Column order can't change while frozen — the frozen view's
+                # own header order is only synced once, at freeze time (see
+                # _sync_frozen_header_order), not continuously.
+                self._movable_before_freeze = hdr.sectionsMovable()
+            hdr.setSectionsMovable(False)
+            self._sync_frozen_header_order()
+            self._apply_frozen_visibility()
+            self._frozen_view.show()
+            self._update_frozen_geometry()
+        else:
+            if self._movable_before_freeze is not None:
+                hdr.setSectionsMovable(self._movable_before_freeze)
+                self._movable_before_freeze = None
+            if self._frozen_view is not None:
+                self._frozen_view.hide()
+
+    def _sync_frozen_header_order(self):
+        """Arrange the frozen view's header sections in the same
+        left-to-right visual order as the main header, for the columns
+        being frozen (runs once per freeze, since reordering is disabled
+        while a freeze is active)."""
+        main_hdr = self.horizontalHeader()
+        frozen_hdr = self._frozen_view.horizontalHeader()
+        for target_visual in range(self._frozen_col_count):
+            logical = main_hdr.logicalIndex(target_visual)
+            current_visual = frozen_hdr.visualIndex(logical)
+            if current_visual != target_visual:
+                frozen_hdr.moveSection(current_visual, target_visual)
+
+    def _apply_frozen_visibility(self):
+        """Show only the frozen columns in the overlay view; the main view
+        keeps showing all columns as before (frozen ones just end up
+        scrolled out of its visible area once the overlay pins them)."""
+        if self._frozen_view is None:
+            return
+        hdr = self.horizontalHeader()
+        for logical in range(self.columnCount()):
+            visual = hdr.visualIndex(logical)
+            self._frozen_view.setColumnHidden(
+                logical, visual == -1 or visual >= self._frozen_col_count)
+
+    def _on_main_section_resized(self, logical, _old, new):
+        if self._frozen_col_count <= 0 or self._frozen_view is None or self._syncing_frozen_width:
+            self._update_frozen_geometry()
+            return
+        if self.horizontalHeader().visualIndex(logical) < self._frozen_col_count:
+            self._syncing_frozen_width = True
+            self._frozen_view.setColumnWidth(logical, new)
+            self._syncing_frozen_width = False
+        self._update_frozen_geometry()
+
+    def _on_frozen_section_resized(self, logical, _old, new):
+        if self._syncing_frozen_width or self._frozen_view is None:
+            return
+        self._syncing_frozen_width = True
+        self.setColumnWidth(logical, new)
+        self._syncing_frozen_width = False
+        self._update_frozen_geometry()
+
+    def _update_frozen_geometry(self):
+        """Position/size the overlay so it exactly covers the frozen
+        columns' header + rows at the left edge of this widget."""
+        if self._frozen_col_count <= 0 or self._frozen_view is None:
+            return
+        hdr = self.horizontalHeader()
+        width = sum(self.columnWidth(hdr.logicalIndex(v))
+                    for v in range(self._frozen_col_count))
+        hsb = self.horizontalScrollBar()
+        hsb_h = hsb.height() if hsb.isVisible() else 0
+        self._frozen_view.setGeometry(0, 0, width, max(0, self.height() - hsb_h))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_frozen_geometry()
+
+    def _show_header_context_menu(self, position):
+        """Right-click a column header: freeze up through that column, or
+        unfreeze if a freeze is already active."""
+        hdr = self.horizontalHeader()
+        logical = hdr.logicalIndexAt(position)
+        menu = QMenu(self)
+        if logical >= 0:
+            visual = hdr.visualIndex(logical)
+            header_item = self.horizontalHeaderItem(logical)
+            col_name = header_item.text() if header_item else ""
+            freeze_action = menu.addAction(f"📌  Freeze Up To “{col_name}”")
+            freeze_action.triggered.connect(lambda: self.set_frozen_columns(visual + 1))
+        if self._frozen_col_count > 0:
+            menu.addAction("Unfreeze Columns").triggered.connect(
+                lambda: self.set_frozen_columns(0))
+        if menu.actions():
+            menu.exec_(hdr.mapToGlobal(position))
 
     _COL_WIDTH_MIN = 60     # never narrower than this
     _COL_WIDTH_MAX = 300    # never wider than this without manual resize
@@ -394,7 +735,8 @@ class EditableTableWidget(QTableWidget):
         return ""
     
     def on_item_changed(self, item):
-        """Track when an item is modified and paint changed cell + row."""
+        """Track when an item is modified, push an undo step, and paint
+        changed cell + row."""
         row = item.row()
         col = item.column()
 
@@ -404,19 +746,159 @@ class EditableTableWidget(QTableWidget):
             self.evaluate_formula(item)
             return
 
+        old_text = self._cell_snapshot.get((row, col), "")
+        if old_text == text:
+            return  # no actual change from the last known state
+        self._cell_snapshot[(row, col)] = text
+
+        self._push_history(_CellEditCommand(row, col, old_text, text))
+
         if row not in self.new_rows:
-            original_value = item.data(Qt.UserRole)
-            current_value  = item.text()
+            self._recompute_cell_dirty_state(row, col)
+        self.changes_made.emit()
 
-            if current_value == "" and pd.isna(original_value):
-                return  # no actual change
+    def _recompute_cell_dirty_state(self, row: int, col: int):
+        """Update modified_rows/modified_cells for one cell against its
+        original DB value (Qt.UserRole) and repaint the row. Used both for
+        live edits and for undo/redo restores, so a cell/row that's been
+        undone back to its original value is correctly un-highlighted."""
+        item = self.item(row, col)
+        if item is None:
+            return
 
-            if str(original_value) != current_value:
-                self.modified_rows.add(row)
-                self.modified_cells.add((row, col))
-                self._repaint_row(row)
-                self.changes_made.emit()
-    
+        original_value = item.data(Qt.UserRole)
+        current_value = item.text()
+        unchanged = (current_value == "" and pd.isna(original_value)) or \
+            str(original_value) == current_value
+
+        if unchanged:
+            self.modified_cells.discard((row, col))
+            if not any(r == row for (r, _c) in self.modified_cells):
+                self.modified_rows.discard(row)
+        else:
+            self.modified_cells.add((row, col))
+            self.modified_rows.add(row)
+
+        self._repaint_row(row)
+
+    # ── Undo/redo (issue #124) ──────────────────────────────────────────
+
+    def _push_history(self, cmd):
+        """Record cmd as the next undoable step, or fold it into the batch
+        currently being accumulated (see _begin_batch)."""
+        if self._undo_batch is not None:
+            self._undo_batch.append(cmd)
+            return
+        self._undo_stack.append(cmd)
+        if len(self._undo_stack) > self._UNDO_LIMIT:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _begin_batch(self):
+        """Start grouping subsequent _push_history calls into one undo step
+        (e.g. a paste touching many cells, or duplicating several rows)."""
+        self._undo_batch = []
+
+    def _end_batch(self):
+        batch, self._undo_batch = self._undo_batch, None
+        if not batch:
+            return  # nothing actually changed — don't touch the stacks
+        self._undo_stack.append(_CompositeCommand(batch))
+        if len(self._undo_stack) > self._UNDO_LIMIT:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def undo(self):
+        if not self._undo_stack:
+            return
+        cmd = self._undo_stack.pop()
+        cmd.undo(self)
+        self._redo_stack.append(cmd)
+
+    def redo(self):
+        if not self._redo_stack:
+            return
+        cmd = self._redo_stack.pop()
+        cmd.redo(self)
+        self._undo_stack.append(cmd)
+
+    def _restore_cell_text(self, row: int, col: int, text: str):
+        """Set a cell's text without going through on_item_changed (so
+        restoring it doesn't itself push a new undo step), then bring
+        tracking state back in sync."""
+        item = self.item(row, col)
+        if item is None:
+            return
+        try:
+            self.itemChanged.disconnect(self.on_item_changed)
+        except Exception:
+            pass
+        item.setText(text)
+        self.itemChanged.connect(self.on_item_changed)
+
+        self._cell_snapshot[(row, col)] = text
+        if row not in self.new_rows:
+            self._recompute_cell_dirty_state(row, col)
+        else:
+            self._repaint_row(row)
+        self.changes_made.emit()
+
+    def _insert_row_with_values(self, row: int, values: list):
+        """Physically insert a new row at *row* with the given per-column
+        text, marking it new. Shifts every row-indexed piece of tracking
+        state (and any pending undo/redo commands) that sits at or below
+        the insertion point."""
+        self._shift_row_refs(row, +1)
+        self.insertRow(row)
+        try:
+            self.itemChanged.disconnect(self.on_item_changed)
+        except Exception:
+            pass
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setData(Qt.UserRole, None)
+            self.setItem(row, col, item)
+            self._cell_snapshot[(row, col)] = value
+        self.itemChanged.connect(self.on_item_changed)
+        self.new_rows.add(row)
+        self._repaint_row(row)
+        self.changes_made.emit()
+
+    def _remove_row_and_shift(self, row: int):
+        """Physically remove *row* (undo of a row insert) and shift every
+        row-indexed piece of tracking state below it back down."""
+        self.new_rows.discard(row)
+        self.modified_rows.discard(row)
+        self.deleted_rows.discard(row)
+        self.modified_cells = {(r, c) for (r, c) in self.modified_cells if r != row}
+        self._cell_snapshot = {(r, c): v for (r, c), v in self._cell_snapshot.items() if r != row}
+        self.removeRow(row)
+        self._shift_row_refs(row, -1)
+        self.changes_made.emit()
+
+    def _shift_row_refs(self, at_row: int, delta: int):
+        """Renumber every row index this widget tracks — the dirty-state
+        sets, the cell snapshot, and every command still on either stack or
+        the batch in progress — after a physical row insert/remove."""
+        self.modified_rows = {_shift_row(r, at_row, delta) for r in self.modified_rows}
+        self.new_rows = {_shift_row(r, at_row, delta) for r in self.new_rows}
+        self.deleted_rows = {_shift_row(r, at_row, delta) for r in self.deleted_rows}
+        self.modified_cells = {
+            (_shift_row(r, at_row, delta), c) for (r, c) in self.modified_cells
+        }
+        self._cell_snapshot = {
+            (_shift_row(r, at_row, delta), c): v for (r, c), v in self._cell_snapshot.items()
+        }
+
+        for cmd in self._undo_stack:
+            cmd.shift_rows(at_row, delta)
+        for cmd in self._redo_stack:
+            cmd.shift_rows(at_row, delta)
+        if self._undo_batch is not None:
+            for cmd in self._undo_batch:
+                cmd.shift_rows(at_row, delta)
+
+
     def _repaint_row(self, row: int):
         """Apply the correct colour to every cell in *row* based on its state."""
         dark = self.current_theme == 'dark'
@@ -476,38 +958,31 @@ class EditableTableWidget(QTableWidget):
     
     def add_new_row(self):
         """Add a new empty row"""
-        row_count = self.rowCount()
-        self.insertRow(row_count)
-        
-        # Mark as new row
-        self.new_rows.add(row_count)
-        
-        # Create empty items
-        for col in range(self.columnCount()):
-            item = QTableWidgetItem("")
-            item.setData(Qt.UserRole, None)
-            self.setItem(row_count, col, item)
-        
-        self._repaint_row(row_count)
-        self.changes_made.emit()  # Notify parent
-        
+        row = self.rowCount()
+        values = [""] * self.columnCount()
+        self._insert_row_with_values(row, values)
+        self._push_history(_RowInsertCommand(row, values))
+
         # Start editing first cell
-        self.editItem(self.item(row_count, 0))
-    
+        self.editItem(self.item(row, 0))
+
     def delete_selected_rows(self):
-        """Mark selected rows for deletion"""
-        selected_rows = set()
-        for item in self.selectedItems():
-            selected_rows.add(item.row())
+        """Mark selected rows for deletion (Ctrl/Cmd+Z steps back through
+        them one row at a time via _RowDeleteMarkCommand)."""
+        selected_rows = {item.row() for item in self.selectedItems()}
 
         if not selected_rows:
             return
 
+        self._begin_batch()
         for row in selected_rows:
-            self.deleted_rows.add(row)
-            self._repaint_row(row)
+            if row not in self.deleted_rows:
+                self.deleted_rows.add(row)
+                self._repaint_row(row)
+                self._push_history(_RowDeleteMarkCommand(row))
+        self._end_batch()
         self.changes_made.emit()  # Notify parent
-    
+
     def revert_changes(self):
         """Revert all changes"""
         if self.original_data is not None:
@@ -626,6 +1101,8 @@ class EditableTableWidget(QTableWidget):
 
         order = Qt.AscendingOrder if self._sort_asc else Qt.DescendingOrder
         self.horizontalHeader().setSortIndicator(col, order)
+        if self._frozen_view is not None:
+            self._frozen_view.horizontalHeader().setSortIndicator(col, order)
 
         col_name = self.filtered_data.columns[col]
         self.filtered_data = self.filtered_data.sort_values(
@@ -763,8 +1240,20 @@ class EditableTableWidget(QTableWidget):
             menu.addAction("Add New Row").triggered.connect(self.add_new_row)
 
         menu.addSeparator()
+        undo_action = menu.addAction("Undo")
+        undo_action.setShortcut(QKeySequence.Undo)
+        undo_action.setEnabled(bool(self._undo_stack))
+        undo_action.triggered.connect(self.undo)
+        redo_action = menu.addAction("Redo")
+        redo_action.setShortcut(QKeySequence.Redo)
+        redo_action.setEnabled(bool(self._redo_stack))
+        redo_action.triggered.connect(self.redo)
+        menu.addSeparator()
         menu.addAction("Revert Changes").triggered.connect(self.revert_changes)
-        menu.exec_(self.mapToGlobal(position))
+        # QCursor.pos() rather than self.mapToGlobal(position): this menu can
+        # also be triggered from the frozen overlay view (issue #125), whose
+        # local coordinates aren't in self's coordinate space.
+        menu.exec_(QCursor.pos())
 
     def set_fk_map(self, fk_list: list):
         """Store FK metadata: list of {column, ref_table, ref_column} dicts."""
@@ -946,7 +1435,8 @@ class EditableTableWidget(QTableWidget):
         hdr = self.horizontalHeader()
         start_visual_col = hdr.visualIndex(current.column())
 
-        # Parse clipboard (tab-separated)
+        # Parse clipboard (tab-separated); grouped into one undo step.
+        self._begin_batch()
         lines = text.split("\n")
         for i, line in enumerate(lines):
             values = line.split("\t")
@@ -958,26 +1448,21 @@ class EditableTableWidget(QTableWidget):
                     item = self.item(row, col)
                     if item:
                         item.setText(value)
-    
+        self._end_batch()
+
     def duplicate_row(self):
         """Duplicate current row"""
         current = self.currentItem()
         if not current:
             return
-        
+
         source_row = current.row()
-        self.insertRow(source_row + 1)
-        
-        # Copy data
-        for col in range(self.columnCount()):
-            source_item = self.item(source_row, col)
-            if source_item:
-                new_item = QTableWidgetItem(source_item.text())
-                self.setItem(source_row + 1, col, new_item)
-        
-        self.new_rows.add(source_row + 1)
-        self._repaint_row(source_row + 1)
-    
+        values = [self.item(source_row, col).text() if self.item(source_row, col) else ""
+                  for col in range(self.columnCount())]
+        row = source_row + 1
+        self._insert_row_with_values(row, values)
+        self._push_history(_RowInsertCommand(row, values))
+
     def export_selected(self):
         """Export visible table data to CSV / JSON / Excel / SQL — despite
         the name, this has always exported *all* rows (filtered/original),
@@ -1023,32 +1508,21 @@ class EditableTableWidget(QTableWidget):
     def duplicate_selected_rows(self):
         """Duplicate all selected rows (Cmd+D)"""
         selected_rows = sorted(set(item.row() for item in self.selectedItems()))
-        
+
         if not selected_rows:
             return
-        
-        # Disconnect signal to avoid multiple triggers
-        self.itemChanged.disconnect(self.on_item_changed)
-        
-        # Duplicate each row from bottom to top to maintain correct indices
+
+        self._begin_batch()
+        # Duplicate each row from bottom to top so a source row's index is
+        # never disturbed by an insertion made earlier in this same loop.
         for source_row in reversed(selected_rows):
-            # Insert new row after source
-            self.insertRow(source_row + 1)
-            
-            # Copy all cell data
-            for col in range(self.columnCount()):
-                source_item = self.item(source_row, col)
-                if source_item:
-                    new_item = QTableWidgetItem(source_item.text())
-                    new_item.setData(Qt.UserRole, source_item.data(Qt.UserRole))
-                    self.setItem(source_row + 1, col, new_item)
-            
-            # Mark as new row
-            self.new_rows.add(source_row + 1)
-            self._repaint_row(source_row + 1)
-        # Reconnect signal
-        self.itemChanged.connect(self.on_item_changed)
-    
+            values = [self.item(source_row, col).text() if self.item(source_row, col) else ""
+                      for col in range(self.columnCount())]
+            row = source_row + 1
+            self._insert_row_with_values(row, values)
+            self._push_history(_RowInsertCommand(row, values))
+        self._end_batch()
+
     def bulk_edit_dialog(self):
         """Show dialog to edit multiple rows at once"""
         selected_rows = sorted(set(item.row() for item in self.selectedItems()))
@@ -1106,11 +1580,11 @@ class EditableTableWidget(QTableWidget):
         if dialog.exec_() == QDialog.Accepted:
             column_idx = column_combo.currentIndex()
             new_value = value_input.text()
-            
-            # Disconnect signal
-            self.itemChanged.disconnect(self.on_item_changed)
-            
-            # Apply to all selected rows
+
+            # itemChanged stays connected so on_item_changed's normal
+            # dirty-tracking/undo capture runs per cell (grouped into one
+            # undo step via the batch below).
+            self._begin_batch()
             for row in selected_rows:
                 item = self.item(row, column_idx)
                 if item:
@@ -1124,15 +1598,8 @@ class EditableTableWidget(QTableWidget):
                         item.setText(result)
                     else:
                         item.setText(new_value)
-                    
-                    # Mark as modified
-                    self.modified_rows.add(row)
-                    self.modified_cells.add((row, col))
-                    self._repaint_row(row)
-            
-            # Reconnect signal
-            self.itemChanged.connect(self.on_item_changed)
-    
+            self._end_batch()
+
     def evaluate_formula(self, item):
         """Evaluate formula in cell (e.g., =NOW(), =UPPER(text))"""
         formula = item.text()

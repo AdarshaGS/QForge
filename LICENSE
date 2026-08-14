@@ -1,21 +1,75 @@
-MIT License
+QForge End-User License Agreement (EULA)
 
-Copyright (c) 2026 AdarshaGS
+Copyright (c) 2026 AdarshaGS. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software and its accompanying source code (the "Software") are the
+proprietary property of AdarshaGS ("Licensor"). The Software is licensed,
+not sold. This is a legal agreement between you (an individual or a single
+legal entity, "Licensee") and Licensor.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Grant of License
+   Subject to Licensee's compliance with this Agreement and, where
+   applicable, payment of the required license fee, Licensor grants
+   Licensee a limited, non-exclusive, non-transferable, non-sublicensable
+   license to install and use the Software, in compiled/binary form, on
+   devices Licensee owns or controls, solely for Licensee's own internal
+   business or personal purposes.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+   Where Licensor offers an unpaid evaluation/trial period, use beyond that
+   period requires a paid license.
+
+2. Restrictions
+   Licensee shall not, and shall not permit any third party to:
+   a. copy, redistribute, sell, rent, lease, sublicense, or otherwise make
+      the Software available to any third party, whether modified or not;
+   b. reverse engineer, decompile, disassemble, or otherwise attempt to
+      derive the source code of the Software, except to the extent such
+      restriction is prohibited by applicable law;
+   c. remove, disable, or circumvent any license-key validation, usage
+      limitation, or other protection mechanism in the Software;
+   d. use the Software to build a competing product or service;
+   e. remove or alter any copyright, trademark, or other proprietary notice
+      contained in the Software.
+
+3. Source Code
+   Access to this repository, if granted, is provided for transparency,
+   review, or contribution purposes only and does not itself grant any
+   license to use, copy, modify, or distribute the Software beyond what is
+   expressly stated in this Agreement. All source code remains the
+   confidential and proprietary property of Licensor.
+
+4. Third-Party Components
+   The Software incorporates open-source third-party components (see
+   requirements.txt), each governed by its own license terms. Nothing in
+   this Agreement limits the rights granted under those separate licenses
+   with respect to the third-party components themselves.
+
+5. Ownership
+   Licensor retains all right, title, and interest in and to the Software,
+   including all intellectual property rights therein. No rights are
+   granted to Licensee other than as expressly set out in this Agreement.
+
+6. Termination
+   This license terminates automatically if Licensee breaches any term of
+   this Agreement. Upon termination, Licensee must cease all use of the
+   Software and destroy all copies in its possession.
+
+7. Disclaimer of Warranty
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+   NONINFRINGEMENT.
+
+8. Limitation of Liability
+   IN NO EVENT SHALL LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+   FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE, INCLUDING WITHOUT LIMITATION ANY LOSS OF DATA,
+   PROFITS, OR BUSINESS ARISING FROM ACCESS TO STAGING OR PRODUCTION
+   DATABASES THROUGH THE SOFTWARE.
+
+9. Governing Law
+   This Agreement is governed by the laws of Licensor's jurisdiction of
+   residence, without regard to conflict-of-law principles.
+
+For licensing inquiries, contact the repository owner.

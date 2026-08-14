@@ -5,7 +5,8 @@
 # sqlparse upgrade, that's exactly what they're here to catch.
 
 from services.query_classifier import (
-    TRANSACTION_KINDS, classify, is_dangerous, split_statements,
+    READ_ONLY_BLOCKED_KINDS, TRANSACTION_KINDS, classify, is_dangerous,
+    split_statements,
 )
 
 
@@ -158,3 +159,51 @@ def test_transaction_control_statements_are_not_writes_or_dangerous():
         c = classify(sql)
         assert c.is_write is False, sql
         assert not is_dangerous(c), sql
+
+
+# ─── Read-only guard coverage (issue #70) ──────────────────────────────────
+
+
+def test_replace_and_load_data_are_classified_as_writes():
+    assert classify("REPLACE INTO users (id) VALUES (1)").kind == "REPLACE"
+    assert classify("REPLACE INTO users (id) VALUES (1)").is_write is True
+    c = classify("LOAD DATA INFILE 'x.csv' INTO TABLE users")
+    assert c.kind == "LOAD"
+    assert c.is_write is True
+
+
+def test_procedure_calls_are_not_writes_but_are_read_only_blocked():
+    # Not folded into WRITE_KINDS: execute_multi_query() dispatches writes
+    # through execute_update(), which would silently drop a result set a
+    # CALL might legitimately return. They must still be blocked under
+    # read-only mode since sqlparse can't tell whether the routine mutates.
+    for sql in ("CALL my_proc(1)", "EXEC my_proc", "EXECUTE my_proc"):
+        c = classify(sql)
+        assert c.is_write is False, sql
+        assert c.kind in READ_ONLY_BLOCKED_KINDS, sql
+
+
+def test_read_only_blocked_kinds_covers_every_write_kind():
+    for sql in (
+        "INSERT INTO users (id) VALUES (1)",
+        "UPDATE users SET x=1 WHERE id=1",
+        "DELETE FROM users WHERE id=1",
+        "REPLACE INTO users (id) VALUES (1)",
+        "CREATE TABLE x (id INT)",
+        "DROP TABLE users",
+        "ALTER TABLE x ADD COLUMN y INT",
+        "TRUNCATE users",
+        "RENAME TABLE a TO b",
+        "GRANT ALL ON db.* TO 'u'@'%'",
+        "REVOKE ALL ON db.* FROM 'u'@'%'",
+        "LOAD DATA INFILE 'x.csv' INTO TABLE users",
+    ):
+        assert classify(sql).kind in READ_ONLY_BLOCKED_KINDS, sql
+
+
+def test_read_only_blocked_kinds_excludes_reads_and_transaction_control():
+    for sql in (
+        "SELECT * FROM users", "SHOW TABLES", "EXPLAIN SELECT 1",
+        "BEGIN", "COMMIT", "ROLLBACK",
+    ):
+        assert classify(sql).kind not in READ_ONLY_BLOCKED_KINDS, sql

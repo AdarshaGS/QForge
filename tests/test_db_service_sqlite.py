@@ -1,6 +1,6 @@
 import pytest
 
-from services.db_service import DbService, TransactionError
+from services.db_service import DbService, ReadOnlyViolation, TransactionError
 
 
 @pytest.fixture
@@ -191,3 +191,37 @@ def test_raw_typed_rollback_via_execute_query(db, db_path):
         assert df.iloc[0]["name"] == "Alice"
     finally:
         other.disconnect()
+
+
+# ─── Read-only guard coverage (issue #70) ──────────────────────────────────
+
+
+def test_read_only_blocks_replace_and_load_data(db):
+    db.read_only = True
+    with pytest.raises(ReadOnlyViolation):
+        db.execute_query("REPLACE INTO users (id, name) VALUES (1, 'Mallory')")
+    with pytest.raises(ReadOnlyViolation):
+        db.execute_query("LOAD DATA INFILE 'x.csv' INTO TABLE users")
+    # Statement never reached the driver — data is untouched.
+    df = db.execute_query("SELECT name FROM users WHERE id = 1")
+    assert df.iloc[0]["name"] == "Alice"
+
+
+def test_read_only_blocks_procedure_calls_even_though_not_classified_as_writes(db):
+    db.read_only = True
+    with pytest.raises(ReadOnlyViolation):
+        db.execute_query("CALL some_proc(1)")
+    with pytest.raises(ReadOnlyViolation):
+        db.execute_query("EXEC some_proc")
+
+
+def test_read_only_still_allows_reads(db):
+    db.read_only = True
+    df = db.execute_query("SELECT * FROM users ORDER BY id")
+    assert list(df["name"]) == ["Alice", "Bob"]
+
+
+def test_read_only_off_by_default_writes_still_work(db):
+    assert db.read_only is False
+    affected = db.execute_update("UPDATE users SET name = 'Carol' WHERE id = 1")
+    assert affected == 1

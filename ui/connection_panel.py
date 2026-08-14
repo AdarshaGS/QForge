@@ -26,6 +26,7 @@ from PySide6.QtGui import QShortcut, QKeySequence, QCursor
 
 from services.db_service import DbService
 from services.query_history import QueryHistory
+from services.saved_queries import SavedQueries
 from services.schema_snapshot import fetch_schema_snapshot
 from ui.sql_tab import SqlTab
 from ui.table_view_widget import TableViewWidget
@@ -34,8 +35,11 @@ from ui.snippet_manager import SnippetManager
 from ui.structure_editor import StructureEditorDialog
 from ui.db_switcher_dialog import DbSwitcherDialog
 from ui.query_history_dialog import QueryHistoryDialog
+from ui.query_library_dialog import QueryLibraryDialog
 from ui.export_scope_dialog import ExportScopeDialog
 from ui.theme_manager import ThemeManager
+from ui.erd_dialog import ErdDialog
+from ui.schema_compare_dialog import SchemaCompareDialog
 from ui import query_guard_dialog
 from utils.logger import get_logger
 from utils import environment
@@ -118,6 +122,27 @@ class _QueryWorker(QObject):
                     pass
 
 
+class _ClickableRow(QWidget):
+    """A QWidget that behaves like a button for the schema sidebar's
+    category rows (All Tables / Views / Functions) — plain QPushButton
+    can't lay out an icon + label + right-aligned count cleanly."""
+    clicked = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Plain QWidget ignores a stylesheet "background" unless told to
+        # paint it — without this the active-category highlight silently
+        # never renders (caught by grabbing an offscreen render, not by any
+        # of the structural checks, which only look at the stylesheet
+        # *string*, not the actual paint).
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class ConnectionPanel(QWidget):
     """One database connection panel (sidebar + content tabs)."""
 
@@ -149,12 +174,14 @@ class ConnectionPanel(QWidget):
     _bg_connect_done = Signal(str)    # error message, "" on success
 
     def __init__(self, config: dict, db_service: DbService,
-                 query_history: QueryHistory, parent=None, already_connected: bool = True):
+                 query_history: QueryHistory, saved_queries: SavedQueries = None,
+                 parent=None, already_connected: bool = True):
         super().__init__(parent)
 
         self.config = config
         self.db_service = db_service
         self.query_history = query_history
+        self.saved_queries = saved_queries if saved_queries is not None else SavedQueries()
         # True while db_service.connect() is still running on a background
         # thread (see _connect_in_background). Cached schema is shown
         # immediately regardless; write/reconnect actions are held off
@@ -163,10 +190,24 @@ class ConnectionPanel(QWidget):
 
         self.all_tables = []
         self.all_table_items = {}
+        self.all_views = []
+        self.all_view_items = {}
+        self.all_functions = []
+        self.all_function_items = {}
         self.table_index = {}
         self.all_schema_items = []
         self.current_theme = "dark"
         self._available_dbs: list[str] = []
+
+        # Schema sidebar category filter (All Tables / Views / Functions) —
+        # a flat, single-category-at-a-time list styled after a categorized
+        # sidebar with live counts, rather than a nested Tables/Views/
+        # Functions tree the user always has to expand.
+        self._active_category = "tables"
+        self._category_rows = {}
+        self._category_count_labels = {}
+        self._category_icon_emoji = {"tables": "\U0001F5C3", "views": "\U0001F441", "functions": "ƒ"}
+        self._icon_cache = {}
 
         # Schema-loading progress indicator (issue #57) — ticks the elapsed
         # time on whichever top-level tree row represents an in-flight
@@ -230,46 +271,48 @@ class ConnectionPanel(QWidget):
         # Cmd+K shortcut (also works as Ctrl+K on non-mac)
         QShortcut(QKeySequence("Ctrl+K"), self).activated.connect(self.show_db_switcher)
 
-        # ── Refresh Schema + Reconnect row ───────────────────────────
-        _action_row = QWidget()
-        _ar_layout = QHBoxLayout(_action_row)
-        _ar_layout.setContentsMargins(0, 0, 0, 0)
-        _ar_layout.setSpacing(4)
-
-        _btn_style = """
-            QPushButton {
-                background: transparent;
-                color: #8e8e93;
-                border: 1px solid #3a3a3c;
-                border-radius: 4px;
-                padding: 2px 8px;
-                font-size: 11px;
-            }
-            QPushButton:hover { color: #e5e5ea; border-color: #636366; }
-        """
-        self._refresh_schema_btn = QPushButton("↺ Schema")
-        self._refresh_schema_btn.setToolTip("Refresh schema tree (Cmd+Shift+R)")
-        self._refresh_schema_btn.setStyleSheet(_btn_style)
-        self._refresh_schema_btn.clicked.connect(self.load_schema)
-        _ar_layout.addWidget(self._refresh_schema_btn)
-
-        self._reconnect_btn = QPushButton("⟳ Reconnect")
-        self._reconnect_btn.setToolTip("Reconnect to the database")
-        self._reconnect_btn.setStyleSheet(_btn_style)
-        self._reconnect_btn.clicked.connect(self._do_reconnect)
-        _ar_layout.addWidget(self._reconnect_btn)
-
-        left_layout.addWidget(_action_row)
+        # Refresh Schema / Reconnect / ER Diagram / Compare Schema live in
+        # the Database menu (main.py) instead of dedicated toolbar buttons
+        # here (issue #68).
 
         # Cmd+Shift+R — refresh schema
         QShortcut(QKeySequence("Ctrl+Shift+R"), self).activated.connect(self.load_schema)
+
+        # ── Category filter: All Tables / Views / Functions, with live
+        # counts — a flat single-category list instead of an always-nested
+        # Tables/Views/Functions tree the user has to expand every time.
+        cat_container = QWidget()
+        cat_layout = QVBoxLayout(cat_container)
+        cat_layout.setContentsMargins(0, 2, 0, 2)
+        cat_layout.setSpacing(1)
+        for key, label in (("tables", "All Tables"), ("views", "Views"), ("functions", "Functions")):
+            row = _ClickableRow()
+            row.setCursor(Qt.PointingHandCursor)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(8, 5, 8, 5)
+            row_layout.setSpacing(8)
+            icon_lbl = QLabel(self._category_icon_emoji[key])
+            icon_lbl.setFixedWidth(16)
+            row_layout.addWidget(icon_lbl)
+            row_layout.addWidget(QLabel(label))
+            row_layout.addStretch()
+            count_lbl = QLabel("0")
+            row_layout.addWidget(count_lbl)
+            row.clicked.connect(lambda checked=False, k=key: self._set_active_category(k))
+            cat_layout.addWidget(row)
+            self._category_rows[key] = row
+            self._category_count_labels[key] = count_lbl
+        left_layout.addWidget(cat_container)
+        self._update_category_row_styles()
 
         self.table_search = QLineEdit()
         self.table_search.setPlaceholderText("Search tables...")
         self.table_search.textChanged.connect(self.filter_tables)
         left_layout.addWidget(self.table_search)
 
-        # ── Schema / History toggle ──────────────────────────────────
+        # ── Schema / Queries / History toggle ──────────────────────────
+        # Order is Schema, Queries, History (issue #130) — Queries sits
+        # ahead of History since it's the more actively-used workflow.
         sidebar_toggle = QWidget()
         toggle_layout = QHBoxLayout(sidebar_toggle)
         toggle_layout.setContentsMargins(0, 0, 0, 0)
@@ -281,11 +324,17 @@ class ConnectionPanel(QWidget):
         self._schema_btn.setFlat(True)
         self._schema_btn.clicked.connect(lambda: self._switch_sidebar(0))
 
+        self._queries_btn = QPushButton("Queries")
+        self._queries_btn.setCheckable(True)
+        self._queries_btn.setChecked(False)
+        self._queries_btn.setFlat(True)
+        self._queries_btn.clicked.connect(lambda: self._switch_sidebar(1))
+
         self._history_btn = QPushButton("History")
         self._history_btn.setCheckable(True)
         self._history_btn.setChecked(False)
         self._history_btn.setFlat(True)
-        self._history_btn.clicked.connect(lambda: self._switch_sidebar(1))
+        self._history_btn.clicked.connect(lambda: self._switch_sidebar(2))
 
         _toggle_style = """
             QPushButton {
@@ -304,13 +353,15 @@ class ConnectionPanel(QWidget):
             QPushButton:hover:!checked { color: #c7c7cc; }
         """
         self._schema_btn.setStyleSheet(_toggle_style)
+        self._queries_btn.setStyleSheet(_toggle_style)
         self._history_btn.setStyleSheet(_toggle_style)
         toggle_layout.addWidget(self._schema_btn)
+        toggle_layout.addWidget(self._queries_btn)
         toggle_layout.addWidget(self._history_btn)
         toggle_layout.addStretch()
         left_layout.addWidget(sidebar_toggle)
 
-        # ── Stacked: page 0 = schema tree, page 1 = history list ────────
+        # ── Stacked: page 0 = schema tree, page 1 = queries, page 2 = history ──
         self._sidebar_stack = QStackedWidget()
 
         self.schema_tree = QTreeWidget()
@@ -321,6 +372,33 @@ class ConnectionPanel(QWidget):
         self.schema_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.schema_tree.customContextMenuRequested.connect(self._show_context_menu)
         self._sidebar_stack.addWidget(self.schema_tree)   # index 0
+
+        # Queries panel (favorite + saved queries — issue #130)
+        queries_panel = QWidget()
+        qp_layout = QVBoxLayout(queries_panel)
+        qp_layout.setContentsMargins(0, 0, 0, 0)
+        qp_layout.setSpacing(2)
+
+        self._queries_search = QLineEdit()
+        self._queries_search.setPlaceholderText("Search queries...")
+        self._queries_search.textChanged.connect(self._filter_queries_list)
+        qp_layout.addWidget(self._queries_search)
+
+        self._queries_list = QListWidget()
+        self._queries_list.setWordWrap(False)
+        qp_layout.addWidget(self._queries_list)
+
+        view_all_btn = QPushButton("View all saved queries...")
+        view_all_btn.setFlat(True)
+        view_all_btn.clicked.connect(self._open_query_library)
+        qp_layout.addWidget(view_all_btn)
+
+        save_query_btn = QPushButton("＋ Save Current Query")
+        save_query_btn.setFlat(True)
+        save_query_btn.clicked.connect(self._save_current_query)
+        qp_layout.addWidget(save_query_btn)
+
+        self._sidebar_stack.addWidget(queries_panel)          # index 1
 
         # History panel
         history_panel = QWidget()
@@ -343,7 +421,7 @@ class ConnectionPanel(QWidget):
         clear_hist_btn.clicked.connect(self._clear_history)
         hp_layout.addWidget(clear_hist_btn)
 
-        self._sidebar_stack.addWidget(history_panel)         # index 1
+        self._sidebar_stack.addWidget(history_panel)         # index 2
 
         left_layout.addWidget(self._sidebar_stack)
 
@@ -393,6 +471,87 @@ class ConnectionPanel(QWidget):
 
         root.addWidget(splitter)
 
+    # ─── Schema sidebar category filter ────────────────────────────────────────
+
+    def _emoji_icon(self, emoji: str):
+        """Rasterize *emoji* to a small QIcon (cached) — this app has no
+        icon image assets, everything is unicode/emoji, consistent with
+        menu actions elsewhere in this file."""
+        if emoji in self._icon_cache:
+            return self._icon_cache[emoji]
+        from PySide6.QtGui import QIcon, QPixmap, QPainter, QFont
+        size = 16
+        pix = QPixmap(size, size)
+        pix.fill(Qt.transparent)
+        painter = QPainter(pix)
+        f = QFont()
+        f.setPointSize(11)
+        painter.setFont(f)
+        painter.drawText(pix.rect(), Qt.AlignCenter, emoji)
+        painter.end()
+        icon = QIcon(pix)
+        self._icon_cache[emoji] = icon
+        return icon
+
+    def _update_category_row_styles(self):
+        for key, row in self._category_rows.items():
+            active = key == self._active_category
+            row.setStyleSheet(
+                f"background: {'#0A84FF' if active else 'transparent'}; border-radius: 4px;")
+            for child in row.findChildren(QLabel):
+                child.setStyleSheet(
+                    f"color: {'#ffffff' if active else '#c7c7cc'}; background: transparent;")
+
+    def _set_active_category(self, category: str):
+        if category == self._active_category:
+            return
+        self._active_category = category
+        self._update_category_row_styles()
+        self.table_search.setPlaceholderText(f"Search {category}...")
+        self.table_search.blockSignals(True)
+        self.table_search.clear()
+        self.table_search.blockSignals(False)
+        self._render_active_category()
+
+    def _active_category_items(self) -> dict:
+        return {
+            "tables": self.all_table_items,
+            "views": self.all_view_items,
+            "functions": self.all_function_items,
+        }[self._active_category]
+
+    def _render_active_category(self):
+        """Rebuild schema_tree as a flat list of just the active category's
+        items — no folder wrapper, matching a categorized-sidebar layout
+        instead of an always-nested Tables/Views/Functions tree."""
+        self.schema_tree.clear()
+        names = {
+            "tables": self.all_tables,
+            "views": self.all_views,
+            "functions": self.all_functions,
+        }[self._active_category]
+        items_map = self._active_category_items()
+        items_map.clear()
+        icon = self._emoji_icon(self._category_icon_emoji[self._active_category])
+        for name in names:
+            item = QTreeWidgetItem([name])
+            item.setIcon(0, icon)
+            items_map[name] = item
+            self.schema_tree.addTopLevelItem(item)
+        self.filter_tables(self.table_search.text())
+
+    def _clear_schema_state(self):
+        self.all_tables.clear()
+        self.all_table_items.clear()
+        self.all_views.clear()
+        self.all_view_items.clear()
+        self.all_functions.clear()
+        self.all_function_items.clear()
+        self.all_schema_items.clear()
+        self.schema_tree.clear()
+        for lbl in self._category_count_labels.values():
+            lbl.setText("0")
+
     def _guard_write(self, sql: str, extra_reason: str = None) -> bool:
         """Classify *sql* (one statement or a whole script) and show
         whatever dialog is needed before a write reaches the database.
@@ -419,8 +578,13 @@ class ConnectionPanel(QWidget):
         connection_name = self.config.get("name", "Connection")
         env = environment.normalize(self.config.get("environment"))
 
-        if self.config.get("read_only") and any(c.is_write for c in classifications):
-            blocked = [c.statement for c in classifications if c.is_write]
+        if self.config.get("read_only") and any(
+            c.kind in query_classifier.READ_ONLY_BLOCKED_KINDS for c in classifications
+        ):
+            blocked = [
+                c.statement for c in classifications
+                if c.kind in query_classifier.READ_ONLY_BLOCKED_KINDS
+            ]
             query_guard_dialog.show_read_only_blocked(self, connection_name, env, blocked)
             return False
 
@@ -449,19 +613,13 @@ class ConnectionPanel(QWidget):
         # to be live, and the cache check further down still applies.
         if not self.db_service or (not self.db_service.connection and not self._connecting):
             self._stop_schema_loading_indicator()
-            self.schema_tree.clear()
-            self.all_tables.clear()
-            self.all_table_items.clear()
-            self.all_schema_items.clear()
+            self._clear_schema_state()
             return
 
         # Clear immediately so the user sees empty tree straight away
         self._stop_schema_loading_indicator()
         self._schema_retry_item = None
-        self.schema_tree.clear()
-        self.all_tables.clear()
-        self.all_table_items.clear()
-        self.all_schema_items.clear()
+        self._clear_schema_state()
 
         # Issue #71: a previously visited connection/database populates the
         # tree and autocomplete instantly from disk, no network round-trip.
@@ -629,41 +787,26 @@ class ConnectionPanel(QWidget):
 
         self._column_cache = columns
 
-        # Rebuild tree
-        self.schema_tree.clear()
-        self.all_tables.clear()
-        self.all_table_items.clear()
-        self.all_schema_items.clear()
+        # Populate the flat name/index state; _render_active_category()
+        # below builds the visible tree from just the active category.
+        self.all_tables = list(tables)
+        self.all_views = list(views)
+        self.all_functions = list(functions)
+        self.all_schema_items = (
+            [("table", t) for t in tables]
+            + [("view", v) for v in views]
+            + [("function", fn) for fn in functions]
+        )
         self.table_index.clear()
-
-        tables_cat    = QTreeWidgetItem(["Tables"])
-        views_cat     = QTreeWidgetItem(["Views"])
-        functions_cat = QTreeWidgetItem(["Functions/Procedures"])
-
         for table_name in tables:
-            self.all_tables.append(table_name)
-            self.all_schema_items.append(("table", table_name))
             if len(table_name) >= 3:
                 self.table_index.setdefault(
                     table_name[:3].lower(), []).append(table_name)
-            item = QTreeWidgetItem([table_name])
-            self.all_table_items[table_name] = item
-            tables_cat.addChild(item)
 
-        for v in views:
-            self.all_schema_items.append(("view", v))
-            views_cat.addChild(QTreeWidgetItem([v]))
-
-        for fn in functions:
-            self.all_schema_items.append(("function", fn))
-            functions_cat.addChild(QTreeWidgetItem([fn]))
-
-        self.schema_tree.addTopLevelItem(tables_cat)
-        if views:
-            self.schema_tree.addTopLevelItem(views_cat)
-        if functions:
-            self.schema_tree.addTopLevelItem(functions_cat)
-        tables_cat.setExpanded(True)
+        self._category_count_labels["tables"].setText(str(len(tables)))
+        self._category_count_labels["views"].setText(str(len(views)))
+        self._category_count_labels["functions"].setText(str(len(functions)))
+        self._render_active_category()
 
         # Update autocomplete in existing SQL tabs (TableViewWidget is a data
         # grid, not an editor — it has no autocomplete/schema to push).
@@ -882,20 +1025,25 @@ class ConnectionPanel(QWidget):
     # ─── Schema tree interaction ──────────────────────────────────────────────
 
     def _on_item_clicked(self, item, column):
-        if item.parent() is None:
-            # Issue #57: the "↺ Click to retry" row shown after a failed
-            # schema load — same action as the toolbar's "↺ Schema" button.
-            if item is self._schema_retry_item:
-                self.load_schema()
+        # Issue #57: the "↺ Click to retry" row shown after a failed
+        # schema load — same action as the toolbar's "↺ Schema" button.
+        if item is self._schema_retry_item:
+            self._schema_retry_item = None
+            self.load_schema()
             return
-        if item.parent().text(0) in ("Tables", "Views"):
+        # The tree is a flat list of just the active category's items now
+        # (no Tables/Views/Functions folder wrapper) — gate by membership in
+        # that category's item map rather than a parent-folder check, so a
+        # transient "Loading…"/error row (never added to that map) is a
+        # no-op instead of trying to open a table that doesn't exist.
+        if self._active_category in ("tables", "views") and item.text(0) in self._active_category_items():
             self.open_table_view(item.text(0))
 
     def _show_context_menu(self, position):
         item = self.schema_tree.itemAt(position)
-        if not item or item.parent() is None:
+        if not item:
             return
-        if item.parent().text(0) not in ("Tables", "Views"):
+        if self._active_category not in ("tables", "views") or item.text(0) not in self._active_category_items():
             return
 
         menu = QMenu(self)
@@ -924,6 +1072,26 @@ class ConnectionPanel(QWidget):
             self.load_schema()
 
     # ─── Table/query tabs ─────────────────────────────────────────────────────
+
+    def open_erd_view(self):
+        """Open a read-only ER diagram of the current database (issue #62).
+        Builds its own dedicated connection (services/erd_model.py) — never
+        touches self.db_service."""
+        if not self.db_service or not self.db_service.connection:
+            QMessageBox.information(self, "ER Diagram", "Connect to a database first.")
+            return
+        dlg = ErdDialog(dict(self.config), is_dark=(self.current_theme == "dark"), parent=self)
+        dlg.open_table.connect(self.open_table_view)
+        dlg.view_structure.connect(self._show_table_structure)
+        dlg.exec_()
+
+    def open_schema_compare(self):
+        """Open the read-only Schema Compare dialog (issue #68), preselecting
+        this connection as Source. Builds its own dedicated connections for
+        both sides (services/schema_diff.py) — never touches self.db_service."""
+        dlg = SchemaCompareDialog(
+            self.config.get("id", ""), is_dark=(self.current_theme == "dark"), parent=self)
+        dlg.exec_()
 
     def open_table_view(self, table_name: str):
         """Open a table view; re-focus if already open."""
@@ -1126,7 +1294,7 @@ class ConnectionPanel(QWidget):
         # Load FK map so right-click "Go to …" works in the result grid
         self._wire_result_fk(tab, table_name)
         self.query_history.add_query(query, self.config["name"], len(df), elapsed)
-        if self._sidebar_stack.currentIndex() == 1:
+        if self._sidebar_stack.currentIndex() == 2:
             self._reload_history_list(self._history_search.text())
         self.health_changed.emit('idle')
         if self.tabs.currentWidget() is not tab:
@@ -1148,7 +1316,7 @@ class ConnectionPanel(QWidget):
 
         total_rows = sum(len(df) for _, df in select_results)
         self.query_history.add_query(query, self.config["name"], total_rows, elapsed)
-        if self._sidebar_stack.currentIndex() == 1:
+        if self._sidebar_stack.currentIndex() == 2:
             self._reload_history_list(self._history_search.text())
 
         if len(select_results) == 1:
@@ -1760,6 +1928,7 @@ class ConnectionPanel(QWidget):
             w = panel.tabs.widget(i)
             from ui.table_view_widget import TableViewWidget
             if isinstance(w, TableViewWidget) and w.table_name == table_name:
+                w._warn_and_discard_changes()
                 w.current_page = 1
                 w.load_table_data()
                 break
@@ -1827,9 +1996,12 @@ class ConnectionPanel(QWidget):
     def _switch_sidebar(self, index: int):
         self._sidebar_stack.setCurrentIndex(index)
         self._schema_btn.setChecked(index == 0)
-        self._history_btn.setChecked(index == 1)
+        self._queries_btn.setChecked(index == 1)
+        self._history_btn.setChecked(index == 2)
         self.table_search.setVisible(index == 0)
         if index == 1:
+            self._reload_queries_list()
+        elif index == 2:
             self._reload_history_list()
 
     def _reload_history_list(self, filter_text: str = ''):
@@ -1863,25 +2035,179 @@ class ConnectionPanel(QWidget):
         self.query_history.save_history()
         self._history_list.clear()
 
+    # ─── Sidebar saved queries (issue #130) ────────────────────────────────────
+
+    def _build_query_row(self, entry: dict) -> QWidget:
+        """One clickable row in the Queries panel — click loads the query
+        into the active tab, the ⋮ button opens per-row actions. Reuses
+        _ClickableRow so a click anywhere except the buttons fires (same
+        pattern as the schema category rows)."""
+        row = _ClickableRow()
+        row.setAttribute(Qt.WA_StyledBackground, True)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(8, 4, 4, 4)
+        row_layout.setSpacing(6)
+
+        icon_lbl = QLabel("★" if entry.get("favorite") else "📄")
+        icon_lbl.setFixedWidth(18)
+        icon_lbl.setStyleSheet(
+            "color: #FFCC00; font-size: 13px; background: transparent;" if entry.get("favorite")
+            else "color: #8e8e93; font-size: 12px; background: transparent;")
+        row_layout.addWidget(icon_lbl)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(0)
+        name_lbl = QLabel(entry["name"])
+        name_lbl.setStyleSheet("color: #e5e5ea; font-size: 12px; font-weight: 600; background: transparent;")
+        preview = entry.get("query", "").replace("\n", " ").strip()[:48]
+        preview_lbl = QLabel(preview)
+        preview_lbl.setStyleSheet("color: #0A84FF; font-size: 11px; background: transparent;")
+        text_col.addWidget(name_lbl)
+        text_col.addWidget(preview_lbl)
+        row_layout.addLayout(text_col)
+        row_layout.addStretch()
+
+        menu_btn = QPushButton("⋮")
+        menu_btn.setFlat(True)
+        menu_btn.setFixedWidth(22)
+        menu_btn.setStyleSheet("""
+            QPushButton { color: #8e8e93; border: none; background: transparent; font-size: 14px; }
+            QPushButton:hover { color: #e5e5ea; }
+        """)
+        menu_btn.clicked.connect(lambda checked=False, e=entry, b=menu_btn: self._show_saved_query_menu(e, b))
+        row_layout.addWidget(menu_btn)
+
+        row.clicked.connect(lambda e=entry: self._use_saved_query(e))
+        return row
+
+    def _add_query_section_header(self, text: str, count: int):
+        item = QListWidgetItem()
+        item.setFlags(Qt.ItemIsEnabled)
+        header = QWidget()
+        h_layout = QHBoxLayout(header)
+        h_layout.setContentsMargins(6, 8, 6, 2)
+        label = QLabel(text)
+        label.setStyleSheet("color: #8e8e93; font-size: 11px; font-weight: 600; background: transparent;")
+        h_layout.addWidget(label)
+        h_layout.addStretch()
+        count_lbl = QLabel(str(count))
+        count_lbl.setStyleSheet("color: #636366; font-size: 11px; background: transparent;")
+        h_layout.addWidget(count_lbl)
+        item.setSizeHint(header.sizeHint())
+        self._queries_list.addItem(item)
+        self._queries_list.setItemWidget(item, header)
+
+    def _add_query_rows(self, entries: list):
+        for entry in entries:
+            item = QListWidgetItem()
+            item.setFlags(Qt.ItemIsEnabled)
+            row = self._build_query_row(entry)
+            item.setSizeHint(row.sizeHint())
+            self._queries_list.addItem(item)
+            self._queries_list.setItemWidget(item, row)
+
+    def _reload_queries_list(self, filter_text: str = ''):
+        self._queries_list.clear()
+        ft = filter_text.strip()
+        entries = self.saved_queries.search(ft) if ft else list(self.saved_queries.queries)
+        favorites = [q for q in entries if q.get("favorite")]
+        saved = [q for q in entries if not q.get("favorite")]
+
+        if favorites:
+            self._add_query_section_header("★ Favorite Queries", len(favorites))
+            self._add_query_rows(favorites)
+        if saved:
+            self._add_query_section_header("☆ Saved Queries", len(saved))
+            self._add_query_rows(saved)
+        if not favorites and not saved:
+            empty_item = QListWidgetItem("No saved queries yet — save one from the SQL editor.")
+            empty_item.setFlags(Qt.NoItemFlags)
+            self._queries_list.addItem(empty_item)
+
+    def _filter_queries_list(self, text: str):
+        self._reload_queries_list(filter_text=text)
+
+    def _use_saved_query(self, entry: dict):
+        query = entry.get("query", "")
+        if not query:
+            return
+        self._active_sql_tab().set_query(query)
+        self._switch_sidebar(0)
+
+    def _show_saved_query_menu(self, entry: dict, anchor: QPushButton):
+        menu = QMenu(self)
+        run_action = menu.addAction("Load into Tab")
+        fav_action = menu.addAction("Remove from Favorites" if entry.get("favorite") else "Add to Favorites")
+        rename_action = menu.addAction("Rename…")
+        delete_action = menu.addAction("Delete")
+        action = menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+        if action == run_action:
+            self._use_saved_query(entry)
+        elif action == fav_action:
+            self.saved_queries.toggle_favorite(entry["id"])
+            self._reload_queries_list(self._queries_search.text())
+        elif action == rename_action:
+            self._rename_saved_query(entry)
+        elif action == delete_action:
+            self._delete_saved_query(entry)
+
+    def _rename_saved_query(self, entry: dict):
+        name, ok = QInputDialog.getText(self, "Rename Query", "Name:", text=entry["name"])
+        if ok and name.strip():
+            self.saved_queries.update(entry["id"], name=name.strip())
+            self._reload_queries_list(self._queries_search.text())
+
+    def _delete_saved_query(self, entry: dict):
+        reply = QMessageBox.question(
+            self, "Delete Query", f"Delete '{entry['name']}'?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.saved_queries.delete(entry["id"])
+            self._reload_queries_list(self._queries_search.text())
+
+    def _save_current_query(self):
+        tab = self.tabs.currentWidget()
+        query = tab.editor.toPlainText().strip() if isinstance(tab, SqlTab) else ""
+        if not query:
+            QMessageBox.information(self, "Nothing to Save", "Write a query in the editor first.")
+            return
+        name, ok = QInputDialog.getText(self, "Save Query", "Name:")
+        if ok and name.strip():
+            self.saved_queries.add(name.strip(), query)
+            self._switch_sidebar(1)
+
+    def _open_query_library(self):
+        dialog = QueryLibraryDialog(self.saved_queries, self)
+        if dialog.exec():
+            query = dialog.get_selected_query()
+            if query:
+                self._active_sql_tab().set_query(query)
+                self._switch_sidebar(0)
+        self._reload_queries_list(self._queries_search.text())
+
     # ─── Table filter ─────────────────────────────────────────────────────────
 
     def filter_tables(self, search_text: str):
-        """Fuzzy-match table names; bold-highlight matched characters."""
+        """Fuzzy-match the active category's item names (tables, views, or
+        functions — whichever sidebar category filter is selected);
+        bold-highlight matched characters."""
         from PySide6.QtGui import QBrush, QColor
 
+        items_map = self._active_category_items()
         raw = search_text.strip()
         query = raw.lower()
 
         # ── Reset all items ───────────────────────────────────────────────────
-        for table_name, item in self.all_table_items.items():
+        for name, item in items_map.items():
             item.setHidden(False)
-            item.setText(0, table_name)   # clear previous highlight
+            item.setText(0, name)   # clear previous highlight
             item.setForeground(0, QBrush(QColor("#e5e5ea")))
 
         if not query:
             return
 
-        # ── Score every table ─────────────────────────────────────────────────
+        # ── Score every item ──────────────────────────────────────────────────
         def _score(name: str) -> int:
             nl = name.lower()
             if nl == query:                    return 1000
@@ -1896,16 +2222,16 @@ class ConnectionPanel(QWidget):
             return -1   # no match
 
         scored = []
-        for table_name, item in self.all_table_items.items():
-            s = _score(table_name)
+        for name, item in items_map.items():
+            s = _score(name)
             item.setHidden(s < 0)
             if s >= 0:
-                scored.append((s, table_name, item))
+                scored.append((s, name, item))
 
         # ── Highlight matched characters in green ─────────────────────────────
         # QTreeWidget doesn't support rich text, so we colour the whole item
         # for prefix/exact matches and use normal colour for fuzzy hits.
-        for s, table_name, item in scored:
+        for s, name, item in scored:
             if s >= 800:
                 # Direct substring match — tint green
                 item.setForeground(0, QBrush(QColor("#89d185")))
@@ -1914,30 +2240,26 @@ class ConnectionPanel(QWidget):
                 item.setForeground(0, QBrush(QColor("#6cba68")))
 
         # ── Re-sort visible items so best matches appear first ────────────────
-        # QTreeWidget doesn't have a built-in sort by custom score, so we
-        # reorder children of each top-level category item.
-        def _reorder(parent_item):
-            children = []
-            for i in range(parent_item.childCount()):
-                child = parent_item.child(i)
-                if not child.isHidden():
-                    name = child.text(0)
-                    children.append((_score(name), name, child))
-            # Sort descending by score, then alphabetically
-            children.sort(key=lambda x: (-x[0], x[1]))
-            for rank, (_, _, child) in enumerate(children):
-                parent_item.removeChild(child)
-                parent_item.insertChild(rank, child)
-
+        # QTreeWidget doesn't have a built-in sort by custom score. The tree
+        # is a flat list of the active category now (no folder wrapper), so
+        # reorder the root's direct children.
         root = self.schema_tree.invisibleRootItem()
+        children = []
         for i in range(root.childCount()):
-            _reorder(root.child(i))
+            child = root.child(i)
+            if not child.isHidden():
+                children.append((_score(child.text(0)), child.text(0), child))
+        children.sort(key=lambda x: (-x[0], x[1]))
+        for rank, (_, _, child) in enumerate(children):
+            root.removeChild(child)
+            root.insertChild(rank, child)
 
     # ─── Refresh ──────────────────────────────────────────────────────────────
 
     def refresh_current_view(self):
         w = self.tabs.currentWidget()
         if isinstance(w, TableViewWidget):
+            w._warn_and_discard_changes()
             w.current_page = 1
             w.load_table_data()
         elif isinstance(w, SqlTab) and w.get_query().strip():
@@ -2049,9 +2371,6 @@ class ConnectionPanel(QWidget):
             return
         reconnected_ok = False
         try:
-            self._reconnect_btn.setEnabled(False)
-            self._reconnect_btn.setText("…")
-
             # Pick up any edits made in the Connection Manager while this
             # tab stayed open (host, port, credentials, environment, ...)
             # instead of reusing whatever was captured when the tab was
@@ -2076,9 +2395,6 @@ class ConnectionPanel(QWidget):
         except Exception as ex:
             QMessageBox.critical(self, "Reconnect Failed", str(ex))
             self.health_changed.emit('disconnected')
-        finally:
-            self._reconnect_btn.setEnabled(True)
-            self._reconnect_btn.setText("⟳ Reconnect")
 
     # ─── Health check ────────────────────────────────────────────────────────────
 
@@ -2185,64 +2501,9 @@ class ConnectionPanel(QWidget):
 
     def _show_query_toast(self, tab_name: str, row_count: int, elapsed: float):
         """Slide-in notification from the right when a background query finishes."""
-        from PySide6.QtWidgets import QFrame, QLabel, QHBoxLayout
-        from PySide6.QtCore import QTimer, QPropertyAnimation, QRect, QEasingCurve
-        from PySide6.QtGui import QColor
-
-        # Build toast widget parented to this panel (so it clips to its bounds)
-        toast = QFrame(self)
-        toast.setWindowFlags(Qt.FramelessWindowHint | Qt.ToolTip)
-        toast.setAttribute(Qt.WA_TranslucentBackground, False)
-        toast.setStyleSheet("""
-            QFrame {
-                background: #1e3a2e;
-                border: 1px solid #30d158;
-                border-radius: 8px;
-            }
-            QLabel { color: #e5e5ea; font-size: 13px; background: transparent; border: none; }
-        """)
-
-        h = QHBoxLayout(toast)
-        h.setContentsMargins(14, 10, 14, 10)
-        h.setSpacing(8)
-        icon = QLabel("✓")
-        icon.setStyleSheet("color: #30d158; font-size: 16px; font-weight: bold; background:transparent; border:none;")
-        text = QLabel(f"<b>{tab_name}</b> — {row_count} row{'s' if row_count != 1 else ''} in {elapsed:.2f}s")
-        h.addWidget(icon)
-        h.addWidget(text)
-
-        toast.adjustSize()
-        tw, th = toast.width(), toast.height()
-
-        # Position: bottom-right corner of this panel
-        pw, ph = self.width(), self.height()
-        margin = 16
-        shown_x  = pw - tw - margin
-        hidden_x = pw + tw          # starts off-screen to the right
-        y        = ph - th - margin
-
-        toast.setGeometry(hidden_x, y, tw, th)
-        toast.show()
-        toast.raise_()
-
-        # Slide in
-        anim_in = QPropertyAnimation(toast, b"geometry")
-        anim_in.setDuration(280)
-        anim_in.setEasingCurve(QEasingCurve.OutCubic)
-        anim_in.setStartValue(QRect(hidden_x, y, tw, th))
-        anim_in.setEndValue(QRect(shown_x,  y, tw, th))
-        anim_in.start()
-        # Keep a reference so GC doesn't kill it
-        toast._anim_in = anim_in
-
-        def _slide_out():
-            anim_out = QPropertyAnimation(toast, b"geometry")
-            anim_out.setDuration(280)
-            anim_out.setEasingCurve(QEasingCurve.InCubic)
-            anim_out.setStartValue(QRect(shown_x,  y, tw, th))
-            anim_out.setEndValue(QRect(hidden_x, y, tw, th))
-            anim_out.finished.connect(toast.deleteLater)
-            anim_out.start()
-            toast._anim_out = anim_out
-
-        QTimer.singleShot(2800, _slide_out)
+        from utils.toast import show_toast
+        show_toast(
+            self,
+            f"<b>{tab_name}</b> — {row_count} row{'s' if row_count != 1 else ''} in {elapsed:.2f}s",
+            icon="✓", kind="success",
+        )

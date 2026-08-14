@@ -65,10 +65,8 @@ Support a connection/profile mode that blocks writes inside QForge. It should
 cover direct SQL, multi-statement scripts, result-grid commits, CSV imports,
 and schema creation/alteration. Ideally use database-native read-only session
 settings where each engine supports them, plus a client-side guard for clear
-feedback and consistent UI behaviour.
-
-Never describe client-side statement parsing as a security boundary: database
-permissions remain the real enforcement mechanism.
+feedback and consistent UI behaviour. (See principle 1 below — this guard is
+convenience, not the security boundary.)
 
 ### 3. Dangerous-query guard
 
@@ -133,14 +131,19 @@ confidential data.
 
 ## Before changing code
 
-1. Read the relevant files in the code map and trace every write entry point.
+1. Read the relevant files in the code map and trace every write entry point
+   — prefer `graphify-out/graph.json` (method/line index) for navigation over
+   reading whole files or spawning search agents, when it's current.
 2. Check the working tree with `git status --short`; unrelated edits belong to
    the user and must be preserved.
-3. Write a short implementation plan naming affected entry points and how each
-   guard will apply.
+3. For non-trivial or architecturally ambiguous changes, name the affected
+   entry points and how each guard will apply before writing code — a couple
+   of sentences is enough for most tasks; reserve full plan-mode ceremony for
+   genuinely large or multi-approach changes.
 4. Decide which database dialects are supported in this slice and make any
    limitations visible in the UI and documentation.
-5. Update `ai/flush-context.md` before handoff or when the work pauses.
+5. Update `ai/flush-context.md` before handoff or when the work pauses —
+   replace stale content, don't append to it.
 
 ## Definition of done for a safety slice
 

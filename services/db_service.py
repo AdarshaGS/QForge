@@ -76,7 +76,7 @@ class DbService:
             return
         for stmt in query_classifier.split_statements(sql):
             c = query_classifier.classify(stmt)
-            if c.is_write:
+            if c.kind in query_classifier.READ_ONLY_BLOCKED_KINDS:
                 raise ReadOnlyViolation(
                     f"This connection is read-only — blocked: {stmt[:200]}"
                 )
@@ -572,6 +572,41 @@ class DbService:
             pass
         return []
 
+    def get_primary_keys(self, table_name: str) -> list[str]:
+        """Return the primary-key column name(s) for *table_name*, in key
+        order. Empty list if the table has no primary key or on failure."""
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute(f"SHOW KEYS FROM `{table_name}` WHERE Key_name = 'PRIMARY'")
+                rows = cursor.fetchall()
+                cursor.close()
+                rows.sort(key=lambda r: r["Seq_in_index"])
+                return [r["Column_name"] for r in rows]
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT a.attname
+                    FROM pg_index i
+                    JOIN pg_attribute a
+                         ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    WHERE i.indrelid = %s::regclass AND i.indisprimary
+                    ORDER BY array_position(i.indkey, a.attnum)
+                """, (table_name,))
+                rows = cursor.fetchall()
+                cursor.close()
+                return [r[0] for r in rows]
+            elif self.db_type == "sqlite":
+                cursor = self.connection.cursor()
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                rows = cursor.fetchall()
+                cursor.close()
+                pk_rows = sorted((r for r in rows if r[5] > 0), key=lambda r: r[5])
+                return [r[1] for r in pk_rows]
+        except Exception:
+            pass
+        return []
+
     def _execute_query_raw(self, query):
         """Internal: run a SQL statement without reconnect logic.
         For statements that return a result set (SELECT/SHOW/EXPLAIN/DESCRIBE),
@@ -1061,8 +1096,9 @@ class DbService:
                     idx_name = row[1] if isinstance(row, (list, tuple)) else row.get("name", "")
                     unique = bool(row[2] if isinstance(row, (list, tuple)) else row.get("unique", 0))
                     cursor.execute(f"PRAGMA index_info({idx_name})")
+                    info_rows = [dict(r) if hasattr(r, 'keys') else r for r in cursor.fetchall()]
                     cols = ", ".join(str(r[2] if isinstance(r, (list, tuple)) else r.get("name", ""))
-                                    for r in cursor.fetchall())
+                                    for r in info_rows)
                     indexes.append({"name": idx_name, "columns": cols, "unique": unique, "type": "BTREE"})
                 cursor.close()
                 return indexes

@@ -29,9 +29,9 @@ the free-tool tier.
 | Item | Effort | Cash cost |
 |---|---|---|
 | Real code signing + notarization pipeline (replace ad-hoc `codesign` in `build.sh`/CI) | 1–2 dev days | $99/yr (Apple Developer Program) |
-| Relicense off MIT (proprietary or open-core decision + LICENSE/README update) | 0.5–1 day | $0 |
+| ~~Relicense off MIT (proprietary or open-core decision + LICENSE/README update)~~ — done: `LICENSE` replaced with a proprietary EULA, `pyproject.toml`/`README.md` updated | 0.5–1 day | $0 |
 | License-key generation + in-app validation, wired to Paddle/Lemon Squeezy checkout | 3–5 dev days | $0 upfront, ~5% of revenue per sale |
-| EULA + privacy policy + refund policy | 1–2 days (template) or 1–2 weeks turnaround (lawyer review) | ~$50–100 (Termly/TermsFeed template) or $500–1500 (lawyer review) |
+| Privacy policy + refund policy (EULA draft now in `LICENSE`, but still wants lawyer review before charging money) | 1–2 days (template) or 1–2 weeks turnaround (lawyer review) | ~$50–100 (Termly/TermsFeed template) or $500–1500 (lawyer review) |
 | Storefront / landing page | 2–4 dev days, or under a day using a MoR's hosted checkout page instead of a custom site | $0–~$20/mo if using a site builder |
 | Auto-update hardening (verify signed releases, not just any GitHub asset) | 1 day | $0 |
 | **Total** | **~9–15 dev days** (roughly 2–3 weeks full-time, 4–6 weeks part-time) | **~$150–300 first year DIY, up to ~$1,500–2,000 if lawyer-reviewed** |

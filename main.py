@@ -13,6 +13,7 @@ from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon
 
 from services.db_service import DbService
 from services.query_history import QueryHistory
+from services.saved_queries import SavedQueries
 from ui.connection_dialog import ConnectionDialog
 from ui.connection_panel import ConnectionPanel
 from ui.theme_manager import ThemeManager
@@ -65,6 +66,7 @@ class MainWindow(QMainWindow):
 
         self._panels: list[ConnectionPanel] = []
         self.query_history = QueryHistory()
+        self.saved_queries = SavedQueries()
         self.current_theme = "dark"
 
         self.apply_theme()
@@ -343,6 +345,7 @@ class MainWindow(QMainWindow):
                         config=config,
                         db_service=db_service,
                         query_history=self.query_history,
+                        saved_queries=self.saved_queries,
                         parent=self,
                         already_connected=False,
                     )
@@ -365,6 +368,7 @@ class MainWindow(QMainWindow):
                         config=config,
                         db_service=db_service,
                         query_history=self.query_history,
+                        saved_queries=self.saved_queries,
                         parent=self,
                     )
                     progress.close()
@@ -682,6 +686,38 @@ class MainWindow(QMainWindow):
 
         # Database
         db_menu = menubar.addMenu("Database")
+
+        act = db_menu.addAction("New Connection")
+        act.triggered.connect(self._prompt_new_connection)
+
+        act = db_menu.addAction("Reconnect")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel()._do_reconnect()
+        )
+
+        act = db_menu.addAction("Disconnect")
+        act.triggered.connect(
+            lambda: self._close_connection_tab(self.conn_tab_bar.currentIndex())
+        )
+
+        db_menu.addSeparator()
+
+        act = db_menu.addAction("Refresh Schema")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().load_schema()
+        )
+
+        act = db_menu.addAction("ER Diagram")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().open_erd_view()
+        )
+
+        act = db_menu.addAction("Compare Schemas…")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().open_schema_compare()
+        )
+
+        db_menu.addSeparator()
 
         act = db_menu.addAction("Create Database…")
         act.triggered.connect(

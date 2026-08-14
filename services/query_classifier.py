@@ -25,8 +25,9 @@ from sqlparse.sql import Where
 grouping.MAX_GROUPING_TOKENS = 100_000
 
 WRITE_KINDS = {
-    "INSERT", "UPDATE", "DELETE",
+    "INSERT", "UPDATE", "DELETE", "REPLACE",
     "CREATE", "DROP", "ALTER", "TRUNCATE", "RENAME", "GRANT", "REVOKE",
+    "LOAD",
 }
 DESTRUCTIVE_DDL_KINDS = {"DROP", "TRUNCATE"}
 # Statements that change table/column structure — used to invalidate the
@@ -39,7 +40,23 @@ WHERE_APPLICABLE_KINDS = {"UPDATE", "DELETE"}
 # sqlparse's get_type() reports UNKNOWN for these; the real keyword has to
 # come from the first non-comment token instead (verified against the
 # installed sqlparse version — see tests/test_query_classifier.py).
-_UNKNOWN_TYPE_FALLBACKS = {"GRANT", "REVOKE", "RENAME", "BEGIN"}
+_UNKNOWN_TYPE_FALLBACKS = {
+    "GRANT", "REVOKE", "RENAME", "BEGIN", "LOAD", "CALL", "EXEC", "EXECUTE",
+}
+
+# Stored procedure/function calls (issue #70). sqlparse can't tell whether
+# the called routine mutates data, so these are treated as unsafe under
+# read-only mode (READ_ONLY_BLOCKED_KINDS below) without folding them into
+# WRITE_KINDS itself — WRITE_KINDS also drives execute_multi_query()'s
+# DataFrame-vs-affected-rows dispatch, and a CALL can legitimately return a
+# result set that would be silently dropped if routed through
+# execute_update() instead of execute_query().
+PROCEDURE_CALL_KINDS = {"CALL", "EXEC", "EXECUTE"}
+
+# Everything read-only mode blocks (issue #70) — broader than WRITE_KINDS
+# because a stored-procedure call might mutate even though it isn't itself
+# classified as a write.
+READ_ONLY_BLOCKED_KINDS = WRITE_KINDS | PROCEDURE_CALL_KINDS
 
 # Transaction-control statements (Slice 4, ai/load-context.md). Not writes,
 # not dangerous — used by services/db_service.py to route BEGIN/COMMIT/
