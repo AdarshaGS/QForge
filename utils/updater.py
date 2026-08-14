@@ -10,7 +10,7 @@ from PySide6.QtCore import QThread, Signal
 # ── App identity ──────────────────────────────────────────────────────────────
 GITHUB_USER = "AdarshaGS"
 GITHUB_REPO = "QForge"
-APP_VERSION  = "1.1.2"        # bump this, commit, then tag as v<APP_VERSION> to release
+APP_VERSION  = "1.1.3"        # bump this, commit, then tag as v<APP_VERSION> to release
 
 
 def _vtuple(tag: str) -> tuple:
