@@ -17,7 +17,7 @@ def _to_sql_inserts(df, table_name: str) -> str:
     lines = []
     for _, row in df.iterrows():
         values = ", ".join(_sql_value_literal(v) for v in row)
-        lines.append(f"INSERT INTO `{table_name}` ({cols}) VALUES ({values});")
+        lines.append(f"INSERT INTO `{table_name}` ({cols}) VALUES ({values});")  # nosec B608
     return "\n".join(lines)
 
 

@@ -129,6 +129,39 @@ jobs:
         working-directory: artifacts
         run: sha256sum ./* > SHA256SUMS.txt
 
+      # Issue #113: SHA256 alone doesn't protect against a compromised
+      # GitHub release channel — an attacker who can publish here can
+      # regenerate the checksum to match a tampered DMG. Signing
+      # SHA256SUMS.txt with a key that only ever lives in this secret (never
+      # in the repo, never on GitHub as anything but this) means the
+      # self-updater (utils/self_updater.py, utils/update_signing.py) can
+      # refuse an update whose checksums aren't signed by it, even if the
+      # release itself is compromised. Needs a RELEASE_SIGNING_KEY repo
+      # secret (base64 raw ed25519 private key) — warns and skips signing
+      # if unset, same pattern as HOMEBREW_TAP_TOKEN below. NOTE: until this
+      # secret is set and a release is cut with it, the self-updater's
+      # signature check will refuse ALL updates — set this before shipping
+      # a version that includes the check.
+      - name: Sign SHA256SUMS.txt
+        working-directory: artifacts
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::warning::RELEASE_SIGNING_KEY secret not set — releasing without a signed SHA256SUMS.txt.sig. Any client running the signature-checking self-updater will refuse this update."
+            exit 0
+          fi
+          python3 -m pip install --quiet cryptography
+          python3 <<'PY'
+          import base64, os
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+          priv = Ed25519PrivateKey.from_private_bytes(base64.b64decode(os.environ["RELEASE_SIGNING_KEY"]))
+          data = open("SHA256SUMS.txt", "rb").read()
+          signature = base64.b64encode(priv.sign(data)).decode()
+          open("SHA256SUMS.txt.sig", "w").write(signature)
+          PY
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

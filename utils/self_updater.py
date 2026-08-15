@@ -10,7 +10,7 @@ import hashlib
 import os
 import plistlib
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import sys
 import tempfile
 import urllib.request
@@ -18,6 +18,7 @@ import urllib.request
 from PySide6.QtCore import QThread, Signal
 
 from utils.logger import get_logger
+from utils.update_signing import verify_signature
 from utils.updater import GITHUB_USER, GITHUB_REPO
 
 logger = get_logger()
@@ -66,10 +67,19 @@ class UpdateInstaller(QThread):
             self.failed.emit(str(ex))
 
     def _download(self, url: str) -> str:
+        # Unlike sums_url/sig_url below (fixed https://github.com/... with
+        # only a path segment interpolated), this url is the GitHub API's
+        # browser_download_url field verbatim — attacker-influenceable if
+        # the release channel itself is compromised (issue #113's threat
+        # model). Reject anything but plain https before ever calling
+        # urlopen, so a malicious file:// or unexpected scheme can't be
+        # used to read a local file or reach an unintended target.
+        if not url.startswith("https://"):
+            raise RuntimeError(f"Refusing to fetch update from a non-https URL: {url}")
         req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
         fd, tmp_path = tempfile.mkstemp(suffix=".dmg")
         self._sha256 = hashlib.sha256()
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310
             total = int(resp.headers.get("Content-Length", 0))
             written = 0
             with os.fdopen(fd, "wb") as f:
@@ -91,12 +101,38 @@ class UpdateInstaller(QThread):
         )
         req = urllib.request.Request(sums_url, headers={"User-Agent": _USER_AGENT})
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                sums_text = resp.read().decode()
+            # sums_url is a fixed https://github.com/... literal above with
+            # only a path segment (self.tag) interpolated — scheme can't be
+            # attacker-influenced the way _download()'s url can.
+            with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310
+                sums_bytes = resp.read()
         except Exception as ex:
             os.remove(dmg_path)
             raise RuntimeError(f"Could not fetch checksums for verification: {ex}")
 
+        sig_url = sums_url + ".sig"
+        req = urllib.request.Request(sig_url, headers={"User-Agent": _USER_AGENT})
+        try:
+            # sig_url is sums_url (see above) + a fixed ".sig" suffix.
+            with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310
+                signature_b64 = resp.read().decode().strip()
+        except Exception as ex:
+            os.remove(dmg_path)
+            raise RuntimeError(f"Could not fetch checksum signature for verification: {ex}")
+
+        # Requiring a valid signature here, not just a matching checksum, is
+        # the actual point of issue #113: without it, an attacker able to
+        # publish to (or intercept) this GitHub release could replace the
+        # DMG and SHA256SUMS.txt together and this check alone wouldn't
+        # notice — see utils/update_signing.py.
+        if not verify_signature(sums_bytes, signature_b64):
+            os.remove(dmg_path)
+            raise RuntimeError(
+                "Checksum signature verification failed — refusing to "
+                "trust this update."
+            )
+
+        sums_text = sums_bytes.decode()
         expected = next(
             (line.split()[0].lower() for line in sums_text.splitlines()
              if line.strip().endswith(".dmg")),
@@ -112,10 +148,12 @@ class UpdateInstaller(QThread):
             raise RuntimeError("Downloaded update failed checksum verification.")
 
     def _extract_app(self, dmg_path: str) -> str:
+        # dmg_path is our own tempfile.mkstemp() path; list-form args, no
+        # shell — nothing here is attacker-controlled string concatenation.
         out = subprocess.run(
             ["hdiutil", "attach", dmg_path, "-nobrowse", "-readonly", "-plist"],
             capture_output=True, check=True,
-        )
+        )  # nosec B603 B607
         info = plistlib.loads(out.stdout)
         mount_point = next(
             e["mount-point"] for e in info["system-entities"] if e.get("mount-point")
@@ -130,7 +168,9 @@ class UpdateInstaller(QThread):
             shutil.copytree(os.path.join(mount_point, apps[0]), staged, symlinks=True)
             return staged
         finally:
-            subprocess.run(["hdiutil", "detach", mount_point, "-quiet"], check=False)
+            # mount_point came from hdiutil's own plist output above, not
+            # from any external input.
+            subprocess.run(["hdiutil", "detach", mount_point, "-quiet"], check=False)  # nosec B603 B607
             os.remove(dmg_path)
 
     def _replace(self, app_path: str, new_app_path: str):
@@ -150,10 +190,12 @@ class UpdateInstaller(QThread):
         # Best-effort: a downloaded-by-python file has no quarantine
         # attribute to begin with, but clear it in case macOS added one
         # anyway, so relaunch doesn't hit a Gatekeeper prompt.
-        subprocess.run(["xattr", "-dr", "com.apple.quarantine", app_path], check=False)
+        # app_path is the running bundle's own path (running_app_bundle_path,
+        # derived from sys.executable) — not externally supplied.
+        subprocess.run(["xattr", "-dr", "com.apple.quarantine", app_path], check=False)  # nosec B603 B607
 
 
 def relaunch(app_path: str):
     """Launch the freshly-installed app and quit this process."""
-    subprocess.Popen(["open", "-n", app_path])
+    subprocess.Popen(["open", "-n", app_path])  # nosec B603 B607
     sys.exit(0)

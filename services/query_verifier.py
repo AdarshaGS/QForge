@@ -306,7 +306,11 @@ class QueryVerifier:
         if limit <= 0:
             return sql
         sql = sql.rstrip().rstrip(";").rstrip()
-        return f"SELECT * FROM ({sql}) _qlimit LIMIT {limit}"
+        # sql is the user's own typed query (SECURITY.md: executing whatever
+        # SQL a user chooses to write is the product's job, not an injection
+        # surface); limit is int()-coerced above, so neither is attacker
+        # input in the sense this check is looking for.
+        return f"SELECT * FROM ({sql}) _qlimit LIMIT {limit}"  # nosec B608
 
     def _run_explain(self, sql: str) -> list:
         """Run EXPLAIN and return list[ExplainRow]. Non-fatal on any error."""

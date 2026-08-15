@@ -35,7 +35,10 @@ class UpdateChecker(QThread):
                 url,
                 headers={"User-Agent": f"QForge/{APP_VERSION}"},
             )
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            # url above is a fixed https://api.github.com/... literal built
+            # only from the hardcoded GITHUB_USER/GITHUB_REPO constants —
+            # nothing attacker- or user-influenced feeds the scheme/host.
+            with urllib.request.urlopen(req, timeout=8) as resp:  # nosec B310
                 data = json.loads(resp.read())
 
             tag      = data.get("tag_name", "").strip()

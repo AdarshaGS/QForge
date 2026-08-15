@@ -547,7 +547,7 @@ class MainWindow(QMainWindow):
         action = menu.exec(self.conn_tab_bar.mapToGlobal(pos))
         if action == refresh_schema_act:
             if 0 <= idx < len(self._panels):
-                self._panels[idx].load_schema()
+                self._panels[idx].load_schema(notify=True)
         elif action == reconnect_act:
             if 0 <= idx < len(self._panels):
                 self._panels[idx]._do_reconnect()
@@ -783,7 +783,7 @@ class MainWindow(QMainWindow):
 
         act = db_menu.addAction("Refresh Schema")
         act.triggered.connect(
-            lambda: self._current_panel() and self._current_panel().load_schema()
+            lambda: self._current_panel() and self._current_panel().load_schema(notify=True)
         )
 
         act = db_menu.addAction("ER Diagram")
@@ -804,9 +804,20 @@ class MainWindow(QMainWindow):
         )
 
         act = db_menu.addAction("Refresh Databases")
-        act.triggered.connect(
-            lambda: self._current_panel() and self._current_panel().refresh_databases()
-        )
+
+        def _refresh_databases():
+            panel = self._current_panel()
+            if not panel:
+                return
+            # Issue #138: disable for the duration so a slow/remote fetch
+            # can't be re-triggered mid-flight from a second click.
+            act.setEnabled(False)
+            try:
+                panel.refresh_databases()
+            finally:
+                act.setEnabled(True)
+
+        act.triggered.connect(_refresh_databases)
 
         db_menu.addSeparator()
 

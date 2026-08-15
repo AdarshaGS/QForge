@@ -4,7 +4,7 @@ Uses the `keyring` library (Keychain on macOS) so passwords never need to be
 written to connections.json in plaintext. Each stored secret is keyed by a
 connection's stable `id` plus a `kind` ("db" or "ssh").
 """
-import subprocess
+import subprocess  # nosec B404
 import sys
 
 import keyring
@@ -41,11 +41,14 @@ def _force_delete_stale_item(connection_id: str, kind: str) -> None:
     if sys.platform != "darwin":
         return
     try:
+        # List-form argv (no shell=True) — connection_id/kind become opaque
+        # argument values to `security`, never shell-interpreted, so there's
+        # no command-injection surface here regardless of their content.
         subprocess.run(
             ["security", "delete-generic-password", "-s", _SERVICE,
              "-a", _account(connection_id, kind)],
             capture_output=True, timeout=5,
-        )
+        )  # nosec B603 B607
     except Exception:
         pass
 

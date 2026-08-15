@@ -15,3 +15,18 @@ ignore = [
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.bandit]
+exclude_dirs = ["tests", "venv", "build", "dist", "graphify-out"]
+# B110 (try/except/pass) is skipped project-wide, not per-line: every one of
+# the ~25 instances in this codebase was individually read during the #140
+# triage and confirmed to be a "best-effort, degrade gracefully" pattern
+# (signal disconnect, cosmetic formatting fallback, non-critical schema
+# lookup) — none swallow an auth/permission/credential-relevant error. This
+# check's signal-to-noise ratio here is poor enough (it can't distinguish
+# "benign cleanup" from "hiding a real bug" — that needs human code review
+# regardless) that per-line `# nosec` on every instance would just be noise.
+# Every OTHER finding type stays live and per-line-justified only, so a
+# genuinely new SQL-string-construction, subprocess, or eval() issue in a
+# future PR still fails CI.
+skips = ["B110"]

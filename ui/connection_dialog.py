@@ -4,8 +4,11 @@ import uuid
 
 from utils import credential_store
 from utils import environment
+from utils.logger import get_logger
 from utils.paths import app_data_dir
 from ui.theme_manager import ThemeManager
+
+logger = get_logger()
 
 from PySide6.QtWidgets import (
     QDialog,
@@ -34,6 +37,11 @@ class ConnectionDialog(QDialog):
     _APP_DIR = str(app_data_dir())
     CONNECTION_FILE = os.path.join(_APP_DIR, "connections.json")
     LAST_CONNECTION_FILE = os.path.join(_APP_DIR, "last_connection.json")
+
+    # Issue #116: bounds used to validate a hand-edited or malicious
+    # connections.json on load rather than trusting its shape.
+    _ALLOWED_TYPES = ("mysql", "postgresql", "sqlite")
+    _MAX_STRING_LEN = 4096
 
     # Form field widths (issue #55) — small/medium/large are fixed caps;
     # content-fit fields (host, database, ssh key path) start at the medium
@@ -511,6 +519,91 @@ class ConnectionDialog(QDialog):
 
     # ── Load / save connections ──────────────────────────────────
 
+    @classmethod
+    def _sanitize_connection_entry(cls, raw) -> dict | None:
+        """Validate one connections.json entry before any downstream code
+        (credential_store, environment.normalize, db_service, the tree
+        builder — several of which call .strip()/.get() assuming a plain
+        dict of strings) touches it. Returns a cleaned copy, or None if the
+        entry is malformed enough that it can't be trusted — issue #116:
+        a hand-edited or malicious connections.json must not crash the app
+        or feed unexpected types into connection logic; a bad profile is
+        skipped, not fatal."""
+        if not isinstance(raw, dict):
+            return None
+        conn = dict(raw)
+
+        def _bounded_str(value):
+            return value[:cls._MAX_STRING_LEN] if isinstance(value, str) else None
+
+        name = _bounded_str(conn.get("name"))
+        if not name:
+            return None
+        conn["name"] = name
+
+        conn_id = conn.get("id")
+        if conn_id is not None:
+            # A non-string id would silently break credential_store lookups
+            # keyed on it (get_password/set_password expect a string key).
+            conn_id = _bounded_str(conn_id)
+            if conn_id is None:
+                return None
+            conn["id"] = conn_id
+
+        conn_type = conn.get("type", "mysql")
+        if not isinstance(conn_type, str) or conn_type not in cls._ALLOWED_TYPES:
+            return None
+        conn["type"] = conn_type
+
+        for key in ("host", "database", "user", "group", "password"):
+            if key in conn:
+                v = _bounded_str(conn[key])
+                if v is None:
+                    return None
+                conn[key] = v
+
+        if "port" in conn and conn["port"] is not None:
+            try:
+                port = int(conn["port"])
+            except (TypeError, ValueError):
+                return None
+            if not (0 < port <= 65535):
+                return None
+            conn["port"] = port
+
+        if "read_only" in conn and not isinstance(conn["read_only"], bool):
+            conn["read_only"] = bool(conn["read_only"])
+
+        if "environment" in conn and not isinstance(conn["environment"], str):
+            conn["environment"] = environment.DEFAULT_ENVIRONMENT
+
+        ssh = conn.get("ssh_tunnel")
+        if ssh is not None:
+            if not isinstance(ssh, dict):
+                conn.pop("ssh_tunnel", None)
+            else:
+                ssh = dict(ssh)
+                for key in ("host", "user", "password", "key_path", "passphrase"):
+                    if key in ssh:
+                        v = _bounded_str(ssh[key])
+                        if v is None:
+                            return None
+                        ssh[key] = v
+                if "port" in ssh and ssh["port"] is not None:
+                    try:
+                        ssh_port = int(ssh["port"])
+                    except (TypeError, ValueError):
+                        return None
+                    if not (0 < ssh_port <= 65535):
+                        return None
+                    ssh["port"] = ssh_port
+                for key in ("enabled", "use_key"):
+                    if key in ssh and not isinstance(ssh[key], bool):
+                        ssh[key] = bool(ssh[key])
+                conn["ssh_tunnel"] = ssh
+
+        return conn
+
     @staticmethod
     def load_connection_by_id(conn_id: str):
         """Read connections.json fresh from disk and return the full,
@@ -527,11 +620,15 @@ class ConnectionDialog(QDialog):
                 connections = json.load(f)
         except Exception:
             return None
+        if not isinstance(connections, list):
+            return None
 
-        for conn in connections:
-            if conn.get("id") != conn_id:
+        for raw in connections:
+            if not isinstance(raw, dict) or raw.get("id") != conn_id:
                 continue
-            conn = dict(conn)
+            conn = ConnectionDialog._sanitize_connection_entry(raw)
+            if conn is None:
+                return None
             if conn.get("type") != "sqlite":
                 conn["password"] = credential_store.get_password(conn_id, "db")
                 ssh = conn.get("ssh_tunnel")
@@ -541,6 +638,20 @@ class ConnectionDialog(QDialog):
                     conn["ssh_tunnel"] = ssh
             return conn
         return None
+
+    @staticmethod
+    def _restrict_permissions(path: str):
+        """connections.json can hold plaintext passwords (the OS-keychain
+        fallback — see SECURITY.md) alongside the always-plaintext host/user
+        fields, so cap it to owner-only on POSIX (issue #116). Windows ACLs
+        aren't touched — os.chmod's POSIX-mode-bit semantics don't map onto
+        them the way this needs."""
+        if os.name != "posix":
+            return
+        try:
+            os.chmod(path, 0o600)
+        except OSError as ex:
+            logger.warning(f"Failed to restrict permissions on {path}: {ex}")
 
     def _migrate_legacy_connections(self):
         if os.path.exists(self.CONNECTION_FILE):
@@ -553,6 +664,7 @@ class ConnectionDialog(QDialog):
                 os.makedirs(os.path.dirname(self.CONNECTION_FILE), exist_ok=True)
                 import shutil
                 shutil.copy2(legacy, self.CONNECTION_FILE)
+                self._restrict_permissions(self.CONNECTION_FILE)
                 break
 
     def load_connections(self):
@@ -565,10 +677,25 @@ class ConnectionDialog(QDialog):
 
         try:
             with open(self.CONNECTION_FILE, "r") as f:
-                self.connections = json.load(f)
+                raw = json.load(f)
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
             return
+        if not isinstance(raw, list):
+            raw = []
+
+        self.connections = []
+        skipped = 0
+        for entry in raw:
+            sanitized = self._sanitize_connection_entry(entry)
+            if sanitized is None:
+                skipped += 1
+                continue
+            self.connections.append(sanitized)
+        if skipped:
+            logger.warning(
+                f"Skipped {skipped} malformed connection profile(s) in {self.CONNECTION_FILE}"
+            )
 
         self._resolve_credentials()
 
@@ -719,6 +846,7 @@ class ConnectionDialog(QDialog):
             sanitized.append(c)
         with open(self.CONNECTION_FILE, "w") as f:
             json.dump(sanitized, f, indent=4)
+        self._restrict_permissions(self.CONNECTION_FILE)
 
         if keyring_failures:
             self._warn_keyring_unavailable(keyring_failures)

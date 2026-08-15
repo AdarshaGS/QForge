@@ -34,7 +34,11 @@ BADGE_LABELS = {
 
 
 def normalize(value) -> str:
-    """Coerce any stored/legacy value to a known tier; unrecognized or
-    missing values become 'unclassified' rather than guessed."""
-    value = (value or "").strip().lower()
+    """Coerce any stored/legacy value to a known tier; unrecognized,
+    missing, or wrong-typed values (issue #116: a hand-edited or malicious
+    connections.json could put anything here) become 'unclassified' rather
+    than guessed or crashing on `.strip()`."""
+    if not isinstance(value, str):
+        return DEFAULT_ENVIRONMENT
+    value = value.strip().lower()
     return value if value in ENVIRONMENTS else DEFAULT_ENVIRONMENT

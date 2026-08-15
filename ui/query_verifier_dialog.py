@@ -95,7 +95,7 @@ class _VerifyWorker(QObject):
 
 # ─── Dialog ───────────────────────────────────────────────────────────────────
 
-_PASS_COLOR = "#30d158"   # macOS green
+_PASS_COLOR = "#30d158"   # macOS green  # nosec B105
 _FAIL_COLOR = "#ff453a"   # macOS red
 _WARN_COLOR = "#ff9f0a"   # macOS orange
 _MUTED      = "#8e8e93"

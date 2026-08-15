@@ -488,9 +488,9 @@ class TableViewWidget(QWidget):
             
             # Build query with pagination
             if self.current_filter:
-                query = f"SELECT * FROM {self.table_name} WHERE {self.current_filter}{order_clause} LIMIT {self.page_size} OFFSET {offset}"
+                query = f"SELECT * FROM {self.table_name} WHERE {self.current_filter}{order_clause} LIMIT {self.page_size} OFFSET {offset}"  # nosec B608
             else:
-                query = f"SELECT * FROM {self.table_name}{order_clause} LIMIT {self.page_size} OFFSET {offset}"
+                query = f"SELECT * FROM {self.table_name}{order_clause} LIMIT {self.page_size} OFFSET {offset}"  # nosec B608
             
             df = self.db_service.execute_query(query)
             

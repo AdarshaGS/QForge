@@ -22,3 +22,13 @@ jobs:
 
       - name: Run tests
         run: pytest tests/ -v
+
+      # Issue #140: SAST for QForge's own source (injection patterns,
+      # hardcoded-secret-shaped strings, unsafe eval/subprocess use, ...) —
+      # distinct from #120's dependency-CVE scanning. Config (skips, exclude
+      # dirs) lives in pyproject.toml's [tool.bandit]; baseline findings are
+      # individually triaged with justified `# nosec` comments referencing
+      # tracked follow-up issues where relevant, so this fails on anything
+      # *new*, not on the audited-clean baseline.
+      - name: Run bandit (static security analysis)
+        run: bandit -c pyproject.toml -r . -x ./tests,./venv,./build,./dist,./graphify-out
