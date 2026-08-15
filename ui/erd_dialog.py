@@ -55,7 +55,9 @@ _HEADER_PALETTE = [
 
 
 def _header_color(table_name: str, is_dark: bool) -> QColor:
-    idx = int(hashlib.sha1(table_name.encode()).hexdigest(), 16) % len(_HEADER_PALETTE)
+    # usedforsecurity=False: this is a cosmetic bucket-pick, not a security
+    # hash (Python 3.9+; sha1 would otherwise get flagged as weak crypto).
+    idx = int(hashlib.sha1(table_name.encode(), usedforsecurity=False).hexdigest(), 16) % len(_HEADER_PALETTE)
     light, dark = _HEADER_PALETTE[idx]
     return QColor(dark if is_dark else light)
 
@@ -488,10 +490,11 @@ class ErdDialog(QDialog):
     _graph_load_error = Signal(str)
     _indexes_loaded = Signal(str, list)
 
-    def __init__(self, config: dict, is_dark: bool = True, parent=None):
+    def __init__(self, config: dict, is_dark: bool = True, parent=None, focus_table: str = None):
         super().__init__(parent)
         self._config = config
         self._is_dark = is_dark
+        self._focus_table = focus_table
         label = config.get("database") or config.get("name") or ""
         self.setWindowTitle(f"ER Diagram — {label}" if label else "ER Diagram")
         self.resize(1000, 700)
@@ -647,6 +650,21 @@ class ErdDialog(QDialog):
         self.status_label.setText(
             f"{len(graph.tables)} table(s), {len(graph.relationships)} relationship(s)")
         self._build_scene(graph)
+        if self._focus_table:
+            self._focus_on_table(self._focus_table)
+            self._focus_table = None  # only auto-focus once, on first load
+
+    def _focus_on_table(self, table_name: str):
+        """Select *table_name*'s node (highlighting it and its relationship
+        edges, same as clicking it) and center the view on it — how
+        right-click → Show Diagram lands the user straight on the table
+        they asked about instead of the whole-database overview."""
+        node = self._nodes.get(table_name)
+        if node is None:
+            return
+        self._on_node_selected(node)
+        self.view.centerOn(node)
+        self._update_minimap_tracking()
 
     # ── layout + rendering ───────────────────────────────────────────
 

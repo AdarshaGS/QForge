@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QMessageBox, QInputDialog,
     QMenu, QProgressDialog, QPushButton, QLabel,
     QListWidget, QListWidgetItem, QStackedWidget,
+    QApplication,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QCursor
 
@@ -37,6 +38,7 @@ from ui.db_switcher_dialog import DbSwitcherDialog
 from ui.query_history_dialog import QueryHistoryDialog
 from ui.query_library_dialog import QueryLibraryDialog
 from ui.export_scope_dialog import ExportScopeDialog
+from ui.column_selection_dialog import ColumnSelectionDialog
 from ui.theme_manager import ThemeManager
 from ui.erd_dialog import ErdDialog
 from ui.schema_compare_dialog import SchemaCompareDialog
@@ -46,6 +48,7 @@ from utils import environment
 from utils import schema_cache
 from utils.df_export import export_dataframe, _to_sql_inserts
 from services import query_classifier
+from services import table_organization
 
 logger = get_logger()
 
@@ -225,6 +228,7 @@ class ConnectionPanel(QWidget):
         self._schema_status_item = None
         self._schema_tables_seen = 0
         self._schema_retry_item = None
+        self._notify_schema_refresh = False
 
         # Wire bridge signals → main-thread handlers (connected once here so
         # QueuedConnection always delivers on the main thread event loop).
@@ -540,9 +544,28 @@ class ConnectionPanel(QWidget):
         items_map = self._active_category_items()
         items_map.clear()
         icon = self._emoji_icon(self._category_icon_emoji[self._active_category])
+
+        # Pin to Top / Add to Favorites (issue #142's Organization group) —
+        # only meaningful for tables/views, which is all the context menu
+        # that sets them covers.
+        pinned, favorites = set(), set()
+        if self._active_category in ("tables", "views"):
+            conn_id = self.config.get("id", "")
+            database = self.config.get("database", "")
+            pinned = table_organization.get_pinned(conn_id, database)
+            favorites = table_organization.get_favorites(conn_id, database)
+            names = sorted(names, key=lambda n: (n not in pinned, n))
+
         for name in names:
             item = QTreeWidgetItem([name])
-            item.setIcon(0, icon)
+            if name in pinned:
+                item.setIcon(0, self._emoji_icon("📌"))
+                item.setToolTip(0, "Pinned" + (" · Favorite" if name in favorites else ""))
+            elif name in favorites:
+                item.setIcon(0, self._emoji_icon("⭐"))
+                item.setToolTip(0, "Favorite")
+            else:
+                item.setIcon(0, icon)
             items_map[name] = item
             self.schema_tree.addTopLevelItem(item)
         self.filter_tables(self.table_search.text())
@@ -612,7 +635,14 @@ class ConnectionPanel(QWidget):
 
     # ─── Schema loading ───────────────────────────────────────────────────────
 
-    def load_schema(self):
+    def load_schema(self, notify: bool = False):
+        """notify=True (explicit "Refresh Schema" actions only, not the
+        initial connect / db-switch calls) shows a toast once the live
+        background fetch actually completes. Needed because when a fresh
+        cache hit exists (the common case — issue #71), the tree repaints
+        instantly from disk and the live refresh underneath is otherwise
+        completely silent: same tree, no ticker, no marker, nothing to tell
+        the user anything happened at all."""
         # Don't attempt schema load if not connected — except while an
         # optimistic background connect is in flight (self._connecting):
         # the live fetch below uses its own dedicated connection anyway
@@ -630,7 +660,9 @@ class ConnectionPanel(QWidget):
 
         # Issue #71: a previously visited connection/database populates the
         # tree and autocomplete instantly from disk, no network round-trip.
-        # The live fetch below still runs and silently refreshes it.
+        # The live fetch below still runs and silently refreshes it. This
+        # cache-paint call is intentionally excluded from the notify below —
+        # it isn't the refresh completing, just the instant first paint.
         cached = schema_cache.load(
             self.config.get("id", ""), self.config.get("database", ""))
         if not self._apply_cached_schema(cached):
@@ -645,6 +677,7 @@ class ConnectionPanel(QWidget):
             self.schema_tree.addTopLevelItem(loading_item)
             self._start_schema_loading_indicator(loading_item)
 
+        self._notify_schema_refresh = notify
         self._spawn_schema_fetch(dict(self.config))
 
     def _apply_cached_schema(self, cached: dict | None) -> bool:
@@ -822,11 +855,24 @@ class ConnectionPanel(QWidget):
             if isinstance(tab, SqlTab):
                 tab.set_schema(tables, columns)
 
+        if getattr(self, "_notify_schema_refresh", False):
+            self._notify_schema_refresh = False
+            from utils.toast import show_toast
+            show_toast(
+                self,
+                f"Schema refreshed — {len(tables)} table(s), {len(views)} view(s)",
+                icon="✓", kind="success",
+            )
+
     def _on_schema_error(self, msg: str):
         self._stop_schema_loading_indicator()
         self.schema_tree.clear()
         err = QTreeWidgetItem([f"⚠ Failed to load schema: {msg}"])
         self.schema_tree.addTopLevelItem(err)
+        if getattr(self, "_notify_schema_refresh", False):
+            self._notify_schema_refresh = False
+            from utils.toast import show_toast
+            show_toast(self, "Failed to refresh schema", icon="⚠", kind="warning")
         # Issue #57: give failure an explicit retry affordance rather than
         # just leaving a dead-end error row — reuses load_schema() via the
         # existing itemClicked wiring (_on_item_clicked), same action as
@@ -836,8 +882,10 @@ class ConnectionPanel(QWidget):
         self._schema_retry_item = retry
         logger.error(f"Schema load error: {msg}")
 
-    def _load_databases(self):
-        """Sync fallback — only used from _do_reconnect path."""
+    def _load_databases(self) -> bool:
+        """Blocking DB-list fetch used by refresh/create/drop-database flows.
+        Returns True on success, False if the fetch failed — callers that
+        need to surface that (e.g. refresh_databases) check the result."""
         try:
             db_type = self.db_service.db_type
             if db_type == "mysql":
@@ -857,10 +905,13 @@ class ConnectionPanel(QWidget):
                 self._available_dbs = df["datname"].tolist()
             else:
                 self._available_dbs = []
+            self._update_pill_label()
+            return True
         except Exception as ex:
             logger.error(f"Failed to load databases: {ex}")
             self._available_dbs = []
-        self._update_pill_label()
+            self._update_pill_label()
+            return False
 
     def _update_pill_label(self):
         current_db = self.config.get("database", "") or "(no database)"
@@ -984,9 +1035,32 @@ class ConnectionPanel(QWidget):
         self._load_databases()
 
     def refresh_databases(self):
+        """Issue #138: previously ran _load_databases() with no visual
+        feedback at all — a slow/remote connection looked frozen and a
+        failure was silent. Busy cursor covers the "in progress" window
+        (the fetch is synchronous), a toast confirms the outcome either
+        way, matching the pattern already used for query-done toasts."""
         if not self._check_db_management_supported():
             return
-        self._load_databases()
+        from PySide6.QtWidgets import QApplication as _QApp
+        _QApp.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok = self._load_databases()
+        finally:
+            _QApp.restoreOverrideCursor()
+
+        from utils.toast import show_toast
+        if ok:
+            n = len(self._available_dbs)
+            show_toast(
+                self, f"Database list refreshed — {n} found",
+                icon="✓", kind="success",
+            )
+        else:
+            show_toast(
+                self, "Failed to refresh database list",
+                icon="⚠", kind="warning",
+            )
 
     def drop_database(self):
         if not self._check_db_management_supported():
@@ -1036,7 +1110,7 @@ class ConnectionPanel(QWidget):
         # schema load — same action as the toolbar's "↺ Schema" button.
         if item is self._schema_retry_item:
             self._schema_retry_item = None
-            self.load_schema()
+            self.load_schema(notify=True)
             return
         # The tree is a flat list of just the active category's items now
         # (no Tables/Views/Functions folder wrapper) — gate by membership in
@@ -1047,47 +1121,143 @@ class ConnectionPanel(QWidget):
             self.open_table_view(item.text(0))
 
     def _show_context_menu(self, position):
+        """Full table/view context menu (issue #142, TablePlus parity).
+        Grouped: navigation, copy, organization, export/import/new/script
+        submenus, then table operations with destructive ones visually
+        separated at the bottom. Actions with no backing implementation
+        (Open in New Window, Item Overview — no multi-window architecture
+        or defined behavior to build on) are intentionally omitted rather
+        than shown disabled, per the issue's own "do not display actions
+        that are not implemented" requirement."""
         item = self.schema_tree.itemAt(position)
         if not item:
             return
         if self._active_category not in ("tables", "views") or item.text(0) not in self._active_category_items():
             return
+        table_name = item.text(0)
+        is_view = self._active_category == "views"
+
+        conn_id = self.config.get("id", "")
+        database = self.config.get("database", "")
+        pinned = table_name in table_organization.get_pinned(conn_id, database)
+        favorite = table_name in table_organization.get_favorites(conn_id, database)
 
         menu = QMenu(self)
-        open_action = menu.addAction("📋 Open Table")
-        menu.addSeparator()
-        structure_action = menu.addAction("🔍 View Structure")
+
+        # ── Navigation ──────────────────────────────────────────────────
+        open_new_tab_action = menu.addAction("📋 Open in New Tab")
+        structure_action = menu.addAction("🔍 Open Structure")
         edit_action = menu.addAction("✏️ Edit Structure")
+        diagram_action = None
+        if not is_view:
+            diagram_action = menu.addAction("🗺️ Show Diagram")
         menu.addSeparator()
-        import_action = menu.addAction("📥 Import CSV into Table…")
-        export_action = menu.addAction("📤 Export Table…")
+
+        # ── Copy ─────────────────────────────────────────────────────────
+        copy_name_action = menu.addAction("Copy Name")
+        copy_full_name_action = menu.addAction("Copy Full Name")
         menu.addSeparator()
+
+        # ── Organization ────────────────────────────────────────────────
+        pin_action = menu.addAction("📌 Unpin from Top" if pinned else "📌 Pin to Top")
+        favorite_action = menu.addAction("⭐ Remove from Favorites" if favorite else "⭐ Add to Favorites")
+        menu.addSeparator()
+
+        # ── Export submenu ──────────────────────────────────────────────
+        export_menu = menu.addMenu("📤 Export")
+        export_action = export_menu.addAction("Export Table…")
+        export_sql_action = export_menu.addAction("Export Table as SQL")
+        export_cols_action = export_menu.addAction("Export Table with Column Selection…")
+        export_data_action = export_menu.addAction("Export Table Data")
+
+        # ── Import submenu ──────────────────────────────────────────────
+        import_action = None
+        if not is_view:
+            import_menu = menu.addMenu("📥 Import")
+            import_action = import_menu.addAction("Import Data…")
+
+        # ── New submenu ─────────────────────────────────────────────────
+        new_menu = menu.addMenu("🆕 New")
+        new_table_action = new_menu.addAction("New Table…")
+        new_view_action = new_menu.addAction("New View…")
+
+        # ── Copy Script As submenu ──────────────────────────────────────
+        script_menu = menu.addMenu("📄 Copy Script As")
+        copy_create_action = script_menu.addAction("CREATE Table")
+        copy_insert_action = script_menu.addAction("INSERT Data")
+        menu.addSeparator()
+
+        # ── Table operations ────────────────────────────────────────────
+        clone_action = None
+        truncate_action = None
+        if not is_view:
+            clone_action = menu.addAction("Clone")
         refresh_action = menu.addAction("🔄 Refresh Schema")
+        refresh_action.setShortcut(QKeySequence("Ctrl+Shift+R"))  # mirrors the real global binding below
+        menu.addSeparator()
+        if not is_view:
+            truncate_action = menu.addAction("⚠️ Truncate…")
+        delete_action = menu.addAction(f"🗑️ Delete {'View' if is_view else 'Table'}…")
 
         action = menu.exec_(self.schema_tree.mapToGlobal(position))
-        if action == open_action:
-            self.open_table_view(item.text(0))
+        if action is None:
+            return
+        elif action == open_new_tab_action:
+            self.open_table_view(table_name, force_new=True)
         elif action == structure_action:
-            self._show_table_structure(item.text(0))
+            self._show_table_structure(table_name)
         elif action == edit_action:
-            self.show_alter_table_editor(item.text(0))
-        elif action == import_action:
-            self._import_csv_into_table(item.text(0))
+            self.show_alter_table_editor(table_name)
+        elif diagram_action is not None and action == diagram_action:
+            self.open_erd_view(focus_table=table_name)
+        elif action == copy_name_action:
+            self._copy_table_name(table_name)
+        elif action == copy_full_name_action:
+            self._copy_table_full_name(table_name)
+        elif action == pin_action:
+            self._toggle_pin_table(table_name)
+        elif action == favorite_action:
+            self._toggle_favorite_table(table_name)
         elif action == export_action:
-            self._export_table(item.text(0))
+            self._export_table(table_name)
+        elif action == export_sql_action:
+            self._export_table_as_sql(table_name)
+        elif action == export_cols_action:
+            self._export_table_with_column_selection(table_name)
+        elif action == export_data_action:
+            self._export_table_data_only(table_name)
+        elif import_action is not None and action == import_action:
+            self._import_csv_into_table(table_name)
+        elif action == new_table_action:
+            self._new_table()
+        elif action == new_view_action:
+            self._new_view()
+        elif action == copy_create_action:
+            self._copy_create_table_script(table_name)
+        elif action == copy_insert_action:
+            self._copy_insert_script(table_name)
+        elif clone_action is not None and action == clone_action:
+            self._clone_table(table_name)
         elif action == refresh_action:
-            self.load_schema()
+            self.load_schema(notify=True)
+        elif truncate_action is not None and action == truncate_action:
+            self._truncate_table(table_name)
+        elif action == delete_action:
+            self._delete_table(table_name)
 
     # ─── Table/query tabs ─────────────────────────────────────────────────────
 
-    def open_erd_view(self):
+    def open_erd_view(self, focus_table: str = None):
         """Open a read-only ER diagram of the current database (issue #62).
         Builds its own dedicated connection (services/erd_model.py) — never
-        touches self.db_service."""
+        touches self.db_service. *focus_table*, when given (context menu's
+        "Show Diagram"), selects and centers that table once the graph loads
+        rather than dropping the user on the unfocused whole-database view."""
         if not self.db_service or not self.db_service.connection:
             QMessageBox.information(self, "ER Diagram", "Connect to a database first.")
             return
-        dlg = ErdDialog(dict(self.config), is_dark=(self.current_theme == "dark"), parent=self)
+        dlg = ErdDialog(dict(self.config), is_dark=(self.current_theme == "dark"), parent=self,
+                         focus_table=focus_table)
         dlg.open_table.connect(self.open_table_view)
         dlg.view_structure.connect(self._show_table_structure)
         dlg.exec_()
@@ -1100,13 +1270,15 @@ class ConnectionPanel(QWidget):
             self.config.get("id", ""), is_dark=(self.current_theme == "dark"), parent=self)
         dlg.exec_()
 
-    def open_table_view(self, table_name: str):
-        """Open a table view; re-focus if already open."""
-        for i in range(self.tabs.count()):
-            w = self.tabs.widget(i)
-            if isinstance(w, TableViewWidget) and w.table_name == table_name:
-                self.tabs.setCurrentIndex(i)
-                return
+    def open_table_view(self, table_name: str, force_new: bool = False):
+        """Open a table view; re-focus if already open, unless *force_new*
+        (context menu's "Open in New Tab") asks for a fresh tab regardless."""
+        if not force_new:
+            for i in range(self.tabs.count()):
+                w = self.tabs.widget(i)
+                if isinstance(w, TableViewWidget) and w.table_name == table_name:
+                    self.tabs.setCurrentIndex(i)
+                    return
 
         tv = TableViewWidget(self.db_service, table_name)
         tv.execute_query_signal.connect(self._run_query_in_tab)
@@ -1806,7 +1978,7 @@ class ConnectionPanel(QWidget):
             fh.write(f"-- Table: {table}\n")
             fh.write(self.db_service.get_table_ddl(table) + "\n\n")
         if content in ("data", "both"):
-            df = self.db_service.execute_query(f"SELECT * FROM {table}")
+            df = self.db_service.execute_query(f"SELECT * FROM {table}")  # nosec B608
             if not df.empty:
                 fh.write(_to_sql_inserts(df, table) + "\n\n")
 
@@ -1823,7 +1995,7 @@ class ConnectionPanel(QWidget):
 
         if content == "data":
             try:
-                df = self.db_service.execute_query(f"SELECT * FROM {table_name}")
+                df = self.db_service.execute_query(f"SELECT * FROM {table_name}")  # nosec B608
             except Exception as ex:
                 QMessageBox.critical(self, "Export Error", f"Could not read table:\n{ex}")
                 return
@@ -1889,9 +2061,9 @@ class ConnectionPanel(QWidget):
         )
         placeholders = ", ".join([ph] * len(df.columns))
         insert_sql = (
-            f"INSERT INTO `{table_name}` ({cols_sql}) VALUES ({placeholders})"
+            f"INSERT INTO `{table_name}` ({cols_sql}) VALUES ({placeholders})"  # nosec B608
             if db_type == "mysql"
-            else f'INSERT INTO "{table_name}" ({cols_sql}) VALUES ({placeholders})'
+            else f'INSERT INTO "{table_name}" ({cols_sql}) VALUES ({placeholders})'  # nosec B608
         )
 
         mass_write_reason = (
@@ -1936,6 +2108,223 @@ class ConnectionPanel(QWidget):
             from ui.table_view_widget import TableViewWidget
             if isinstance(w, TableViewWidget) and w.table_name == table_name:
                 w._warn_and_discard_changes()
+                w.current_page = 1
+                w.load_table_data()
+                break
+
+    # ─── Table context-menu operations (issue #142) ────────────────────────────
+
+    def _qualified_name(self, table_name: str, quote: bool = False) -> str:
+        db_type = self.db_service.db_type
+        if not quote:
+            return table_name
+        return f"`{table_name}`" if db_type == "mysql" else f'"{table_name}"'
+
+    def _copy_table_name(self, table_name: str):
+        QApplication.clipboard().setText(table_name)
+
+    def _copy_table_full_name(self, table_name: str):
+        database = self.config.get("database", "")
+        full = f"{database}.{table_name}" if database else table_name
+        QApplication.clipboard().setText(full)
+
+    def _toggle_pin_table(self, table_name: str):
+        table_organization.toggle_pinned(
+            self.config.get("id", ""), self.config.get("database", ""), table_name)
+        self._render_active_category()
+
+    def _toggle_favorite_table(self, table_name: str):
+        table_organization.toggle_favorite(
+            self.config.get("id", ""), self.config.get("database", ""), table_name)
+        self._render_active_category()
+
+    def _copy_create_table_script(self, table_name: str):
+        try:
+            ddl = self.db_service.get_table_ddl(table_name)
+        except Exception as ex:
+            QMessageBox.critical(self, "Copy Script Error", f"Could not build CREATE TABLE:\n{ex}")
+            return
+        QApplication.clipboard().setText(ddl)
+
+    def _copy_insert_script(self, table_name: str):
+        try:
+            df = self.db_service.execute_query(f"SELECT * FROM {table_name}")  # nosec B608
+        except Exception as ex:
+            QMessageBox.critical(self, "Copy Script Error", f"Could not read table:\n{ex}")
+            return
+        if df.empty:
+            QMessageBox.information(self, "Copy Script", f"'{table_name}' has no rows to script.")
+            return
+        QApplication.clipboard().setText(_to_sql_inserts(df, table_name))
+
+    def _export_table_data_only(self, table_name: str):
+        """Export just the rows (context menu's "Export Table Data") without
+        the ExportScopeDialog's structure/data/both prompt — same CSV/JSON/
+        Excel/SQL-inserts picker _export_table() already uses for "data"."""
+        try:
+            df = self.db_service.execute_query(f"SELECT * FROM {table_name}")  # nosec B608
+        except Exception as ex:
+            QMessageBox.critical(self, "Export Error", f"Could not read table:\n{ex}")
+            return
+        export_dataframe(self, df, f"{table_name}.csv", table_name)
+
+    def _export_table_as_sql(self, table_name: str):
+        """Export structure + data as a single .sql file (context menu's
+        "Export Table as SQL") — skips ExportScopeDialog since both are
+        implied, reusing _write_table_export()'s 'both' path."""
+        from PySide6.QtWidgets import QFileDialog
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Table as SQL", f"{table_name}.sql", "SQL Dump (*.sql)"
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, "w", encoding="utf-8") as fh:
+                self._write_table_export(fh, table_name, "both")
+            QMessageBox.information(self, "Export Table as SQL", f"Exported to:\n{file_path}")
+        except Exception as ex:
+            QMessageBox.critical(self, "Export Error", str(ex))
+
+    def _export_table_with_column_selection(self, table_name: str):
+        try:
+            columns = [str(c.get("Field", c.get("name", ""))) for c in self.db_service.get_columns(table_name)]
+        except Exception as ex:
+            QMessageBox.critical(self, "Export Error", f"Could not load columns:\n{ex}")
+            return
+        if not columns:
+            QMessageBox.information(self, "Export Table", f"'{table_name}' has no columns.")
+            return
+
+        dlg = ColumnSelectionDialog(columns, parent=self)
+        if not dlg.exec():
+            return
+        selected = dlg.selected_columns()
+        if not selected:
+            QMessageBox.information(self, "Export Table", "No columns selected.")
+            return
+
+        db_type = self.db_service.db_type
+        cols_sql = ", ".join(
+            (f"`{c}`" if db_type == "mysql" else f'"{c}"') for c in selected
+        )
+        try:
+            df = self.db_service.execute_query(
+                f"SELECT {cols_sql} FROM {table_name}")  # nosec B608
+        except Exception as ex:
+            QMessageBox.critical(self, "Export Error", f"Could not read table:\n{ex}")
+            return
+        export_dataframe(self, df, f"{table_name}.csv", table_name)
+
+    def _new_table(self):
+        """StructureEditorDialog already supports a "New Table" mode
+        (table_name=None) — same dialog show_alter_table_editor() uses for
+        Alter, just without existing columns to seed it."""
+        dialog = StructureEditorDialog(db_type=self.db_service.db_type, parent=self)
+        if not dialog.exec():
+            return
+        try:
+            sql = dialog.get_sql()
+            if not sql.strip() or sql.strip().startswith("--"):
+                return
+            if not self._guard_write(sql):
+                return
+            for stmt in query_classifier.split_statements(sql):
+                self.db_service.execute_update(stmt)
+            QMessageBox.information(self, "Success", "Table created successfully.")
+            self.load_schema()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def _new_view(self):
+        """No dedicated CREATE VIEW UI exists — open a fresh SQL tab with a
+        template so the user writes the SELECT and runs it themselves,
+        consistent with how the app already treats view creation as a plain
+        SQL statement rather than a form."""
+        self.add_new_tab()
+        tab = self.tabs.currentWidget()
+        if hasattr(tab, "editor"):
+            tab.editor.setPlainText("CREATE VIEW view_name AS\nSELECT *\nFROM table_name;\n")
+
+    def _clone_table(self, table_name: str):
+        new_name, ok = QInputDialog.getText(
+            self, "Clone Table", "New table name:", text=f"{table_name}_copy")
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        if not self._VALID_DB_NAME.match(new_name):
+            QMessageBox.warning(self, "Invalid Name", "Unrecognized table name.")
+            return
+
+        quoted_new = self._qualified_name(new_name, quote=True)
+        sql = f"CREATE TABLE {quoted_new} AS SELECT * FROM {table_name}"  # nosec B608
+        if not self._guard_write(sql):
+            return
+        reply = QMessageBox.question(
+            self, "Clone Table",
+            f"Execute the following SQL?\n\n{sql}",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self.db_service.execute_update(sql)
+        except Exception as ex:
+            QMessageBox.critical(self, "Clone Table Failed", str(ex))
+            return
+        QMessageBox.information(self, "Success", f"'{table_name}' cloned to '{new_name}'.")
+        self.load_schema()
+
+    def _truncate_table(self, table_name: str):
+        db_type = self.db_service.db_type
+        quoted = self._qualified_name(table_name, quote=True)
+        # SQLite has no TRUNCATE statement — DELETE FROM is the equivalent.
+        sql = f"DELETE FROM {quoted}" if db_type == "sqlite" else f"TRUNCATE TABLE {quoted}"  # nosec B608
+        if not self._guard_write(sql):
+            return
+        reply = QMessageBox.question(
+            self, "Truncate Table",
+            f"This permanently deletes ALL rows in '{table_name}'. This cannot be undone.\n\n"
+            f"Execute the following SQL?\n\n{sql}",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self.db_service.execute_update(sql)
+        except Exception as ex:
+            QMessageBox.critical(self, "Truncate Failed", str(ex))
+            return
+        QMessageBox.information(self, "Success", f"'{table_name}' truncated.")
+        self._refresh_open_table_tab(table_name)
+
+    def _delete_table(self, table_name: str):
+        kind = "VIEW" if self._active_category == "views" else "TABLE"
+        quoted = self._qualified_name(table_name, quote=True)
+        sql = f"DROP {kind} {quoted}"
+        if not self._guard_write(sql):
+            return
+        reply = QMessageBox.question(
+            self, f"Delete {kind.title()}",
+            f"This permanently drops '{table_name}' and all its data. This cannot be undone.\n\n"
+            f"Execute the following SQL?\n\n{sql}",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            self.db_service.execute_update(sql)
+        except Exception as ex:
+            QMessageBox.critical(self, "Delete Failed", str(ex))
+            return
+        QMessageBox.information(self, "Success", f"'{table_name}' deleted.")
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, TableViewWidget) and w.table_name == table_name:
+                self.tabs.removeTab(i)
+                break
+        self.load_schema()
+
+    def _refresh_open_table_tab(self, table_name: str):
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, TableViewWidget) and w.table_name == table_name:
                 w.current_page = 1
                 w.load_table_data()
                 break
@@ -2272,7 +2661,7 @@ class ConnectionPanel(QWidget):
         elif isinstance(w, SqlTab) and w.get_query().strip():
             self._run_query_in_tab(w)
         else:
-            self.load_schema()
+            self.load_schema(notify=True)
 
     # ─── Theme ────────────────────────────────────────────────────────────────
 
