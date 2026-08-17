@@ -1,9 +1,13 @@
 """Schema Compare — read-only structural diff between two saved connections
-(issue #68), rendering the diff built by services/schema_diff.py.
+(issue #68), rendering the diff built by services/schema_diff.py, plus an
+optional "Generate Migration SQL" step (issue #69) that turns that diff into
+a reviewable DDL script via services/schema_migration.py.
 
 No schema-modifying actions live here, mirroring ui/erd_dialog.py's stated
-scope for the ER diagram: this dialog only ever reads metadata from the two
-selected connections and never writes to either database.
+scope for the ER diagram: this dialog (and the migration-review dialog it
+opens) only ever reads metadata from the two selected connections and never
+writes to either database — the generated SQL is text for the user to copy,
+export, and run themselves wherever they choose.
 """
 import json
 import os
@@ -12,11 +16,13 @@ import threading
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QBrush, QFont
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QPushButton, QComboBox,
-    QLabel, QLineEdit, QTreeWidget, QTreeWidgetItem, QMessageBox,
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QPushButton,
+    QComboBox, QLabel, QLineEdit, QTreeWidget, QTreeWidgetItem, QMessageBox,
+    QPlainTextEdit, QFileDialog, QMenu,
 )
 
 from services.schema_diff import build_schema_diff
+from services.schema_migration import generate_migration_sql
 from ui.connection_dialog import ConnectionDialog
 
 # (is_dark) -> {change -> color}. Chosen to stay legible against both a dark
@@ -58,10 +64,17 @@ class SchemaCompareDialog(QDialog):
 
     _diff_loaded = Signal(object)
     _diff_load_error = Signal(str)
+    _migration_ready = Signal(str)
+    _migration_error = Signal(str)
 
     def __init__(self, current_connection_id: str = "", is_dark: bool = True, parent=None):
         super().__init__(parent)
         self._is_dark = is_dark
+        self._last_diff = None
+        self._source_config = None
+        self._target_config = None
+        self._target_label = ""
+        self._migration_table_name = None
         self.setWindowTitle("Schema Compare")
         self.resize(900, 650)
 
@@ -83,6 +96,14 @@ class SchemaCompareDialog(QDialog):
         self.compare_btn.clicked.connect(self._run_compare)
         toolbar.addWidget(self.compare_btn)
 
+        self.migrate_btn = QPushButton("Generate Migration SQL")
+        self.migrate_btn.setEnabled(False)
+        self.migrate_btn.setToolTip("Run Compare first")
+        # Wrapped in a lambda — QPushButton.clicked emits a `checked` bool
+        # that would otherwise land in _generate_migration's table_name arg.
+        self.migrate_btn.clicked.connect(lambda: self._generate_migration())
+        toolbar.addWidget(self.migrate_btn)
+
         self.filter_box = QLineEdit()
         self.filter_box.setPlaceholderText("Filter tables...")
         self.filter_box.textChanged.connect(self._apply_filter)
@@ -96,10 +117,14 @@ class SchemaCompareDialog(QDialog):
         self.tree.setHeaderLabels(["Object", "Change", "Detail"])
         self.tree.setColumnWidth(0, 320)
         self.tree.setColumnWidth(1, 100)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_tree_context_menu)
         layout.addWidget(self.tree)
 
         self._diff_loaded.connect(self._on_diff_loaded)
         self._diff_load_error.connect(self._on_diff_error)
+        self._migration_ready.connect(self._on_migration_ready)
+        self._migration_error.connect(self._on_migration_error)
 
     # ── connection pickers ───────────────────────────────────────────
 
@@ -130,8 +155,14 @@ class SchemaCompareDialog(QDialog):
             return
 
         self.compare_btn.setEnabled(False)
+        self.migrate_btn.setEnabled(False)
         self.status_label.setText("⏳ Comparing schemas…")
         self.tree.clear()
+
+        self._source_config = source_config
+        self._target_config = target_config
+        self._target_label = self.target_combo.currentText()
+        self._last_diff = None
 
         sig_done = self._diff_loaded
         sig_error = self._diff_load_error
@@ -154,6 +185,54 @@ class SchemaCompareDialog(QDialog):
             f"{len(diff.tables_added)} added, {len(diff.tables_removed)} removed, "
             f"{len(diff.tables_modified)} modified, {diff.tables_unchanged} unchanged")
         self._build_tree(diff)
+        self._last_diff = diff
+        has_changes = bool(diff.tables_added or diff.tables_removed or diff.tables_modified)
+        self.migrate_btn.setEnabled(has_changes)
+        self.migrate_btn.setToolTip("" if has_changes else "No differences to migrate")
+
+    # ── migration SQL (issue #69) ────────────────────────────────────
+
+    def _generate_migration(self, table_name: str = None):
+        if self._last_diff is None:
+            return
+        self.migrate_btn.setEnabled(False)
+        self.migrate_btn.setText("⏳ Generating…")
+
+        diff, source_config, target_config = self._last_diff, self._source_config, self._target_config
+        self._migration_table_name = table_name
+
+        def _worker():
+            try:
+                sql = generate_migration_sql(diff, source_config, target_config, table_name=table_name)
+                self._migration_ready.emit(sql)
+            except Exception as ex:
+                self._migration_error.emit(str(ex))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_tree_context_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        name = item.data(0, Qt.UserRole) if item else None
+        if not name:
+            return
+        menu = QMenu(self)
+        action = menu.addAction(f"Generate Migration SQL for '{name}'")
+        action.triggered.connect(lambda: self._generate_migration(table_name=name))
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _on_migration_ready(self, sql: str):
+        self.migrate_btn.setEnabled(True)
+        self.migrate_btn.setText("Generate Migration SQL")
+        label = self._target_label
+        if self._migration_table_name:
+            label = f"{label} — table `{self._migration_table_name}`"
+        dialog = _MigrationReviewDialog(sql, label, self._is_dark, self)
+        dialog.exec()
+
+    def _on_migration_error(self, msg: str):
+        self.migrate_btn.setEnabled(True)
+        self.migrate_btn.setText("Generate Migration SQL")
+        QMessageBox.warning(self, "Generate Migration SQL", f"Failed to generate migration SQL: {msg}")
 
     # ── tree rendering ────────────────────────────────────────────────
 
@@ -171,20 +250,26 @@ class SchemaCompareDialog(QDialog):
         f.setBold(True)
         tables_root.setFont(0, f)
 
+        # Table-level rows (but not their Columns/Indexes/FK children) carry
+        # their table name in Qt.UserRole — _show_tree_context_menu uses
+        # that to offer "Generate Migration SQL" scoped to just that table.
         if diff.tables_added:
             added_root = QTreeWidgetItem(tables_root, [f"Added ({len(diff.tables_added)})", "", ""])
             for name in diff.tables_added:
-                self._colored_item(added_root, name, "added")
+                item = self._colored_item(added_root, name, "added")
+                item.setData(0, Qt.UserRole, name)
 
         if diff.tables_removed:
             removed_root = QTreeWidgetItem(tables_root, [f"Removed ({len(diff.tables_removed)})", "", ""])
             for name in diff.tables_removed:
-                self._colored_item(removed_root, name, "removed")
+                item = self._colored_item(removed_root, name, "removed")
+                item.setData(0, Qt.UserRole, name)
 
         if diff.tables_modified:
             modified_root = QTreeWidgetItem(tables_root, [f"Modified ({len(diff.tables_modified)})", "", ""])
             for table_diff in diff.tables_modified:
                 table_item = self._colored_item(modified_root, table_diff.name, "modified")
+                table_item.setData(0, Qt.UserRole, table_diff.name)
                 self._build_table_detail(table_item, table_diff)
 
         self.tree.expandItem(tables_root)
@@ -262,3 +347,51 @@ class SchemaCompareDialog(QDialog):
                 if match:
                     visible_count += 1
             bucket.setHidden(visible_count == 0)
+
+
+class _MigrationReviewDialog(QDialog):
+    """Shows generated migration SQL for review — copy/export only, no Run
+    button. Executing it (if the user chooses to) happens in a normal SQL
+    tab, where the app's existing dangerous-query/read-only guards apply."""
+
+    def __init__(self, sql: str, target_label: str, is_dark: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Migration SQL")
+        self.resize(760, 560)
+        self._sql = sql
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel(f"Target: {target_label}  —  review before running anywhere."))
+
+        self.text = QPlainTextEdit(sql)
+        self.text.setStyleSheet("font-family: Menlo, Monaco, 'Courier New', monospace; font-size: 12px;")
+        layout.addWidget(self.text)
+
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("Copy")
+        copy_btn.clicked.connect(self._copy)
+        btn_row.addWidget(copy_btn)
+
+        export_btn = QPushButton("Export…")
+        export_btn.clicked.connect(self._export)
+        btn_row.addWidget(export_btn)
+
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def _copy(self):
+        QApplication.clipboard().setText(self.text.toPlainText())
+
+    def _export(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Migration SQL", "migration.sql", "SQL Files (*.sql)")
+        if not file_path:
+            return
+        try:
+            with open(file_path, "w") as f:
+                f.write(self.text.toPlainText())
+        except Exception as ex:
+            QMessageBox.warning(self, "Export Migration SQL", f"Failed to save file: {ex}")

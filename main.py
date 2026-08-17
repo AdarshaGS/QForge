@@ -20,6 +20,8 @@ from ui.theme_manager import ThemeManager
 from utils.logger import setup_logger, get_logger
 from utils.updater import UpdateChecker, APP_VERSION
 from utils.self_updater import UpdateInstaller, running_app_bundle_path, relaunch
+from utils.homebrew_updater import HomebrewUpdateInstaller
+from utils import install_source
 from utils.paths import app_data_dir
 from utils import environment
 from utils import schema_cache
@@ -100,22 +102,42 @@ class MainWindow(QMainWindow):
         self._release_url = ""
         self._update_tag = ""
         self._dmg_url = ""
+        self._install_source = None
 
     def _on_update_available(self, tag: str, url: str, dmg_url: str):
         self._release_url = url
         self._update_tag = tag
         self._dmg_url = dmg_url
-        action = "download & install" if self._can_self_update() else "download"
         self._update_label.setText(
-            f"\u2B06  QForge {tag} is available \u2014 click to {action}"
+            f"\u2B06  QForge {tag} is available \u2014 click to {self._update_action_text()}"
         )
         self._update_banner.show()
+
+    def _detect_install_source(self) -> str:
+        """Detected once per session and cached (issue #79) \u2014 a local
+        `brew list` call, not worth re-running on every click."""
+        if self._install_source is None:
+            self._install_source = install_source.detect()
+        return self._install_source
 
     def _can_self_update(self) -> bool:
         """Self-update needs an actual .dmg asset and a running .app bundle
         to replace \u2014 running from source (dev) has neither, so that case
         falls back to opening the release page instead."""
         return bool(self._dmg_url) and running_app_bundle_path() is not None
+
+    def _update_action_text(self) -> str:
+        """What clicking Update will actually do, for the banner/dialog
+        text \u2014 a Homebrew-managed install is upgraded through Homebrew,
+        never by replacing the bundle directly (issue #79)."""
+        if running_app_bundle_path() is None:
+            return "download"
+        source = self._detect_install_source()
+        if source == install_source.HOMEBREW:
+            return "update via Homebrew"
+        if source == install_source.UNKNOWN:
+            return "see update instructions"
+        return "download & install" if self._dmg_url else "download"
 
     def _open_release_url(self):
         if self._release_url:
@@ -124,13 +146,71 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl(self._release_url))
 
     def _handle_update_click(self):
-        if self._can_self_update():
+        if running_app_bundle_path() is None:
+            self._open_release_url()  # dev/source run \u2014 no bundle to update
+            return
+
+        source = self._detect_install_source()
+        if source == install_source.HOMEBREW:
+            self._start_homebrew_update()
+        elif source == install_source.UNKNOWN:
+            QMessageBox.warning(
+                self, "Unknown Installation",
+                "QForge could not determine how it was installed.\n\n"
+                "Please update QForge using your original installation "
+                "method, or run:\n\n    brew upgrade --cask qforge\n\n"
+                f"or download the latest release:\n{self._release_url}",
+            )
+        elif self._can_self_update():
             self._start_self_update()
         else:
             self._open_release_url()
 
     def _dismiss_update_banner(self):
         self._update_banner.hide()
+
+    def _start_homebrew_update(self):
+        self._dismiss_update_banner()
+        brew = install_source.brew_path()
+        if not brew:
+            QMessageBox.warning(
+                self, "Homebrew Not Found",
+                "QForge is managed by Homebrew, but the `brew` command "
+                "could not be located.\n\nRun this in a terminal instead:\n\n"
+                "    brew upgrade --cask qforge",
+            )
+            return
+
+        self._update_progress = QProgressDialog(
+            "Updating via Homebrew\u2026", None, 0, 0, self
+        )
+        self._update_progress.setWindowTitle("Updating QForge")
+        self._update_progress.setWindowModality(Qt.WindowModal)
+        self._update_progress.setCancelButton(None)
+        self._update_progress.setMinimumDuration(0)
+        self._update_progress.show()
+
+        self._homebrew_installer = HomebrewUpdateInstaller(brew, parent=self)
+        self._homebrew_installer.done.connect(self._on_homebrew_update_done)
+        self._homebrew_installer.failed.connect(self._on_homebrew_update_failed)
+        self._homebrew_installer.start()
+
+    def _on_homebrew_update_done(self):
+        self._update_progress.close()
+        reply = QMessageBox.question(
+            self, "Update Complete",
+            "Homebrew has upgraded QForge.\n\nRestart now to finish?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.save_session()
+            relaunch(running_app_bundle_path())
+
+    def _on_homebrew_update_failed(self, message: str):
+        self._update_progress.close()
+        QMessageBox.critical(
+            self, "Update Failed", f"Homebrew upgrade failed:\n\n{message}"
+        )
 
     def _start_self_update(self):
         self._dismiss_update_banner()
@@ -197,6 +277,8 @@ class MainWindow(QMainWindow):
         self.conn_tab_bar.setObjectName("conn_tab_bar")
         self.conn_tab_bar.setTabsClosable(True)
         self.conn_tab_bar.setMovable(True)
+        self.conn_tab_bar.setElideMode(Qt.ElideRight)
+        self.conn_tab_bar.setUsesScrollButtons(True)
         self.conn_tab_bar.tabCloseRequested.connect(self._close_connection_tab)
         self.conn_tab_bar.currentChanged.connect(self._on_connection_tab_changed)
         # Right-click context menu on connection tabs
@@ -579,16 +661,12 @@ class MainWindow(QMainWindow):
             self._release_url = found["url"]
             self._update_tag = found["tag"]
             self._dmg_url = found["dmg_url"]
-            can_self_update = self._can_self_update()
-            action = "download & install" if can_self_update else "download"
+            action = self._update_action_text()
             self._update_label.setText(
                 f"\u2B06  QForge {found['tag']} is available \u2014 click to {action}"
             )
             self._update_banner.show()
-            question = (
-                "Download and install it now?" if can_self_update
-                else "Open the download page?"
-            )
+            question = f"Click Yes to {action}."
             reply = QMessageBox.question(
                 self,
                 "Update Available",

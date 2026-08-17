@@ -18,6 +18,7 @@ cask "qforge" do
     "~/Library/Application Support/QForge",
     "~/Library/Preferences/com.qforge.plist",
     "~/Library/Saved Application State/com.qforge.savedState",
+    "~/.qforge",
     "~/connections.json",
     "~/query_history.json",
   ]

@@ -1266,12 +1266,13 @@ class SqlTab(QWidget):
         self.result_table.load_data(page_df, self.current_table_name)
         self.result_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
 
-        # Re-apply sort indicator so it survives load_data reset
+        # Re-apply sort arrow/highlight so it survives load_data's reset —
+        # setSortIndicator() alone doesn't render once the header carries a
+        # custom stylesheet, see EditableTableWidget._apply_sort_header_labels.
         if self._result_sort_col >= 0:
-            order = Qt.AscendingOrder if self._result_sort_asc else Qt.DescendingOrder
-            self.result_table.horizontalHeader().setSortIndicator(
-                self._result_sort_col, order
-            )
+            self.result_table._sort_col = self._result_sort_col
+            self.result_table._sort_asc = self._result_sort_asc
+            self.result_table._apply_sort_header_labels()
 
         # Update pagination controls
         self._page_label.setText(
@@ -1370,9 +1371,10 @@ class SqlTab(QWidget):
             self.status_label.setStyleSheet(style)
         self.status_label.show()
 
-    def update_status(self, rows, execution_time):
+    def update_status(self, rows, execution_time, truncated=False):
+        suffix = " | result truncated — add a LIMIT to see more" if truncated else ""
         self._set_status(
-            f"{rows} rows | {execution_time:.3f}s",
+            f"{rows} rows | {execution_time:.3f}s{suffix}",
             """
             QPlainTextEdit {
                 color: #0078d4;
@@ -1638,20 +1640,26 @@ class SqlTab(QWidget):
         
         row_layout.addStretch()
         
-        # Remove button
-        remove_btn = QPushButton("−")
+        # Remove button. No padding override previously meant the inherited
+        # default QPushButton padding (5px 16px) squeezed the glyph out of
+        # a 24px box, leaving what looked like a solid red block.
+        remove_btn = QPushButton("×")
         remove_btn.setObjectName("remove_btn")
+        remove_btn.setToolTip("Remove this filter condition")
         remove_btn.setFixedSize(24, 24)
         remove_btn.setStyleSheet("""
             QPushButton {
-                background-color: #d13438;
-                color: #ffffff;
-                border-radius: 2px;
-                font-size: 16px;
+                background: transparent;
+                color: #d13438;
+                border: 1px solid #d13438;
+                border-radius: 4px;
+                padding: 0;
+                font-size: 15px;
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #e04348;
+                background-color: #d13438;
+                color: #ffffff;
             }
         """)
         remove_btn.clicked.connect(lambda: self.remove_filter_row(row_widget))

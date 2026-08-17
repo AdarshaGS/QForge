@@ -36,6 +36,43 @@ _L_NEW_ROW   = QColor("#e6ffed")
 _L_NEW_TEXT  = QColor("#1a6e3c")
 _L_DEL_ROW   = QColor("#ffe6e6")
 _L_DEL_TEXT  = QColor("#b00020")
+# Active sort column highlight (issue #134). Painted by hand in
+# _SortHighlightHeader.paintSection — a QHeaderView::section QSS rule with
+# border/padding (needed for the grid look) makes Qt ignore the header
+# item's BackgroundRole/ForegroundRole entirely, so per-column tinting via
+# the model can't work; only a paintSection override can.
+_HDR_SORT_BG   = QColor("#0A84FF")
+_HDR_SORT_TEXT = QColor("#ffffff")
+
+
+class _SortHighlightHeader(QHeaderView):
+    """QHeaderView that hand-paints the active sort column instead of
+    relying on the model's header roles, which the ::section stylesheet
+    (border/padding) makes Qt ignore. `owner` is the EditableTableWidget
+    holding the current _sort_col — shared by the main header and the
+    frozen-columns overlay header, both of which may show the sort column."""
+
+    def __init__(self, owner, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self._owner = owner
+        # QTableWidget's auto-created header defaults sectionsClickable to
+        # True; a standalone QHeaderView defaults to False, which silently
+        # kills every sectionClicked-driven sort handler once installed here.
+        self.setSectionsClickable(True)
+
+    def paintSection(self, painter, rect, logical_index):
+        if self._owner._sort_col < 0 or logical_index != self._owner._sort_col:
+            super().paintSection(painter, rect, logical_index)
+            return
+        painter.save()
+        painter.fillRect(rect, _HDR_SORT_BG)
+        painter.setPen(_HDR_SORT_TEXT)
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+        text = self.model().headerData(logical_index, Qt.Horizontal, Qt.DisplayRole)
+        painter.drawText(rect.adjusted(8, 0, -8, 0), Qt.AlignVCenter | Qt.AlignLeft, str(text or ""))
+        painter.restore()
 
 
 # ── Undo/redo command stack (issue #124) ────────────────────────────────
@@ -260,6 +297,7 @@ class EditableTableWidget(QTableWidget):
         self.setSortingEnabled(False)
         
         # Connect header click for manual sorting (to avoid breaking modified state)
+        self.setHorizontalHeader(_SortHighlightHeader(self, self))
         hdr = self.horizontalHeader()
         hdr.sectionClicked.connect(self.on_header_clicked)
         hdr.setSortIndicatorShown(True)   # show ▲▼ arrows without enabling Qt sort
@@ -500,6 +538,7 @@ class EditableTableWidget(QTableWidget):
         fv.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         fv.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         fv.setFrameShape(QFrame.NoFrame)
+        fv.setHorizontalHeader(_SortHighlightHeader(self, fv))
         fv.horizontalHeader().setSectionsMovable(False)
         fv.horizontalHeader().setHighlightSections(False)
         fv.horizontalHeader().setSortIndicatorShown(True)
@@ -1087,7 +1126,10 @@ class EditableTableWidget(QTableWidget):
         text. Qt's native QHeaderView sort arrow (setSortIndicator) is
         unreliable once QHeaderView::section carries a custom stylesheet —
         the arrow sub-control silently stops rendering — so the indicator
-        is spelled out in the label itself instead."""
+        is spelled out in the label itself instead. The section highlight
+        itself is painted in _SortHighlightHeader.paintSection, since the
+        same stylesheet quirk also makes Qt ignore the header item's
+        background/foreground roles."""
         if self.filtered_data is None:
             return
         arrow = " ▲" if self._sort_asc else " ▼"
@@ -1096,6 +1138,9 @@ class EditableTableWidget(QTableWidget):
             if item is None:
                 continue
             item.setText(f"{name}{arrow}" if col == self._sort_col else str(name))
+        self.horizontalHeader().viewport().update()
+        if self._frozen_view is not None:
+            self._frozen_view.horizontalHeader().viewport().update()
 
     def on_header_clicked(self, col: int):
         """Sort the currently displayed data by the clicked column (client-side)."""

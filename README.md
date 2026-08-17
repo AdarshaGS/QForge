@@ -262,6 +262,22 @@ warns you so you can fix your keyring setup. Treat exported profiles, logs,
 and query history appropriately: SQL text can still contain sensitive
 information.
 
+### Uninstalling (Homebrew)
+
+```bash
+brew uninstall --cask qforge         # removes QForge.app, keeps your data
+brew uninstall --zap --cask qforge   # also removes all data listed above
+```
+
+### Updating
+
+QForge detects whether it was installed via Homebrew or downloaded directly,
+and routes "Update QForge" accordingly: a Homebrew-managed install runs
+`brew upgrade --cask qforge` instead of replacing the app bundle itself, so
+Homebrew's own install state never falls out of sync with what's actually on
+disk. A direct install replaces the bundle in place, verifying the download
+against the published checksum first.
+
 ## Project layout
 
 ```text

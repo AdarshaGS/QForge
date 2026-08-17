@@ -59,6 +59,13 @@ MASS_WRITE_ROW_THRESHOLD = 5000
 
 # ── Background query worker (must be a top-level class for PySide6) ──────────
 
+# Cap ad-hoc SQL editor results at this many rows so a stray `SELECT *`
+# on a multi-million-row table can't pull the whole thing into memory
+# before pagination ever gets a chance to run (issue #74). Doesn't apply
+# to exports/"browse table", which need (or already paginate) full data.
+_MAX_RESULT_ROWS = 100_000
+
+
 class _QueryWorker(QObject):
     """Runs one or more SQL statements on a QThread and emits the result.
     Receives a *dedicated* DbService connection so it never shares state
@@ -92,14 +99,14 @@ class _QueryWorker(QObject):
             except Exception:
                 stmts = [self._q.strip()]
             if self._multi or len(stmts) > 1:
-                results = self._db.execute_multi_query(self._q)
+                results = self._db.execute_multi_query(self._q, max_rows=_MAX_RESULT_ROWS)
                 elapsed = time.time() - t0
                 if self._flag.is_set():
                     self.cancelled.emit()
                 else:
                     self.multi_done.emit(results, elapsed)
             else:
-                df = self._db.execute_query(self._q)
+                df = self._db.execute_query(self._q, max_rows=_MAX_RESULT_ROWS)
                 elapsed = time.time() - t0
                 if self._flag.is_set():
                     self.cancelled.emit()
@@ -771,7 +778,7 @@ class ConnectionPanel(QWidget):
             # the live connection's selected database needs updating here too.
             if self.db_service.db_type == "mysql" and self.db_service.connection:
                 try:
-                    self.db_service.connection.select_db(new_db)
+                    self.db_service.select_db(new_db)
                 except Exception as ex:
                     logger.warning(f"Failed to switch live connection to database {new_db}: {ex}")
         self._update_pill_label()
@@ -905,7 +912,7 @@ class ConnectionPanel(QWidget):
         # connection (services/schema_snapshot.py) either way.
         if self.db_service.db_type == "mysql" and self.db_service.connection:
             try:
-                self.db_service.connection.select_db(new_db)
+                self.db_service.select_db(new_db)
             except Exception as ex:
                 self._on_schema_error(str(ex))
                 return
@@ -1290,7 +1297,7 @@ class ConnectionPanel(QWidget):
         query = getattr(tab, '_last_query', '')
         table_name = self._extract_table_name(query)
         tab.load_dataframe(df, table_name)
-        tab.update_status(len(df), elapsed)
+        tab.update_status(len(df), elapsed, truncated=df.attrs.get("truncated", False))
         # Load FK map so right-click "Go to …" works in the result grid
         self._wire_result_fk(tab, table_name)
         self.query_history.add_query(query, self.config["name"], len(df), elapsed)
@@ -1323,7 +1330,7 @@ class ConnectionPanel(QWidget):
             # single result — display inline as normal
             lbl, df = select_results[0]
             tab.load_dataframe(df, self._extract_table_name(query))
-            tab.update_status(len(df), elapsed)
+            tab.update_status(len(df), elapsed, truncated=df.attrs.get("truncated", False))
         elif len(select_results) > 1:
             # multiple results — hand off to tab's multi-result view
             tab.load_multi_results(select_results, elapsed)

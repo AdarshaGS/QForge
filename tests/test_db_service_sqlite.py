@@ -36,6 +36,19 @@ def test_get_tables_lists_created_table(db):
 def test_execute_query_returns_rows(db):
     df = db.execute_query("SELECT * FROM users ORDER BY id")
     assert list(df["name"]) == ["Alice", "Bob"]
+    assert df.attrs["truncated"] is False
+
+
+def test_execute_query_max_rows_caps_and_flags_truncation(db):
+    df = db.execute_query("SELECT * FROM users ORDER BY id", max_rows=1)
+    assert list(df["name"]) == ["Alice"]
+    assert df.attrs["truncated"] is True
+
+
+def test_execute_query_max_rows_not_truncated_when_under_limit(db):
+    df = db.execute_query("SELECT * FROM users ORDER BY id", max_rows=10)
+    assert list(df["name"]) == ["Alice", "Bob"]
+    assert df.attrs["truncated"] is False
 
 
 def test_execute_update_reports_affected_rows(db):

@@ -296,7 +296,16 @@ class TableViewWidget(QWidget):
         from ui.editable_table import EditableTableWidget
         self.data_table = EditableTableWidget()
 
-        # Enable column sorting on header click
+        # Sorting here is server-side (re-queries with ORDER BY/LIMIT/OFFSET);
+        # disable EditableTableWidget's own client-side handler so it doesn't
+        # also fire on the same click and rewrite the header text with a
+        # sort arrow before on_column_header_clicked reads the column name.
+        try:
+            self.data_table.horizontalHeader().sectionClicked.disconnect(
+                self.data_table.on_header_clicked
+            )
+        except Exception:
+            pass
         self.data_table.horizontalHeader().sectionClicked.connect(self.on_column_header_clicked)
 
         table_layout.addWidget(self.data_table)
@@ -406,12 +415,12 @@ class TableViewWidget(QWidget):
         Args:
             logical_index: The index of the clicked column
         """
-        # Get the column name from the header
-        header_item = self.data_table.horizontalHeaderItem(logical_index)
-        if header_item is None:
+        # Read the real column name, not the header's display text — that
+        # text may carry a " ▲"/" ▼" sort-arrow suffix once a sort is active,
+        # which would otherwise get embedded straight into the ORDER BY.
+        if logical_index >= len(self.columns):
             return
-
-        column_name = header_item.text()
+        column_name = self.columns[logical_index]
 
         # Toggle sort order if clicking the same column, otherwise set to ascending
         if self.sort_column == column_name:
@@ -453,41 +462,21 @@ class TableViewWidget(QWidget):
     def load_table_data(self):
         """Load the current page for current filter and sort, refreshing row count"""
         try:
-            if self.current_filter:
-                # Bug: this branch built count_query but never ran it, so
-                # self.total_rows stayed None after applying any filter —
-                # the pagination math a few lines below then crashed with
-                # "unsupported operand type(s) for +: 'NoneType' and 'int'"
-                # on the very next page load. Actually run it now, with the
-                # same fallback-on-failure shape as the unfiltered branch.
-                try:
-                    count_query = f"SELECT COUNT(*) as total FROM {self.table_name} WHERE {self.current_filter}"
-                    count_df = self.db_service.execute_query(count_query)
-                    self.total_rows = int(count_df.iloc[0]['total'])
-                except Exception as ex:
-                    logger.debug(f"Filtered row count failed for {self.table_name}: {ex}")
-                    self.total_rows = 1000000
-            else:
-                # For large unfiltered tables, use approximation or skip count
-                try:
-                    # Try to get approximate count (MySQL specific - very fast)
-                    if self.db_service.db_type == 'mysql':
-                        approx_query = f"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_NAME = '{self.table_name}' AND TABLE_SCHEMA = DATABASE()"
-                        approx_df = self.db_service.execute_query(approx_query)
-                        if len(approx_df) > 0 and approx_df.iloc[0]['TABLE_ROWS'] is not None:
-                            self.total_rows = int(approx_df.iloc[0]['TABLE_ROWS'])
-                        else:
-                            # Fallback: set to large number
-                            self.total_rows = 1000000
-                    else:
-                        # For other DBs, use COUNT but with timeout protection
-                        count_query = f"SELECT COUNT(*) as total FROM {self.table_name}"
-                        count_df = self.db_service.execute_query(count_query)
-                        self.total_rows = int(count_df.iloc[0]['total'])
-                except Exception as ex:
-                    # If approximate fails, set to large number to allow pagination
-                    logger.debug(f"Approximate row count failed for {self.table_name}: {ex}")
-                    self.total_rows = 1000000
+            # A real COUNT(*) — MySQL's INFORMATION_SCHEMA.TABLES.TABLE_ROWS
+            # looked appealingly fast, but it's only an approximate
+            # statistic that goes stale by any margin after inserts/deletes
+            # since the last ANALYZE TABLE, which silently capped
+            # pagination or hid real rows outright. A real count costs a
+            # bit more but is the only accurate answer, and Postgres/SQLite
+            # already paid this cost, so this just makes MySQL consistent.
+            try:
+                where_clause = f" WHERE {self.current_filter}" if self.current_filter else ""
+                count_query = f"SELECT COUNT(*) as total FROM {self.table_name}{where_clause}"
+                count_df = self.db_service.execute_query(count_query)
+                self.total_rows = int(count_df.iloc[0]['total'])
+            except Exception as ex:
+                logger.debug(f"Row count failed for {self.table_name}: {ex}")
+                self.total_rows = 1000000
             
             # Calculate offset
             offset = (self.current_page - 1) * self.page_size
@@ -531,13 +520,31 @@ class TableViewWidget(QWidget):
                                 if current in self.columns:
                                     column_combo.setCurrentText(current)
             
-            # For empty tables, create empty DataFrame with column structure
-            if self.total_rows == 0 and self.columns:
+            # Any approximate row-count statistic (MySQL's TABLE_ROWS, or a
+            # stale/cached COUNT) can be wrong in either direction — not
+            # just "reads 0 right after a bulk load", but stale-too-small
+            # on any table with enough writes since the last ANALYZE. Never
+            # let it override what was actually fetched: a full page means
+            # there's likely more beyond it, so bump the estimate up rather
+            # than letting a too-small stale number cap pagination and hide
+            # real data on every later page.
+            if len(df) > 0:
+                got_full_page = len(df) == self.page_size
+                min_known_rows = offset + len(df) + (1 if got_full_page else 0)
+                self.total_rows = max(self.total_rows, min_known_rows)
+            elif self.total_rows == 0 and self.columns:
                 import pandas as pd
-                # Create empty DataFrame with columns to show structure
                 df = pd.DataFrame(columns=self.columns)
             
             self.data_table.load_data(df, table_name=self.table_name)
+            # load_data() resets the grid's own sort state — restore it so
+            # the header shows the arrow/highlight for the column this page
+            # was actually ordered by (sorting itself is done server-side,
+            # above, via ORDER BY, not by EditableTableWidget).
+            if self.sort_column and self.sort_column in df.columns:
+                self.data_table._sort_col = list(df.columns).index(self.sort_column)
+                self.data_table._sort_asc = (self.sort_order == "ASC")
+                self.data_table._apply_sort_header_labels()
             total_pages = (self.total_rows + self.page_size - 1) // self.page_size
             self.page_label.setText(f"{self.current_page}/{max(1, total_pages)}")
             

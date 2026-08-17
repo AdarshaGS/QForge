@@ -347,6 +347,10 @@ class DbService:
     def _is_connection_error(self, ex):
         """Return True if the exception looks like a dropped/lost connection."""
         msg = str(ex).lower()
+        # pymysql's signature for "this connection object is already
+        # closed" — an empty-message, zero-code error, not a phrase.
+        if msg in ("(0, '')", "0", ""):
+            return True
         keywords = (
             'lost connection', 'server has gone away', 'broken pipe',
             'connection reset', 'connection closed', 'interface error',
@@ -406,6 +410,23 @@ class DbService:
             self.ssh_tunnel = None
         self.connect(config)
         logger.info("Reconnect successful")
+
+    def select_db(self, database: str):
+        """Point the live connection at *database* (MySQL only — Postgres/
+        SQLite connections are bound to one database for their lifetime).
+        Callers use this instead of `self.connection.select_db(...)`
+        directly because that bypasses the reconnect-on-drop retry
+        execute_query() gets for free — a connection that went stale (idle
+        timeout, dropped tunnel) would otherwise fail select_db() outright
+        and leave the switch permanently stuck."""
+        if self.connection:
+            try:
+                self.connection.select_db(database)
+                return
+            except Exception as ex:
+                if not self._is_connection_error(ex):
+                    raise
+        self._reconnect(dict(self._config, database=database))
 
     def is_connected(self):
         """Check if connected by opening a *separate* short-lived connection.
@@ -469,8 +490,15 @@ class DbService:
             status = "Rolled back"
         return pd.DataFrame([{"Transaction": status}])
 
-    def execute_query(self, query):
-        """Execute a SELECT query and return results as DataFrame"""
+    def execute_query(self, query, max_rows=None):
+        """Execute a SELECT query and return results as DataFrame.
+
+        max_rows: if given, stop fetching after this many rows (via
+        cursor.fetchmany, so the driver itself never pulls more than that
+        off the wire for an unbounded ad-hoc SELECT). The returned
+        DataFrame carries df.attrs['truncated'] = True when more rows
+        existed than were fetched. None (default) fetches everything, for
+        callers like exports that need the full result."""
 
         if not self.connection:
             raise Exception("No active database connection")
@@ -482,7 +510,7 @@ class DbService:
             return self._run_transaction_kind(tx_kind)
 
         try:
-            return self._execute_query_raw(query)
+            return self._execute_query_raw(query, max_rows)
         except Exception as ex:
             if self._is_connection_error(ex):
                 if self.in_transaction:
@@ -494,10 +522,10 @@ class DbService:
                     ) from ex
                 logger.warning(f"Connection lost during query, reconnecting... ({ex})")
                 self._reconnect()
-                return self._execute_query_raw(query)
+                return self._execute_query_raw(query, max_rows)
             raise
 
-    def execute_multi_query(self, script: str) -> list[tuple[str, object]]:
+    def execute_multi_query(self, script: str, max_rows=None) -> list[tuple[str, object]]:
         """Split *script* into statements, execute each. Returns list of
         (label, DataFrame|None) tuples — one per result-producing stmt.
         Non-SELECT statements produce (label, None).
@@ -520,7 +548,7 @@ class DbService:
                     results.append((label, ex))
             else:
                 try:
-                    df = self.execute_query(stmt)
+                    df = self.execute_query(stmt, max_rows=max_rows)
                     results.append((label, df))
                 except Exception as ex:
                     results.append((label, ex))
@@ -607,7 +635,15 @@ class DbService:
             pass
         return []
 
-    def _execute_query_raw(self, query):
+    def _fetch_rows(self, cursor, max_rows):
+        """fetchall(), or fetchmany(max_rows) with one extra row peeked to
+        detect truncation without pulling the whole result set first."""
+        if max_rows is None:
+            return cursor.fetchall(), False
+        rows = cursor.fetchmany(max_rows + 1)
+        return rows[:max_rows], len(rows) > max_rows
+
+    def _execute_query_raw(self, query, max_rows=None):
         """Internal: run a SQL statement without reconnect logic.
         For statements that return a result set (SELECT/SHOW/EXPLAIN/DESCRIBE),
         returns a DataFrame.  For DML (UPDATE/INSERT/DELETE/…) returns an empty
@@ -617,9 +653,11 @@ class DbService:
             cursor.execute(query)
             if cursor.description:
                 cols = [d[0] for d in cursor.description]
-                rows = cursor.fetchall()
+                rows, truncated = self._fetch_rows(cursor, max_rows)
                 cursor.close()
-                return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+                df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+                df.attrs["truncated"] = truncated
+                return df
             else:
                 affected = cursor.rowcount
                 cursor.close()
@@ -631,9 +669,11 @@ class DbService:
             cursor.execute(query)
             if cursor.description:
                 cols = [d[0] for d in cursor.description]
-                rows = cursor.fetchall()
+                rows, truncated = self._fetch_rows(cursor, max_rows)
                 cursor.close()
-                return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+                df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+                df.attrs["truncated"] = truncated
+                return df
             else:
                 affected = cursor.rowcount
                 cursor.close()
@@ -644,10 +684,12 @@ class DbService:
             cursor.execute(query)
             if cursor.description:
                 cols = [d[0] for d in cursor.description]
-                rows = cursor.fetchall()
+                rows, truncated = self._fetch_rows(cursor, max_rows)
                 cursor.close()
                 data = [dict(row) for row in rows]
-                return pd.DataFrame(data, columns=cols) if data else pd.DataFrame(columns=cols)
+                df = pd.DataFrame(data, columns=cols) if data else pd.DataFrame(columns=cols)
+                df.attrs["truncated"] = truncated
+                return df
             else:
                 affected = cursor.rowcount
                 if not self.in_transaction:

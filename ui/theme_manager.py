@@ -277,6 +277,7 @@ QTabBar#conn_tab_bar::tab {{
     border-right: 1px solid {BORDER};
     font-size: 12px;
     margin-right: 2px;
+    min-width: 120px;
 }}
 QTabBar#conn_tab_bar::tab:selected {{
     color: {TEXT};
@@ -525,6 +526,7 @@ QTabBar#conn_tab_bar::tab {{
     padding: 6px 14px; border: none;
     border-bottom: 2px solid transparent; border-right: 1px solid {BORDER};
     font-size: 12px; margin-right: 2px;
+    min-width: 120px;
 }}
 QTabBar#conn_tab_bar::tab:selected {{ color: {TEXT}; border-bottom: 2px solid {A}; }}
 
