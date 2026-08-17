@@ -1,0 +1,33 @@
+{
+  "_comment": "Live Free/Pro entitlement override, fetched by every QForge install at startup (services/entitlement_config.py / utils/entitlement_fetcher.py). Edit and push to this file to change a limit or the price for every installed copy without shipping a new release. A malformed or missing key here is ignored per-key and falls back to the app's bundled default for that key only.",
+
+  "free_limits": {
+    "max_connections": 5,
+    "max_query_tabs": 5,
+    "saved_queries": null,
+    "query_history": 20,
+    "er_diagram_tables": 10
+  },
+
+  "pro_limits": {
+    "max_connections": null,
+    "max_query_tabs": null,
+    "saved_queries": null,
+    "er_diagram_tables": null,
+    "query_history": 100
+  },
+
+  "pro_only_features": ["schema_compare", "advanced_erd"],
+
+  "pricing_url": "https://github.com/AdarshaGS/QForge",
+  "price_label": "$49/lifetime",
+
+  "pro_benefits": [
+    "Unlimited connections & query tabs",
+    "Unlimited saved queries",
+    "Full query history",
+    "Full ER diagrams",
+    "Schema Compare",
+    "Priority support"
+  ]
+}

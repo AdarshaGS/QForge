@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
 )
 
 from services.erd_model import build_erd_graph, fetch_table_indexes
+from services.entitlements import Edition, Feature, Limit, entitlements
+from ui.upgrade_dialog import UpgradeDialog
 from utils import erd_layout
 
 _HEADER_H = 26
@@ -569,6 +571,21 @@ class ErdDialog(QDialog):
         toolbar2.addStretch()
         layout.addLayout(toolbar2)
 
+        # Free-tier truncation banner (issue #86) — hidden unless a Free
+        # diagram was actually capped below the database's real table count.
+        self._upgrade_banner = QWidget()
+        self._upgrade_banner.setStyleSheet("background:#1c3a1c; border-bottom:1px solid #2d6a2d;")
+        banner_layout = QHBoxLayout(self._upgrade_banner)
+        banner_layout.setContentsMargins(12, 6, 8, 6)
+        self._upgrade_banner_label = QLabel("")
+        self._upgrade_banner_label.setStyleSheet("color:#5cdb5c; font-weight:600;")
+        banner_layout.addWidget(self._upgrade_banner_label, 1)
+        upgrade_link_btn = QPushButton("Upgrade to Pro →")
+        upgrade_link_btn.clicked.connect(self._show_upgrade_dialog)
+        banner_layout.addWidget(upgrade_link_btn)
+        self._upgrade_banner.hide()
+        layout.addWidget(self._upgrade_banner)
+
         canvas_row = QHBoxLayout()
         self.scene = QGraphicsScene(self)
         self.view = _ErdView(self.scene, self)
@@ -630,10 +647,16 @@ class ErdDialog(QDialog):
         config = dict(self._config)
         sig_done = self._graph_loaded
         sig_error = self._graph_load_error
+        # Only applies when loading the whole database (not a table_names-
+        # scoped view) — build_erd_graph itself ignores max_tables whenever
+        # table_names is given, so passing it unconditionally here is safe.
+        max_tables = None
+        if entitlements.edition() is Edition.FREE:
+            max_tables = entitlements.limit(Limit.ER_DIAGRAM_TABLES)
 
         def _worker():
             try:
-                sig_done.emit(build_erd_graph(config))
+                sig_done.emit(build_erd_graph(config, max_tables=max_tables))
             except Exception as ex:
                 sig_error.emit(str(ex))
 
@@ -649,10 +672,40 @@ class ErdDialog(QDialog):
             return
         self.status_label.setText(
             f"{len(graph.tables)} table(s), {len(graph.relationships)} relationship(s)")
+
+        truncated = (
+            entitlements.edition() is Edition.FREE
+            and graph.total_tables_available > len(graph.tables)
+        )
+        if truncated:
+            self._upgrade_banner_label.setText(
+                f"Showing {len(graph.tables)} of {graph.total_tables_available} "
+                "tables — Free is limited to this diagram size."
+            )
+            self._upgrade_banner.show()
+        else:
+            self._upgrade_banner.hide()
+
         self._build_scene(graph)
         if self._focus_table:
             self._focus_on_table(self._focus_table)
             self._focus_table = None  # only auto-focus once, on first load
+
+    def _show_upgrade_dialog(self):
+        cap = entitlements.limit(Limit.ER_DIAGRAM_TABLES)
+        total = self._graph.total_tables_available if self._graph else cap
+        UpgradeDialog(
+            "Full ER Diagrams is a Pro feature",
+            detail=f"Free accounts see at most {cap} tables per diagram.",
+            usage_line=f"{cap} / {total} tables shown" if self._graph else "",
+            cta_line="Upgrade to Pro for unlimited ER diagram tables.",
+            parent=self,
+        ).exec()
+        # Re-run so a license activated from inside the dialog reflects
+        # immediately without the user having to hit Refresh themselves.
+        if entitlements.is_enabled(Feature.ADVANCED_ERD):
+            self._upgrade_banner.hide()
+            self._reload()
 
     def _focus_on_table(self, table_name: str):
         """Select *table_name*'s node (highlighting it and its relationship

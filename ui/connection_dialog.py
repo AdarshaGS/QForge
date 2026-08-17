@@ -7,6 +7,8 @@ from utils import environment
 from utils.logger import get_logger
 from utils.paths import app_data_dir
 from ui.theme_manager import ThemeManager
+from ui.upgrade_dialog import require_under_limit
+from services.entitlements import Limit
 
 logger = get_logger()
 
@@ -1033,6 +1035,10 @@ class ConnectionDialog(QDialog):
                 return
 
         # ── Add as new connection (name required) ────────────────
+        if not require_under_limit(
+            Limit.MAX_CONNECTIONS, len(self.connections), "connections", self,
+        ):
+            return
         try:
             data = self.get_form_data()
         except ValueError as ex:

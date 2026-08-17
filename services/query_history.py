@@ -2,6 +2,7 @@ import json
 import os
 from datetime import datetime
 
+from services.entitlements import Limit, entitlements
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -55,9 +56,13 @@ class QueryHistory:
 
         self.queries.insert(0, entry)  # Add to beginning
 
-        # Keep only last MAX_HISTORY queries
-        if len(self.queries) > self.MAX_HISTORY:
-            self.queries = self.queries[:self.MAX_HISTORY]
+        # Keep only the current edition's allowance (Free: entitlement_config
+        # default 20; Pro: 100 — a storage-sanity cap, not a monetization
+        # limit). Silent trim, no upgrade prompt: history overflowing just
+        # drops the oldest entries, it never blocks the query that ran.
+        cap = entitlements.limit(Limit.QUERY_HISTORY) or self.MAX_HISTORY
+        if len(self.queries) > cap:
+            self.queries = self.queries[:cap]
 
         self.save_history()
 

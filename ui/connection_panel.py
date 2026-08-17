@@ -43,6 +43,8 @@ from ui.theme_manager import ThemeManager
 from ui.erd_dialog import ErdDialog
 from ui.schema_compare_dialog import SchemaCompareDialog
 from ui import query_guard_dialog
+from ui.upgrade_dialog import require_pro, require_under_limit
+from services.entitlements import Feature, Limit
 from utils.logger import get_logger
 from utils import environment
 from utils import schema_cache
@@ -1266,6 +1268,8 @@ class ConnectionPanel(QWidget):
         """Open the read-only Schema Compare dialog (issue #68), preselecting
         this connection as Source. Builds its own dedicated connections for
         both sides (services/schema_diff.py) — never touches self.db_service."""
+        if not require_pro(Feature.SCHEMA_COMPARE, "Schema Compare", self):
+            return
         dlg = SchemaCompareDialog(
             self.config.get("id", ""), is_dark=(self.current_theme == "dark"), parent=self)
         dlg.exec_()
@@ -1354,6 +1358,10 @@ class ConnectionPanel(QWidget):
 
     def add_new_tab(self):
         """Open a blank SQL query tab."""
+        if not require_under_limit(
+            Limit.MAX_QUERY_TABS, self.tabs.count(), "query tabs", self,
+        ):
+            return
         tab = SqlTab()
         # Reparent into the real tab widget FIRST, before any other setup.
         # SqlTab() itself is a fairly heavy construction (dozens of child
@@ -2567,6 +2575,10 @@ class ConnectionPanel(QWidget):
         query = tab.editor.toPlainText().strip() if isinstance(tab, SqlTab) else ""
         if not query:
             QMessageBox.information(self, "Nothing to Save", "Write a query in the editor first.")
+            return
+        if not require_under_limit(
+            Limit.SAVED_QUERIES, len(self.saved_queries.queries), "saved queries", self,
+        ):
             return
         name, ok = QInputDialog.getText(self, "Save Query", "Name:")
         if ok and name.strip():

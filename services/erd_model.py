@@ -41,19 +41,30 @@ class ErdRelationship:
 class ErdGraph:
     tables: dict = field(default_factory=dict)          # name -> ErdTable
     relationships: list = field(default_factory=list)   # list[ErdRelationship]
+    # How many tables the database actually has, before any max_tables cap
+    # was applied — equal to len(tables) unless the diagram was truncated.
+    total_tables_available: int = 0
 
 
-def build_erd_graph(config: dict, table_names: list = None) -> ErdGraph:
+def build_erd_graph(config: dict, table_names: list = None, max_tables: int = None) -> ErdGraph:
     """Connect using *config*, gather table/column/PK/FK metadata for
     *table_names* (every table when None), then disconnect. Never touches
     a caller-held live connection.
+
+    *max_tables*, when given and the database has more tables than that,
+    keeps only the first *max_tables* (alphabetically) — used to cap a Free
+    ER diagram (services/entitlements.py Limit.ER_DIAGRAM_TABLES). Ignored
+    when *table_names* is explicitly given (an already-deliberate subset,
+    e.g. a single-table focus view). graph.total_tables_available always
+    reports the true count so the caller can tell the user a diagram was
+    truncated.
 
     A single table's metadata failing to load doesn't abort diagram
     generation — that table is just omitted (acceptance criterion:
     "Missing/incomplete metadata does not crash diagram generation").
     Relationships whose target table isn't part of the built graph (a
-    dangling FK, or the target was excluded from *table_names*) are dropped
-    rather than left pointing at nothing.
+    dangling FK, the target was excluded from *table_names*, or dropped by
+    *max_tables*) are dropped rather than left pointing at nothing.
     """
     db = DbService()
     db.connect(config)
@@ -68,6 +79,12 @@ def build_erd_graph(config: dict, table_names: list = None) -> ErdGraph:
             except Exception as ex:
                 logger.debug(f"ERD: failed to list tables: {ex}")
                 return graph
+            graph.total_tables_available = len(names)
+            if max_tables is not None and len(names) > max_tables:
+                names = sorted(names)[:max_tables]
+
+        if not graph.total_tables_available:
+            graph.total_tables_available = len(names)
 
         fk_by_table = {}
         for name in names:

@@ -34,6 +34,35 @@ app and user settings are stored under `~/Library/Application Support/QForge`.
 - Switch between light and dark themes, cancel running queries, and check for
   application updates.
 
+## Free vs. Pro
+
+QForge Free covers everyday database work with no license required and no
+internet connection needed: MySQL/PostgreSQL/SQLite connections, the SQL
+editor and result grid, the schema explorer, and a basic ER diagram, each
+capped at a sensible limit —
+
+| | Free | Pro |
+| --- | --- | --- |
+| Saved connections | 5 | Unlimited |
+| Query tabs per connection | 5 | Unlimited |
+| Query history | 20 entries | 100 entries |
+| ER diagram | First 10 tables | Full diagram |
+| Schema Compare | — | ✓ |
+
+Reaching a limit, or opening a Pro-only feature, shows an in-app "Upgrade to
+Pro" dialog explaining what's gated and why — it never blocks a basic
+database operation you were already doing. Activate a purchased license from
+**Help → License…**; it's verified fully offline (an Ed25519 signature, no
+account or network call needed).
+
+These limits live in `services/entitlement_config.py` (the model itself is in
+`services/entitlements.py`, kept separate from every place that enforces it).
+Every install also checks `entitlements-config.json` in this repo once at
+startup and caches the result, so a limit or the price can be changed for
+everyone without shipping a new release — editing that file is enough. A
+failed or offline check simply falls back to the bundled/cached values, never
+blocking the app.
+
 ## Quick start
 
 ### Prerequisites
@@ -284,16 +313,24 @@ against the published checksum first.
 .
 ├── main.py                 # Application entry point and main window
 ├── services/
-│   ├── db_service.py       # Database connections, queries, schema access
-│   ├── query_history.py    # Persistent query history
-│   └── query_verifier.py   # Query-result and EXPLAIN comparison
+│   ├── db_service.py           # Database connections, queries, schema access
+│   ├── query_history.py        # Persistent query history
+│   ├── query_verifier.py       # Query-result and EXPLAIN comparison
+│   ├── entitlements.py         # Free/Pro model — limits, feature gates
+│   ├── entitlement_config.py   # Every tunable limit/price/URL, in one place
+│   └── license_manager.py      # Local license file, Ed25519 verification
 ├── ui/
 │   ├── connection_dialog.py  # Connection profile manager
 │   ├── connection_panel.py   # Per-connection workspace
 │   ├── sql_tab.py            # SQL editor and result grid
 │   ├── table_view_widget.py  # Paginated table browser
-│   └── structure_editor.py   # Create/alter table UI
+│   ├── structure_editor.py   # Create/alter table UI
+│   ├── upgrade_dialog.py     # "Upgrade to Pro" gate + require_pro()
+│   └── license_dialog.py     # Activate/view a Pro license
 ├── utils/                  # Credentials, logging, update and session helpers
+├── scripts/
+│   └── issue_license.py    # Offline dev tool: sign a Pro license key
+├── entitlements-config.json  # Live Free/Pro override, fetched at startup
 ├── query_analyzer.py       # Standalone MySQL query-plan analysis CLI
 ├── requirements.txt
 ├── build.sh                # macOS app/DMG build script

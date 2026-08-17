@@ -14,12 +14,15 @@ from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon
 from services.db_service import DbService
 from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
+from services.entitlements import Edition, entitlements
 from ui.connection_dialog import ConnectionDialog
 from ui.connection_panel import ConnectionPanel
+from ui.license_dialog import LicenseDialog
 from ui.theme_manager import ThemeManager
 from utils.logger import setup_logger, get_logger
 from utils.updater import UpdateChecker, APP_VERSION
 from utils.self_updater import UpdateInstaller, running_app_bundle_path, relaunch
+from utils.entitlement_fetcher import EntitlementConfigFetcher
 from utils.homebrew_updater import HomebrewUpdateInstaller
 from utils import install_source
 from utils.paths import app_data_dir
@@ -92,6 +95,21 @@ class MainWindow(QMainWindow):
 
         self.restore_session()
         self._start_update_check()
+        self._start_entitlement_config_check()
+
+    # ─── Entitlement config (Free/Pro limits, live-overridable) ────────────────
+
+    def _start_entitlement_config_check(self):
+        """Background, best-effort fetch of the remote entitlement override
+        (services/entitlement_config.py). Never blocks startup and never
+        required — offline installs simply keep the bundled/cached values."""
+        self._entitlement_fetcher = EntitlementConfigFetcher()
+        self._entitlement_fetcher.config_loaded.connect(self._on_entitlement_config_loaded)
+        self._entitlement_fetcher.start()
+
+    def _on_entitlement_config_loaded(self, raw: dict):
+        entitlements.apply_remote_config(raw)
+        self._refresh_pro_menu_labels()
 
     # ─── Update checker ───────────────────────────────────────────────────────
 
@@ -791,8 +809,8 @@ class MainWindow(QMainWindow):
             lambda: self._current_panel() and self._current_panel().open_erd_view()
         )
 
-        act = db_menu.addAction("Compare Schemas…")
-        act.triggered.connect(
+        self.schema_compare_action = db_menu.addAction("Compare Schemas…")
+        self.schema_compare_action.triggered.connect(
             lambda: self._current_panel() and self._current_panel().open_schema_compare()
         )
 
@@ -835,6 +853,26 @@ class MainWindow(QMainWindow):
 
         act = help_menu.addAction("Check for Updates…")
         act.triggered.connect(self._check_for_updates_manual)
+
+        help_menu.addSeparator()
+
+        self.license_action = help_menu.addAction("")
+        self.license_action.triggered.connect(self._open_license_dialog)
+
+        self._refresh_pro_menu_labels()
+
+    def _open_license_dialog(self):
+        dlg = LicenseDialog(parent=self)
+        dlg.exec()
+        self._refresh_pro_menu_labels()
+
+    def _refresh_pro_menu_labels(self):
+        """Keeps the menu bar's Pro-affordance labels in sync with the
+        current edition — called after license activate/deactivate and
+        after a remote entitlement-config fetch changes what's gated."""
+        is_free = entitlements.edition() is Edition.FREE
+        self.schema_compare_action.setText("Compare Schemas… (Pro)" if is_free else "Compare Schemas…")
+        self.license_action.setText("Upgrade to Pro…" if is_free else "License…")
 
     # ─── Theme ───────────────────────────────────────────────────────────────
 
