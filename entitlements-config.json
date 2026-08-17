@@ -19,7 +19,7 @@
 
   "pro_only_features": ["schema_compare", "advanced_erd"],
 
-  "pricing_url": "https://github.com/AdarshaGS/QForge",
+  "pricing_url": "https://qforge-licensing-production.up.railway.app/#pricing",
   "price_label": "$49/lifetime",
 
   "pro_benefits": [
