@@ -257,6 +257,26 @@ def test_get_table_ddl_includes_columns_and_primary_key(db):
     assert "PRIMARY KEY" in ddl
 
 
+def test_get_table_ddl_includes_secondary_index_but_not_the_pk_index(db):
+    db.execute_update("CREATE INDEX idx_users_name ON users(name)")
+    ddl = db.get_table_ddl("users")
+    assert "idx_users_name" in ddl
+    assert "CREATE INDEX" in ddl
+    # The PK's own implicit index must not be re-emitted as a second
+    # CREATE statement — it's already covered by the inline PRIMARY KEY.
+    assert ddl.count("users_pkey") == 0
+
+
+def test_get_table_ddl_includes_foreign_keys(db):
+    db.execute_update(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))"
+    )
+    ddl = db.get_table_ddl("orders")
+    assert "FOREIGN KEY" in ddl
+    assert '"user_id"' in ddl
+    assert '"users"' in ddl and '"id"' in ddl
+
+
 def test_get_views(db):
     db.execute_update("CREATE VIEW active_users AS SELECT * FROM users")
     assert db.get_views() == ["active_users"]

@@ -1,3 +1,4 @@
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -5,6 +6,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QPushButton,
     QLabel,
+    QLineEdit,
     QCheckBox,
     QGroupBox,
     QSpinBox,
@@ -65,6 +67,7 @@ class ExportScopeDialog(QDialog):
         }
 
         self._table_checks: dict[str, dict[str, QCheckBox]] = {}
+        self._table_labels: dict[str, QLabel] = {}
         self._column_widgets: dict[str, list] = {key: [] for key, _, _ in _COLUMNS}
         layout = QVBoxLayout(self)
 
@@ -75,6 +78,28 @@ class ExportScopeDialog(QDialog):
         layout.addWidget(self._tab_bar)
 
         layout.addWidget(QLabel("Tables:"))
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search tables…")
+        self._search_edit.textChanged.connect(self._filter_tables)
+        layout.addWidget(self._search_edit)
+
+        bulk_row = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        select_none_btn = QPushButton("Select None")
+        invert_btn = QPushButton("Invert Selection")
+        for btn in (select_all_btn, select_none_btn, invert_btn):
+            btn.setFlat(True)
+            btn.setCursor(Qt.PointingHandCursor)
+        select_all_btn.clicked.connect(lambda: self._bulk_select(True))
+        select_none_btn.clicked.connect(lambda: self._bulk_select(False))
+        invert_btn.clicked.connect(self._invert_selection)
+        bulk_row.addWidget(select_all_btn)
+        bulk_row.addWidget(select_none_btn)
+        bulk_row.addWidget(invert_btn)
+        bulk_row.addStretch()
+        layout.addLayout(bulk_row)
+
         layout.addWidget(self._build_grid(tables))
         layout.addWidget(self._build_advanced_panel())
 
@@ -114,7 +139,9 @@ class ExportScopeDialog(QDialog):
             self._column_widgets[key].extend([all_btn, none_btn])
 
         for row, table in enumerate(tables, start=2):
-            grid.addWidget(QLabel(table), row, 0)
+            name_label = QLabel(table)
+            grid.addWidget(name_label, row, 0)
+            self._table_labels[table] = name_label
             checks = {}
             for col, (key, _short, _full) in enumerate(_COLUMNS, start=1):
                 cb = QCheckBox()
@@ -133,6 +160,39 @@ class ExportScopeDialog(QDialog):
     def _set_column(self, key: str, checked: bool):
         for checks in self._table_checks.values():
             checks[key].setChecked(checked)
+
+    def _filter_tables(self, text: str):
+        """Hides table rows whose name doesn't contain *text* (case-
+        insensitive). Select All/None/Invert below only ever act on the
+        rows still visible, so filtering scopes bulk selection too."""
+        needle = text.strip().lower()
+        for table, label in self._table_labels.items():
+            visible = needle in table.lower()
+            label.setVisible(visible)
+            for cb in self._table_checks[table].values():
+                cb.setVisible(visible)
+
+    def _bulk_select(self, checked: bool):
+        """Sets every currently-relevant column (per the active format
+        tab) to *checked*, for visible (unfiltered) rows only. Checks
+        isHidden() rather than isVisible() — the latter also depends on
+        whether this dialog itself has been shown yet, which isHidden()
+        (the widget's own explicit flag) doesn't care about."""
+        relevant = _FORMAT_COLUMNS[_FORMATS[self._tab_bar.currentIndex()]]
+        for table, label in self._table_labels.items():
+            if label.isHidden():
+                continue
+            for key in relevant:
+                self._table_checks[table][key].setChecked(checked)
+
+    def _invert_selection(self):
+        relevant = _FORMAT_COLUMNS[_FORMATS[self._tab_bar.currentIndex()]]
+        for table, label in self._table_labels.items():
+            if label.isHidden():
+                continue
+            for key in relevant:
+                cb = self._table_checks[table][key]
+                cb.setChecked(not cb.isChecked())
 
     def _build_advanced_panel(self) -> QWidget:
         box = QGroupBox("Advanced")

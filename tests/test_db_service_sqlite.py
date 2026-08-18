@@ -336,6 +336,21 @@ def test_get_table_ddl_unknown_table_returns_empty_string(db):
     assert db.get_table_ddl("does_not_exist") == ""
 
 
+def test_get_table_ddl_includes_secondary_index(db):
+    db.execute_update("CREATE INDEX idx_users_name ON users(name)")
+    ddl = db.get_table_ddl("users")
+    assert "CREATE TABLE users" in ddl
+    assert "CREATE INDEX idx_users_name" in ddl
+
+
+def test_get_table_ddl_does_not_duplicate_implicit_pk_index(db):
+    # A composite/UNIQUE PK creates an internal sqlite_autoindex_* entry
+    # with no stored sql text — it must not surface as a bare "None;".
+    db.execute_update("CREATE TABLE composite_pk (a INTEGER, b INTEGER, PRIMARY KEY (a, b))")
+    ddl = db.get_table_ddl("composite_pk")
+    assert "None" not in ddl
+
+
 def test_get_views(db):
     db.execute_update("CREATE VIEW active_users AS SELECT * FROM users")
     assert db.get_views() == ["active_users"]

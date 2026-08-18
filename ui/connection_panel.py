@@ -140,6 +140,34 @@ class _QueryWorker(QObject):
                     pass
 
 
+_GZIP_COMPRESSLEVEL = 1
+# Exported SQL/Dot text is highly repetitive (INSERT boilerplate, repeated
+# identifiers) — level 1 captures nearly all the achievable compression a
+# plain gzip -9 would (measured <1% size difference) for a real speed win,
+# so there's no real tradeoff to justify Python's slower default of 9 here.
+
+
+def _open_export_file(path: str, gzip_output: bool):
+    if gzip_output:
+        return gzip.open(path, "wt", encoding="utf-8", compresslevel=_GZIP_COMPRESSLEVEL)
+    return open(path, "wt", encoding="utf-8")
+
+
+_UNSAFE_ZIP_CHARS = re.compile(r"[\\/\x00]")
+
+
+def _safe_zip_entry_name(table: str, ext: str) -> str:
+    """Sanitize a table name before using it as a zip member filename
+    (issue #163). zipfile.ZipFile.open() does not sanitize path
+    separators or ".." in the name it's given — table is a server-returned
+    identifier, so a malicious/compromised DB server naming a table e.g.
+    "../../../Library/LaunchAgents/evil" could otherwise produce a zip
+    entry that writes outside the target directory ("Zip Slip") when
+    extracted by a tool that doesn't sanitize archive paths itself."""
+    safe = _UNSAFE_ZIP_CHARS.sub("_", table).strip(".") or "table"
+    return f"{safe}.{ext}"
+
+
 class _ExportWorker(QObject):
     """Runs export_database()/_export_table()'s write loop on a QThread
     (issue #158), streaming each table's rows via DbService.stream_table_rows()
@@ -252,13 +280,12 @@ class _ExportWorker(QObject):
         producer = threading.Thread(target=self._produce_rows, args=(q, done), daemon=True)
         producer.start()
 
-        opener = gzip.open if self._gzip else open
         failures = []
         completed = 0
         writer = None
         writer_table = None
         try:
-            with opener(self._file_path, "wt", encoding="utf-8") as fh:
+            with _open_export_file(self._file_path, self._gzip) as fh:
                 if self._bom:
                     fh.write("﻿")
                 while True:
@@ -334,7 +361,7 @@ class _ExportWorker(QObject):
                         _, table, columns, rows = item
                         if row_writer is None or current_table != table:
                             entry = _io.TextIOWrapper(
-                                zf.open(f"{table}.{ext}", "w"), encoding="utf-8", newline="")
+                                zf.open(_safe_zip_entry_name(table, ext), "w"), encoding="utf-8", newline="")
                             if self._bom:
                                 entry.write("﻿")
                             row_writer = (
@@ -371,9 +398,8 @@ class _ExportWorker(QObject):
             self.errored.emit(str(ex))
             return
 
-        opener = gzip.open if self._gzip else open
         try:
-            with opener(self._file_path, "wt", encoding="utf-8") as fh:
+            with _open_export_file(self._file_path, self._gzip) as fh:
                 fh.write(dot_text + "\n")
         except OSError as ex:
             self._disconnect()
@@ -436,6 +462,14 @@ class ConnectionPanel(QWidget):
     # Bridge signal for the optimistic-open background connect (issue: lag on
     # previously-visited remote/SSH connections despite a warm schema cache)
     _bg_connect_done = Signal(str)    # error message, "" on success
+    # Bridge signals for background export (_ExportWorker) — same reasoning
+    # as _q_done etc.: only one export runs at a time per panel, so the
+    # in-flight QProgressDialog/title/etc. are read from self._export_* by
+    # the bound slots below rather than threaded through the signal args.
+    _export_progress_sig = Signal(str, int)   # (table, completed_count)
+    _export_finished_sig = Signal(list)       # failures: list[str]
+    _export_errored_sig  = Signal(str)
+    _export_cancelled_sig = Signal()
 
     def __init__(self, config: dict, db_service: DbService,
                  query_history: QueryHistory, saved_queries: SavedQueries = None,
@@ -494,6 +528,10 @@ class ConnectionPanel(QWidget):
         self._schema_error.connect(self._on_schema_error, Qt.QueuedConnection)
         self._schema_fast.connect(self._on_schema_tables_ready, Qt.QueuedConnection)
         self._bg_connect_done.connect(self._on_background_connect_done, Qt.QueuedConnection)
+        self._export_progress_sig.connect(self._on_export_progress, Qt.QueuedConnection)
+        self._export_finished_sig.connect(self._on_export_finished, Qt.QueuedConnection)
+        self._export_errored_sig.connect(self._on_export_errored, Qt.QueuedConnection)
+        self._export_cancelled_sig.connect(self._on_export_cancelled, Qt.QueuedConnection)
         self._column_cache: dict = {}   # {table: [col, ...]} for autocomplete
 
         self._build_ui()
@@ -1599,6 +1637,21 @@ class ConnectionPanel(QWidget):
         if self.tabs.count() == 0:
             self.add_new_tab()
 
+    def focus_first_tab(self):
+        """Make tab 0 the active tab and focus its editor. Call once after
+        all of a panel's session/pinned tabs have been restored (issue
+        #149): add_new_tab()/open_table_view() each set themselves as the
+        current tab and grab focus, so restoring N tabs in a loop leaves
+        whichever one was restored *last* active — not tab 1 — unless
+        something resets it afterward."""
+        if self.tabs.count() == 0:
+            return
+        self.tabs.setCurrentIndex(0)
+        first_tab = self.tabs.widget(0)
+        if hasattr(first_tab, 'editor'):
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, first_tab.editor.setFocus)
+
     def _under_tab_limit(self, silent: bool) -> bool:
         """True if one more tab stays within Limit.MAX_QUERY_TABS — query
         tabs and table-data tabs share this one limit (issue #154), since
@@ -2271,33 +2324,28 @@ class ConnectionPanel(QWidget):
         # Keep refs alive until the thread finishes (same as _QueryWorker).
         self._export_thread = thread
         self._export_worker = worker
+        # Read by the bound _on_export_* slots below — only one export runs
+        # at a time per panel, so plain instance attrs are enough (same
+        # pattern as _export_thread/_export_worker above).
+        self._export_progress_dialog = progress
+        self._export_title = title
+        self._export_file_path = file_path
+        self._export_table_opts = table_opts
+        self._export_format = export_format
 
         progress.canceled.connect(cancel_flag.set)
 
-        def _on_progress(table, count):
-            progress.setLabelText(f"Exporting {table}…")
-            progress.setValue(count)
-
-        def _finish(failures):
-            progress.close()
-            if export_format == "dot":
-                summary = f"Exported schema diagram to:\n{file_path}"
-            else:
-                summary = f"Exported {len(table_opts) - len(failures)}/{len(table_opts)} tables to:\n{file_path}"
-            if failures:
-                summary += "\n\nFailed:\n" + "\n".join(failures)
-                QMessageBox.warning(self, title, summary)
-            else:
-                QMessageBox.information(self, title, summary)
-
-        def _error(msg):
-            progress.close()
-            QMessageBox.critical(self, "Export Error", f"Could not write file:\n{msg}")
-
-        worker.progress.connect(_on_progress)
-        worker.finished.connect(_finish)
-        worker.errored.connect(_error)
-        worker.cancelled.connect(progress.close)
+        # _ExportWorker's signals fire on the worker thread. Connecting them
+        # directly to plain closures here would run those closures (and any
+        # QProgressDialog/QMessageBox call inside) on the worker thread too —
+        # PySide6 doesn't reliably promote that to a queued, main-thread
+        # call (see the bridge-signal comment above _bg_connect_done).
+        # Routing through the QueuedConnection-bound _export_*_sig bridge
+        # signals guarantees the actual GUI work happens on the main thread.
+        worker.progress.connect(lambda table, count: self._export_progress_sig.emit(table, count))
+        worker.finished.connect(lambda failures: self._export_finished_sig.emit(failures))
+        worker.errored.connect(lambda msg: self._export_errored_sig.emit(msg))
+        worker.cancelled.connect(lambda: self._export_cancelled_sig.emit())
 
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
@@ -2306,6 +2354,30 @@ class ConnectionPanel(QWidget):
         worker.cancelled.connect(thread.quit)
 
         thread.start()
+
+    def _on_export_progress(self, table: str, count: int):
+        self._export_progress_dialog.setLabelText(f"Exporting {table}…")
+        self._export_progress_dialog.setValue(count)
+
+    def _on_export_finished(self, failures: list[str]):
+        self._export_progress_dialog.close()
+        table_opts, file_path, title = self._export_table_opts, self._export_file_path, self._export_title
+        if self._export_format == "dot":
+            summary = f"Exported schema diagram to:\n{file_path}"
+        else:
+            summary = f"Exported {len(table_opts) - len(failures)}/{len(table_opts)} tables to:\n{file_path}"
+        if failures:
+            summary += "\n\nFailed:\n" + "\n".join(failures)
+            QMessageBox.warning(self, title, summary)
+        else:
+            QMessageBox.information(self, title, summary)
+
+    def _on_export_errored(self, msg: str):
+        self._export_progress_dialog.close()
+        QMessageBox.critical(self, "Export Error", f"Could not write file:\n{msg}")
+
+    def _on_export_cancelled(self):
+        self._export_progress_dialog.close()
 
     def _write_table_export(self, fh, table: str, opts: dict,
                              blob_as_hex: bool = True, batch_kib=None,

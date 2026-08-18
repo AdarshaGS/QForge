@@ -157,6 +157,33 @@ def test_csv_format_writes_one_zip_member_per_table(db_path, tmp_path):
         assert len(users_csv.splitlines()) == 6  # header + 5 rows
 
 
+def test_csv_export_sanitizes_path_traversal_table_name(db_path, tmp_path, monkeypatch):
+    """Regression for issue #163 (Zip Slip): a table name containing path
+    separators/".." must not survive into the zip member name.
+
+    stream_table_rows()'s own unquoted `SELECT * FROM {table_name}` means a
+    "/"-bearing identifier can't actually round-trip through a real query
+    today, so that incidental gate is bypassed here via monkeypatch to test
+    the zip-entry sanitizer in isolation — it's a defense-in-depth fix, not
+    contingent on that unrelated query-construction detail staying broken."""
+    import zipfile
+
+    malicious_table = "../../../../tmp/evil"
+    monkeypatch.setattr(
+        DbService, "stream_table_rows",
+        lambda self, table_name, chunk_size=2000: iter([(["id"], [(1,)])]),
+    )
+
+    out = str(tmp_path / "out.zip")
+    opts = {malicious_table: {"structure": False, "content": True, "drop": False}}
+    events = _run(db_path, opts, out, export_format="csv")
+
+    assert events["finished"] == []
+    with zipfile.ZipFile(out) as zf:
+        for name in zf.namelist():
+            assert "/" not in name and "\\" not in name
+
+
 def test_xml_format_writes_one_zip_member_per_table(db_path, tmp_path):
     import zipfile
 

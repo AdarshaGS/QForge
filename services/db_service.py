@@ -1033,13 +1033,19 @@ class DbService:
             return []
 
     def get_table_ddl(self, table_name: str) -> str:
-        """Return this table's CREATE TABLE statement.
+        """Return this table's CREATE TABLE statement, followed by its
+        indexes and foreign keys as separate statements — export
+        "Structure" means all three, not just the bare CREATE TABLE.
 
-        MySQL/SQLite store the exact original DDL and are asked directly
-        (SHOW CREATE TABLE / sqlite_master.sql). PostgreSQL has no single
-        built-in equivalent, so it's reconstructed from information_schema
-        columns + the primary key — a reasonable approximation, not a full
-        pg_dump (no indexes/constraints/comments)."""
+        MySQL's SHOW CREATE TABLE already inlines indexes/FKs, so it needs
+        nothing extra. SQLite stores each object's exact original DDL in
+        sqlite_master — CREATE TABLE inlines its own FKs, so only indexes
+        (skipping the implicit ones backing inline PK/UNIQUE, which have no
+        stored sql text) need appending. PostgreSQL has no single built-in
+        equivalent, so the table is reconstructed from information_schema
+        columns + the primary key, then indexes (excluding the PK's own
+        backing index) and FKs are appended — a reasonable approximation,
+        not a full pg_dump (no comments/non-FK constraints)."""
         cursor = self.connection.cursor()
         if self.db_type == "mysql":
             cursor.execute(f"SHOW CREATE TABLE `{table_name}`")
@@ -1052,7 +1058,15 @@ class DbService:
                 (table_name,),
             )
             row = cursor.fetchone()
-            return (row[0] + ";") if row and row[0] else ""
+            if not row or not row[0]:
+                return ""
+            statements = [row[0] + ";"]
+            cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+                (table_name,),
+            )
+            statements.extend(r[0] + ";" for r in cursor.fetchall())
+            return "\n".join(statements)
 
         elif self.db_type == "postgresql":
             cursor.execute(
@@ -1072,7 +1086,30 @@ class DbService:
                 col_defs.append(line)
             if pk_cols:
                 col_defs.append(f'PRIMARY KEY ({", ".join(pk_cols)})')
-            return f'CREATE TABLE "{table_name}" (\n  ' + ",\n  ".join(col_defs) + "\n);"
+            statements = [f'CREATE TABLE "{table_name}" (\n  ' + ",\n  ".join(col_defs) + "\n);"]
+
+            cursor.execute(
+                "SELECT conname FROM pg_constraint WHERE conrelid = %s::regclass AND contype = 'p'",
+                (table_name,),
+            )
+            pk_row = cursor.fetchone()
+            pk_index_name = pk_row[0] if pk_row else None
+            cursor.execute(
+                "SELECT indexname, indexdef FROM pg_indexes "
+                "WHERE schemaname = current_schema() AND tablename = %s",
+                (table_name,),
+            )
+            statements.extend(
+                indexdef + ";" for indexname, indexdef in cursor.fetchall()
+                if indexname != pk_index_name
+            )
+
+            for fk in self.get_foreign_keys(table_name):
+                statements.append(
+                    f'ALTER TABLE "{table_name}" ADD FOREIGN KEY ("{fk["column"]}") '
+                    f'REFERENCES "{fk["ref_table"]}" ("{fk["ref_column"]}");'
+                )
+            return "\n".join(statements)
 
         return ""
 

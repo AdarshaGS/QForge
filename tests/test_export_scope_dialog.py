@@ -148,3 +148,62 @@ def test_auto_increment_and_strip_generated_disabled_outside_sql_tab():
     dlg._tab_bar.setCurrentIndex(0)  # back to sql: dialect still supports both
     assert dlg._auto_increment_cb.isEnabled()
     assert dlg.include_auto_increment() is True
+
+
+def test_search_hides_non_matching_table_rows():
+    dlg = ExportScopeDialog(["users", "orders", "order_items"])
+    dlg._search_edit.setText("order")
+    assert dlg._table_labels["users"].isHidden() is True
+    assert dlg._table_labels["orders"].isHidden() is False
+    assert dlg._table_labels["order_items"].isHidden() is False
+
+    dlg._search_edit.setText("")
+    assert dlg._table_labels["users"].isHidden() is False
+
+
+def test_select_all_checks_relevant_columns_for_visible_rows_only():
+    dlg = ExportScopeDialog(["users", "orders"])
+    for cb in dlg._table_checks["users"].values():
+        cb.setChecked(False)
+    for cb in dlg._table_checks["orders"].values():
+        cb.setChecked(False)
+
+    dlg._search_edit.setText("order")
+    dlg._bulk_select(True)
+
+    opts = dlg.table_options()
+    assert "users" not in opts  # left unchecked, filtered out of the bulk action
+    assert opts["orders"] == {"structure": True, "content": True, "drop": True}
+
+
+def test_select_none_unchecks_relevant_columns_for_visible_rows_only():
+    dlg = ExportScopeDialog(["users", "orders"])
+    dlg._search_edit.setText("users")
+    dlg._bulk_select(False)
+
+    opts = dlg.table_options()
+    assert "users" not in opts
+    assert opts["orders"] == {"structure": True, "content": True, "drop": False}  # untouched default
+
+
+def test_invert_selection_flips_relevant_columns_for_visible_rows_only():
+    dlg = ExportScopeDialog(["users", "orders"])
+    dlg._search_edit.setText("users")
+    dlg._invert_selection()
+
+    opts = dlg.table_options()
+    assert opts["users"] == {"structure": False, "content": False, "drop": True}
+    assert opts["orders"] == {"structure": True, "content": True, "drop": False}  # untouched
+
+
+def test_bulk_select_only_touches_columns_relevant_to_current_format():
+    dlg = ExportScopeDialog(["users"])
+    dlg._tab_bar.setCurrentIndex(1)  # csv: only "content" is relevant
+    dlg._bulk_select(False)
+
+    checks = dlg._table_checks["users"]
+    assert checks["content"].isChecked() is False
+    # structure/drop are disabled (unchecked by _on_format_changed) and
+    # untouched by the bulk action itself, which only iterates csv's
+    # relevant column set.
+    assert checks["structure"].isEnabled() is False
