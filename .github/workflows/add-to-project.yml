@@ -1,0 +1,67 @@
+name: Add issue to project
+
+# Auto-files every new issue into the personal-account GitHub Project (v2)
+# whose title matches this repo's name (case-insensitive) — e.g. an issue
+# opened on "QForge" is added to the "QForge" project, an issue opened on
+# "Operion" is added to the "Operion" project. Same workflow file, no
+# per-repo project URL to maintain: copy it as-is into any repo and it
+# routes itself by repo name.
+#
+# Requires a repo secret PROJECT_TOKEN: a classic PAT (or fine-grained PAT
+# with "Projects: read and write" + "Issues: read" access) belonging to the
+# account that owns the projects — the default GITHUB_TOKEN cannot read or
+# write Projects v2.
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: read
+
+jobs:
+  add-to-project:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add issue to matching project
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          OWNER: AdarshaGS
+          REPO_NAME: ${{ github.event.repository.name }}
+          ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::PROJECT_TOKEN secret is not set — cannot add issue to a project."
+            exit 1
+          fi
+
+          projects_json=$(gh api graphql -f query='
+            query($owner: String!) {
+              user(login: $owner) {
+                projectsV2(first: 100) {
+                  nodes { id title }
+                }
+              }
+            }' -f owner="$OWNER")
+
+          project_id=$(echo "$projects_json" | jq -r --arg name "$REPO_NAME" '
+            [.data.user.projectsV2.nodes[]
+             | select(.title | ascii_downcase == ($name | ascii_downcase))]
+            | .[0].id // empty')
+
+          if [ -z "$project_id" ]; then
+            echo "::warning::No project named '$REPO_NAME' found under $OWNER — skipping $ISSUE_URL."
+            exit 0
+          fi
+
+          gh api graphql -f query='
+            mutation($project: ID!, $item: ID!) {
+              addProjectV2ItemById(input: {projectId: $project, contentId: $item}) {
+                item { id }
+              }
+            }' -f project="$project_id" -f item="$ISSUE_NODE_ID" > /dev/null
+
+          echo "Added $ISSUE_URL to project '$REPO_NAME'"
