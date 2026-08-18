@@ -13,6 +13,8 @@ import os
 import time
 import re
 import threading
+import queue
+import gzip
 
 from PySide6.QtCore import Qt, Signal, QThread, QObject
 from PySide6.QtWidgets import (
@@ -44,11 +46,15 @@ from ui.erd_dialog import ErdDialog
 from ui.schema_compare_dialog import SchemaCompareDialog
 from ui import query_guard_dialog
 from ui.upgrade_dialog import require_pro, require_under_limit
-from services.entitlements import Feature, Limit
+from services.entitlements import Feature, Limit, entitlements
 from utils.logger import get_logger
 from utils import environment
 from utils import schema_cache
-from utils.df_export import export_dataframe, _to_sql_inserts
+from utils.df_export import (
+    export_dataframe, _to_sql_inserts, drop_table_statement,
+    SqlInsertStreamWriter, CsvRowStreamWriter, XmlRowStreamWriter,
+    strip_auto_increment_value, strip_generated_column_clauses,
+)
 from services import query_classifier
 from services import table_organization
 
@@ -132,6 +138,252 @@ class _QueryWorker(QObject):
                     self._db.disconnect()
                 except Exception:
                     pass
+
+
+class _ExportWorker(QObject):
+    """Runs export_database()/_export_table()'s write loop on a QThread
+    (issue #158), streaming each table's rows via DbService.stream_table_rows()
+    instead of loading the whole table into memory first. A producer thread
+    walks *table_opts* and pushes structure/drop/row-chunk items onto a
+    bounded queue; run() (on the QThread) drains that queue and writes to
+    the output — so table N+1's fetch overlaps table N's disk/gzip flush
+    rather than the two running strictly sequentially. Receives a
+    *dedicated* DbService connection, same reasoning as _QueryWorker.
+
+    *export_format* selects the writer (issue #159): 'sql' writes one flat
+    (optionally gzip'd) .sql file via SqlInsertStreamWriter; 'csv'/'xml'
+    write one zip archive with one member per table (ExportScopeDialog
+    forces structure/drop off for these, so the same row-producer loop
+    naturally only ever emits "rows" items for them); 'dot' skips the
+    producer/queue machinery entirely — schema+FK metadata is small enough
+    to fetch inline and write as a single Graphviz file."""
+
+    progress  = Signal(str, int)   # (table, completed_count)
+    finished  = Signal(list)       # failures: list[str]
+    errored   = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, db_service, table_opts: dict, file_path: str,
+                 export_format: str = "sql",
+                 blob_as_hex: bool = True, batch_kib=None,
+                 gzip_output: bool = False, use_bom: bool = False,
+                 include_auto_increment: bool = True, strip_generated: bool = False,
+                 cancel_flag: threading.Event = None):
+        super().__init__()
+        self._db = db_service
+        self._table_opts = table_opts
+        self._file_path = file_path
+        self._format = export_format
+        self._blob_as_hex = blob_as_hex
+        self._batch_kib = batch_kib
+        self._gzip = gzip_output
+        self._bom = use_bom
+        self._include_auto_increment = include_auto_increment
+        self._strip_generated = strip_generated
+        self._flag = cancel_flag
+
+    def _produce_rows(self, q, done):
+        """Producer thread body for 'sql'/'csv'/'xml': walks *table_opts* in
+        order, pushing structure/drop/row-chunk items. For csv/xml,
+        ExportScopeDialog already forces structure/drop to False, so this
+        is shared unchanged between all three formats. Generated columns
+        are always dropped from SQL content rows (issue #160) — they can't
+        appear in an INSERT column list — but left alone for csv/xml, where
+        their computed values are legitimate exportable data."""
+        dialect = self._db.db_type
+        try:
+            for table, opts in self._table_opts.items():
+                if self._flag.is_set():
+                    break
+                try:
+                    if opts.get("drop"):
+                        q.put(("drop", table, drop_table_statement(table, dialect)))
+                    if opts.get("structure"):
+                        ddl = self._db.get_table_ddl(table)
+                        if not self._include_auto_increment:
+                            ddl = strip_auto_increment_value(ddl)
+                        if self._strip_generated:
+                            ddl = strip_generated_column_clauses(ddl)
+                        q.put(("structure", table, ddl))
+                    if opts.get("content"):
+                        generated = set(self._db.get_generated_columns(table)) if self._format == "sql" else set()
+                        for columns, rows in self._db.stream_table_rows(table):
+                            if self._flag.is_set():
+                                break
+                            if generated:
+                                keep = [i for i, c in enumerate(columns) if c not in generated]
+                                if len(keep) != len(columns):
+                                    columns = [columns[i] for i in keep]
+                                    rows = [tuple(r[i] for i in keep) for r in rows]
+                            q.put(("rows", table, columns, rows))
+                    q.put(("table_done", table, None))
+                except Exception as ex:
+                    q.put(("error", table, str(ex)))
+        finally:
+            q.put(done)
+
+    def _disconnect(self):
+        try:
+            self._db.disconnect()
+        except Exception:
+            pass
+
+    def _finish_or_cancel(self, failures):
+        if self._flag.is_set():
+            try:
+                os.remove(self._file_path)
+            except OSError:
+                pass
+            self.cancelled.emit()
+        else:
+            self.finished.emit(failures)
+
+    def run(self):
+        if self._format == "dot":
+            self._run_dot()
+        elif self._format in ("csv", "xml"):
+            self._run_zip()
+        else:
+            self._run_sql()
+
+    def _run_sql(self):
+        q = queue.Queue(maxsize=4)
+        done = object()
+        producer = threading.Thread(target=self._produce_rows, args=(q, done), daemon=True)
+        producer.start()
+
+        opener = gzip.open if self._gzip else open
+        failures = []
+        completed = 0
+        writer = None
+        writer_table = None
+        try:
+            with opener(self._file_path, "wt", encoding="utf-8") as fh:
+                if self._bom:
+                    fh.write("﻿")
+                while True:
+                    item = q.get()
+                    if item is done:
+                        break
+                    if self._flag.is_set():
+                        continue  # keep draining so the producer can't block forever
+                    kind = item[0]
+                    if kind == "error":
+                        failures.append(f"{item[1]}: {item[2]}")
+                        completed += 1
+                        self.progress.emit(item[1], completed)
+                    elif kind == "drop":
+                        fh.write(item[2] + "\n")
+                    elif kind == "structure":
+                        fh.write(f"-- Table: {item[1]}\n")
+                        fh.write(item[2] + "\n\n")
+                    elif kind == "rows":
+                        _, table, columns, rows = item
+                        if writer is None or writer_table != table:
+                            writer = SqlInsertStreamWriter(
+                                fh, columns, table, dialect=self._db.db_type,
+                                batch_kib=self._batch_kib, blob_as_hex=self._blob_as_hex)
+                            writer_table = table
+                        writer.write_rows(rows)
+                    elif kind == "table_done":
+                        if writer is not None and writer_table == item[1]:
+                            writer.close()
+                            fh.write("\n")
+                            writer, writer_table = None, None
+                        completed += 1
+                        self.progress.emit(item[1], completed)
+        except OSError as ex:
+            producer.join(timeout=5)
+            self._disconnect()
+            self.errored.emit(str(ex))
+            return
+
+        producer.join(timeout=5)
+        self._disconnect()
+        self._finish_or_cancel(failures)
+
+    def _run_zip(self):
+        import zipfile
+        import io as _io
+
+        q = queue.Queue(maxsize=4)
+        done = object()
+        producer = threading.Thread(target=self._produce_rows, args=(q, done), daemon=True)
+        producer.start()
+
+        ext = "csv" if self._format == "csv" else "xml"
+        failures = []
+        completed = 0
+        entry = None
+        row_writer = None
+        current_table = None
+        try:
+            with zipfile.ZipFile(self._file_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                while True:
+                    item = q.get()
+                    if item is done:
+                        break
+                    if self._flag.is_set():
+                        continue  # keep draining so the producer can't block forever
+                    kind = item[0]
+                    if kind == "error":
+                        failures.append(f"{item[1]}: {item[2]}")
+                        completed += 1
+                        self.progress.emit(item[1], completed)
+                    elif kind == "rows":
+                        _, table, columns, rows = item
+                        if row_writer is None or current_table != table:
+                            entry = _io.TextIOWrapper(
+                                zf.open(f"{table}.{ext}", "w"), encoding="utf-8", newline="")
+                            if self._bom:
+                                entry.write("﻿")
+                            row_writer = (
+                                CsvRowStreamWriter(entry, columns, blob_as_hex=self._blob_as_hex)
+                                if self._format == "csv"
+                                else XmlRowStreamWriter(entry, columns, table, blob_as_hex=self._blob_as_hex)
+                            )
+                            current_table = table
+                        row_writer.write_rows(rows)
+                    elif kind == "table_done":
+                        if row_writer is not None and current_table == item[1]:
+                            row_writer.close()
+                            entry.close()
+                            entry, row_writer, current_table = None, None, None
+                        completed += 1
+                        self.progress.emit(item[1], completed)
+        except OSError as ex:
+            producer.join(timeout=5)
+            self._disconnect()
+            self.errored.emit(str(ex))
+            return
+
+        producer.join(timeout=5)
+        self._disconnect()
+        self._finish_or_cancel(failures)
+
+    def _run_dot(self):
+        from utils.dot_export import build_dot_graph
+        tables = [t for t, opts in self._table_opts.items() if opts.get("structure")]
+        try:
+            dot_text = build_dot_graph(self._db, tables)
+        except Exception as ex:
+            self._disconnect()
+            self.errored.emit(str(ex))
+            return
+
+        opener = gzip.open if self._gzip else open
+        try:
+            with opener(self._file_path, "wt", encoding="utf-8") as fh:
+                fh.write(dot_text + "\n")
+        except OSError as ex:
+            self._disconnect()
+            self.errored.emit(str(ex))
+            return
+
+        self._disconnect()
+        if not self._flag.is_set():
+            self.progress.emit("schema", 1)
+        self._finish_or_cancel([])
 
 
 class _ClickableRow(QWidget):
@@ -349,22 +601,7 @@ class ConnectionPanel(QWidget):
         self._history_btn.setFlat(True)
         self._history_btn.clicked.connect(lambda: self._switch_sidebar(2))
 
-        _toggle_style = """
-            QPushButton {
-                background: transparent;
-                color: #8e8e93;
-                border: none;
-                border-bottom: 2px solid transparent;
-                padding: 4px 12px;
-                font-size: 12px;
-                font-weight: 600;
-            }
-            QPushButton:checked {
-                color: #e5e5ea;
-                border-bottom: 2px solid #0A84FF;
-            }
-            QPushButton:hover:!checked { color: #c7c7cc; }
-        """
+        _toggle_style = self._toggle_style_for(self.current_theme == "dark")
         self._schema_btn.setStyleSheet(_toggle_style)
         self._queries_btn.setStyleSheet(_toggle_style)
         self._history_btn.setStyleSheet(_toggle_style)
@@ -456,7 +693,9 @@ class ConnectionPanel(QWidget):
         new_tab_btn = QPushButton("＋")
         new_tab_btn.setToolTip("New query tab (Ctrl+T)")
         new_tab_btn.setFixedSize(28, 26)
-        new_tab_btn.clicked.connect(self.add_new_tab)
+        # Wrapped in a lambda — QPushButton.clicked emits a `checked` bool
+        # that would otherwise land in add_new_tab's `silent` arg.
+        new_tab_btn.clicked.connect(lambda: self.add_new_tab())
         new_tab_btn.setStyleSheet("""
             QPushButton {
                 background: #2c2c2e;
@@ -507,13 +746,14 @@ class ConnectionPanel(QWidget):
         return icon
 
     def _update_category_row_styles(self):
+        inactive_text = "#c7c7cc" if self.current_theme == "dark" else "#48484a"
         for key, row in self._category_rows.items():
             active = key == self._active_category
             row.setStyleSheet(
                 f"background: {'#0A84FF' if active else 'transparent'}; border-radius: 4px;")
             for child in row.findChildren(QLabel):
                 child.setStyleSheet(
-                    f"color: {'#ffffff' if active else '#c7c7cc'}; background: transparent;")
+                    f"color: {'#ffffff' if active else inactive_text}; background: transparent;")
 
     def _set_active_category(self, category: str):
         if category == self._active_category:
@@ -1274,15 +1514,18 @@ class ConnectionPanel(QWidget):
             self.config.get("id", ""), is_dark=(self.current_theme == "dark"), parent=self)
         dlg.exec_()
 
-    def open_table_view(self, table_name: str, force_new: bool = False):
-        """Open a table view; re-focus if already open, unless *force_new*
-        (context menu's "Open in New Tab") asks for a fresh tab regardless."""
-        if not force_new:
-            for i in range(self.tabs.count()):
-                w = self.tabs.widget(i)
-                if isinstance(w, TableViewWidget) and w.table_name == table_name:
-                    self.tabs.setCurrentIndex(i)
-                    return
+    def open_table_view(self, table_name: str, silent: bool = False):
+        """Open a table view; re-focus if already open. *silent* suppresses
+        the Free-tier tab-cap prompt for callers restoring a saved session
+        rather than acting on a click (issue #154)."""
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, TableViewWidget) and w.table_name == table_name:
+                self.tabs.setCurrentIndex(i)
+                return
+
+        if not self._under_tab_limit(silent):
+            return
 
         tv = TableViewWidget(self.db_service, table_name)
         tv.execute_query_signal.connect(self._run_query_in_tab)
@@ -1356,12 +1599,25 @@ class ConnectionPanel(QWidget):
         if self.tabs.count() == 0:
             self.add_new_tab()
 
-    def add_new_tab(self):
-        """Open a blank SQL query tab."""
-        if not require_under_limit(
-            Limit.MAX_QUERY_TABS, self.tabs.count(), "query tabs", self,
-        ):
-            return
+    def _under_tab_limit(self, silent: bool) -> bool:
+        """True if one more tab stays within Limit.MAX_QUERY_TABS — query
+        tabs and table-data tabs share this one limit (issue #154), since
+        capping only query tabs would let a Free user route around it by
+        browsing tables in unlimited tabs. *silent* checks the cap without
+        popping the upgrade dialog, for callers restoring a saved session
+        rather than acting on a click."""
+        if silent:
+            cap = entitlements.limit(Limit.MAX_QUERY_TABS)
+            return cap is None or self.tabs.count() < cap
+        return require_under_limit(Limit.MAX_QUERY_TABS, self.tabs.count(), "query tabs", self)
+
+    def add_new_tab(self, silent: bool = False):
+        """Open a blank SQL query tab. Returns the new tab, or None if the
+        tab cap (issue #154) blocked it. *silent* suppresses the upgrade
+        prompt for callers restoring a saved session rather than acting on
+        a click."""
+        if not self._under_tab_limit(silent):
+            return None
         tab = SqlTab()
         # Reparent into the real tab widget FIRST, before any other setup.
         # SqlTab() itself is a fairly heavy construction (dozens of child
@@ -1392,6 +1648,7 @@ class ConnectionPanel(QWidget):
         # Focus the editor after the tab is fully shown
         from PySide6.QtCore import QTimer
         QTimer.singleShot(0, tab.editor.setFocus)
+        return tab
 
     def _execute_commit_sql(self, sql_list: list, tab):
         """Execute inline-edit SQL statements against the live connection."""
@@ -1880,7 +2137,10 @@ class ConnectionPanel(QWidget):
         sub-tab (issue #27) — no more separate popup window to lose context in."""
         self.open_table_view(table_name)
         w = self.tabs.currentWidget()
-        if isinstance(w, TableViewWidget):
+        # A blocked tab cap (issue #154) leaves whatever tab was already
+        # active in place — only switch to Structure if it's actually the
+        # requested table, not some other tab that happened to be current.
+        if isinstance(w, TableViewWidget) and w.table_name == table_name:
             w.show_structure_tab()
 
 
@@ -1925,103 +2185,174 @@ class ConnectionPanel(QWidget):
     def export_database(self):
         """Export chosen tables' structure and/or data to a single SQL dump
         (issue #39: whole-database export, independent of any query tab).
-        Structure-only/data-only/both and which tables to include are all
-        chosen up front via ExportScopeDialog — previously this always did
-        every table's structure + data with no way to narrow either."""
-        from PySide6.QtWidgets import QFileDialog, QProgressDialog
-
+        Per-table Structure/Content/Drop and the advanced options (hex BLOBs,
+        BOM, gzip, KiB-batched INSERTs) are all chosen up front via
+        ExportScopeDialog (issue #157). The write itself streams rows off a
+        background thread, pipelined across tables (issue #158) — see
+        _run_export()/_ExportWorker."""
         all_tables = self.db_service.get_tables()
         if not all_tables:
             QMessageBox.information(self, "Export Database", "No tables to export.")
             return
 
-        scope = ExportScopeDialog(all_tables, parent=self)
+        scope = ExportScopeDialog(all_tables, dialect=self.db_service.db_type, parent=self)
         if not scope.exec():
             return
-        tables = scope.selected_tables()
-        content = scope.content_mode()
-        if not tables:
+        table_opts = scope.table_options()
+        if not table_opts:
             QMessageBox.information(self, "Export Database", "No tables selected.")
             return
 
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Export Database", "database.sql", "SQL Dump (*.sql)"
-        )
+        file_path = self._pick_export_file("Export Database", "database", scope)
         if not file_path:
             return
 
-        progress = QProgressDialog(
-            "Exporting tables…", "Cancel", 0, len(tables), self)
-        progress.setWindowTitle("Export Database")
-        progress.setMinimumDuration(0)
+        self._run_export(table_opts, file_path, scope, title="Export Database")
 
-        failures = []
+    def _pick_export_file(self, title: str, default_stem: str, scope) -> str | None:
+        """Prompt for a save path whose filter/extension matches *scope*'s
+        selected format tab (issue #159): a .sql dump, a .zip of per-table
+        CSV/XML files, or a single .dot schema diagram."""
+        from PySide6.QtWidgets import QFileDialog
+
+        fmt = scope.export_format()
+        filters = {
+            "sql": "SQL Dump (*.sql)",
+            "csv": "Zip Archive (*.zip)",
+            "xml": "Zip Archive (*.zip)",
+            "dot": "Graphviz Dot (*.dot)",
+        }
+        default_ext = {"sql": "sql", "csv": "zip", "xml": "zip", "dot": "dot"}[fmt]
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, title, f"{default_stem}.{default_ext}", filters[fmt]
+        )
+        if not file_path:
+            return None
+        if fmt in ("sql", "dot") and scope.gzip_output() and not file_path.endswith(".gz"):
+            file_path += ".gz"
+        return file_path
+
+    def _run_export(self, table_opts: dict, file_path: str, scope, title: str):
+        """Stream *table_opts* to *file_path* on a background QThread via
+        _ExportWorker (issue #158): a producer thread walks the tables and
+        pushes structure/row-chunk items onto a bounded queue while the
+        worker drains it and writes to the (optionally gzip'd) file, so
+        table N+1's fetch overlaps table N's disk/gzip flush instead of
+        running strictly sequentially. Uses a dedicated DbService connection
+        so the export never shares state with the main schema-browsing
+        connection (same reasoning as _QueryWorker's dedicated connection)."""
+        export_db = DbService()
         try:
-            with open(file_path, "w") as fh:
-                for i, table in enumerate(tables):
-                    if progress.wasCanceled():
-                        break
-                    progress.setLabelText(f"Exporting {table}…")
-                    progress.setValue(i)
-                    try:
-                        self._write_table_export(fh, table, content)
-                    except Exception as ex:
-                        failures.append(f"{table}: {ex}")
-                progress.setValue(len(tables))
-        except OSError as ex:
-            QMessageBox.critical(self, "Export Error", f"Could not write file:\n{ex}")
+            export_db.connect(self.config)
+        except Exception as ex:
+            QMessageBox.critical(self, "Export Error", f"Could not open export connection:\n{ex}")
             return
 
-        summary = f"Exported {len(tables) - len(failures)}/{len(tables)} tables to:\n{file_path}"
-        if failures:
-            summary += "\n\nFailed:\n" + "\n".join(failures)
-            QMessageBox.warning(self, "Export Database", summary)
-        else:
-            QMessageBox.information(self, "Export Database", summary)
+        export_format = scope.export_format()
+        progress_max = 1 if export_format == "dot" else len(table_opts)
+        progress = QProgressDialog("Exporting…", "Cancel", 0, progress_max, self)
+        progress.setWindowTitle(title)
+        progress.setMinimumDuration(0)
 
-    def _write_table_export(self, fh, table: str, content: str):
-        """Write *table*'s structure and/or data to the already-open file
-        handle *fh*, per content mode ('structure' | 'data' | 'both')."""
-        if content in ("structure", "both"):
+        cancel_flag = threading.Event()
+        worker = _ExportWorker(
+            export_db, table_opts, file_path, export_format=export_format,
+            blob_as_hex=scope.blob_as_hex(), batch_kib=scope.batch_kib(),
+            gzip_output=scope.gzip_output(), use_bom=scope.use_bom(),
+            include_auto_increment=scope.include_auto_increment(),
+            strip_generated=scope.strip_generated_columns(),
+            cancel_flag=cancel_flag,
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        # Keep refs alive until the thread finishes (same as _QueryWorker).
+        self._export_thread = thread
+        self._export_worker = worker
+
+        progress.canceled.connect(cancel_flag.set)
+
+        def _on_progress(table, count):
+            progress.setLabelText(f"Exporting {table}…")
+            progress.setValue(count)
+
+        def _finish(failures):
+            progress.close()
+            if export_format == "dot":
+                summary = f"Exported schema diagram to:\n{file_path}"
+            else:
+                summary = f"Exported {len(table_opts) - len(failures)}/{len(table_opts)} tables to:\n{file_path}"
+            if failures:
+                summary += "\n\nFailed:\n" + "\n".join(failures)
+                QMessageBox.warning(self, title, summary)
+            else:
+                QMessageBox.information(self, title, summary)
+
+        def _error(msg):
+            progress.close()
+            QMessageBox.critical(self, "Export Error", f"Could not write file:\n{msg}")
+
+        worker.progress.connect(_on_progress)
+        worker.finished.connect(_finish)
+        worker.errored.connect(_error)
+        worker.cancelled.connect(progress.close)
+
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        worker.finished.connect(thread.quit)
+        worker.errored.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+
+        thread.start()
+
+    def _write_table_export(self, fh, table: str, opts: dict,
+                             blob_as_hex: bool = True, batch_kib=None,
+                             include_auto_increment: bool = True, strip_generated: bool = False):
+        """Write *table*'s structure/content/drop to the already-open file
+        handle *fh*, per *opts* (`{"structure", "content", "drop"} -> bool`,
+        from ExportScopeDialog.table_options()). Generated columns are
+        always excluded from the content SELECT (issue #160) — they can't
+        appear in an INSERT column list regardless of any toggle."""
+        dialect = self.db_service.db_type
+        if opts.get("drop"):
+            fh.write(drop_table_statement(table, dialect) + "\n")
+        if opts.get("structure"):
+            ddl = self.db_service.get_table_ddl(table)
+            if not include_auto_increment:
+                ddl = strip_auto_increment_value(ddl)
+            if strip_generated:
+                ddl = strip_generated_column_clauses(ddl)
             fh.write(f"-- Table: {table}\n")
-            fh.write(self.db_service.get_table_ddl(table) + "\n\n")
-        if content in ("data", "both"):
-            df = self.db_service.execute_query(f"SELECT * FROM {table}")  # nosec B608
+            fh.write(ddl + "\n\n")
+        if opts.get("content"):
+            df = self.db_service.execute_query(
+                f"SELECT {self.db_service.content_select_list(table)} FROM {table}")  # nosec B608
             if not df.empty:
-                fh.write(_to_sql_inserts(df, table) + "\n\n")
+                fh.write(_to_sql_inserts(
+                    df, table, dialect=dialect, batch_kib=batch_kib,
+                    blob_as_hex=blob_as_hex) + "\n\n")
 
     def _export_table(self, table_name: str):
         """Export a single table without needing an open query tab (issue
-        #39). 'Data only' keeps the existing multi-format path (CSV/JSON/
-        Excel/SQL inserts via export_dataframe) — structure doesn't fit
-        those formats, so 'Structure only'/'Structure + Data' write a
-        single .sql file instead, matching export_database()'s shape."""
-        scope = ExportScopeDialog([table_name], parent=self)
+        #39), via the same per-table Structure/Content/Drop grid + advanced
+        options as export_database() (issue #157). Plain CSV/JSON/Excel/SQL
+        data-only export without the scope dialog is still available via
+        the table context menu's "Export Table Data" (_export_table_data_only)."""
+        scope = ExportScopeDialog([table_name], dialect=self.db_service.db_type, parent=self)
         if not scope.exec():
             return
-        content = scope.content_mode()
-
-        if content == "data":
-            try:
-                df = self.db_service.execute_query(f"SELECT * FROM {table_name}")  # nosec B608
-            except Exception as ex:
-                QMessageBox.critical(self, "Export Error", f"Could not read table:\n{ex}")
-                return
-            export_dataframe(self, df, f"{table_name}.csv", table_name)
+        table_opts = scope.table_options()
+        if not table_opts:
+            QMessageBox.information(self, "Export Table", "Nothing selected to export.")
             return
 
-        from PySide6.QtWidgets import QFileDialog
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Export Table", f"{table_name}.sql", "SQL Dump (*.sql)"
-        )
+        file_path = self._pick_export_file("Export Table", table_name, scope)
         if not file_path:
             return
-        try:
-            with open(file_path, "w", encoding="utf-8") as fh:
-                self._write_table_export(fh, table_name, content)
-            QMessageBox.information(self, "Export Table", f"Exported to:\n{file_path}")
-        except Exception as ex:
-            QMessageBox.critical(self, "Export Error", str(ex))
+
+        self._run_export(table_opts, file_path, scope, title="Export Table")
 
     def _import_csv_into_table(self, table_name: str):
         """Read a CSV file and INSERT all rows into *table_name*."""
@@ -2156,14 +2487,15 @@ class ConnectionPanel(QWidget):
 
     def _copy_insert_script(self, table_name: str):
         try:
-            df = self.db_service.execute_query(f"SELECT * FROM {table_name}")  # nosec B608
+            df = self.db_service.execute_query(
+                f"SELECT {self.db_service.content_select_list(table_name)} FROM {table_name}")  # nosec B608
         except Exception as ex:
             QMessageBox.critical(self, "Copy Script Error", f"Could not read table:\n{ex}")
             return
         if df.empty:
             QMessageBox.information(self, "Copy Script", f"'{table_name}' has no rows to script.")
             return
-        QApplication.clipboard().setText(_to_sql_inserts(df, table_name))
+        QApplication.clipboard().setText(_to_sql_inserts(df, table_name, dialect=self.db_service.db_type))
 
     def _export_table_data_only(self, table_name: str):
         """Export just the rows (context menu's "Export Table Data") without
@@ -2178,8 +2510,8 @@ class ConnectionPanel(QWidget):
 
     def _export_table_as_sql(self, table_name: str):
         """Export structure + data as a single .sql file (context menu's
-        "Export Table as SQL") — skips ExportScopeDialog since both are
-        implied, reusing _write_table_export()'s 'both' path."""
+        "Export Table as SQL") — skips ExportScopeDialog since structure and
+        content are both implied, no drop, safe/default advanced options."""
         from PySide6.QtWidgets import QFileDialog
         file_path, _ = QFileDialog.getSaveFileName(
             self, "Export Table as SQL", f"{table_name}.sql", "SQL Dump (*.sql)"
@@ -2188,7 +2520,7 @@ class ConnectionPanel(QWidget):
             return
         try:
             with open(file_path, "w", encoding="utf-8") as fh:
-                self._write_table_export(fh, table_name, "both")
+                self._write_table_export(fh, table_name, {"structure": True, "content": True, "drop": False})
             QMessageBox.information(self, "Export Table as SQL", f"Exported to:\n{file_path}")
         except Exception as ex:
             QMessageBox.critical(self, "Export Error", str(ex))
@@ -2370,21 +2702,32 @@ class ConnectionPanel(QWidget):
         dialog.item_selected.connect(self._on_quick_search)
         dialog.exec()
 
-    def _active_sql_tab(self) -> SqlTab:
-        """Return the current tab if it's a SQL editor, else open a new one."""
+    def _active_sql_tab(self):
+        """Return the current tab if it's a SQL editor, else the most
+        recently opened SQL tab, else a fresh one. Returns None only if
+        there's no existing SQL tab to fall back to *and* the Free-tier tab
+        cap (issue #154) blocks opening a new one — callers must handle
+        that case rather than assume a tab is always available."""
         current = self.tabs.currentWidget()
         if isinstance(current, SqlTab):
             return current
-        self.add_new_tab()
-        return self.tabs.currentWidget()
+        for i in range(self.tabs.count() - 1, -1, -1):
+            w = self.tabs.widget(i)
+            if isinstance(w, SqlTab):
+                return w
+        return self.add_new_tab()
 
     def _on_quick_search(self, item_type, display_text, payload):
         if item_type in ("table", "view"):
             self.open_table_view(display_text)
         elif item_type == "history":
-            self._active_sql_tab().set_query(payload)
+            tab = self._active_sql_tab()
+            if tab:
+                tab.set_query(payload)
         else:  # function, column, snippet — insert at cursor
-            self._active_sql_tab().insert_text_at_cursor(payload or display_text)
+            tab = self._active_sql_tab()
+            if tab:
+                tab.insert_text_at_cursor(payload or display_text)
 
     # ─── Query history ────────────────────────────────────────────────────────
 
@@ -2393,7 +2736,9 @@ class ConnectionPanel(QWidget):
         if dialog.exec():
             query = dialog.get_selected_query()
             if query:
-                self._active_sql_tab().set_query(query)
+                tab = self._active_sql_tab()
+                if tab:
+                    tab.set_query(query)
 
     # ─── Sidebar schema/history toggle ─────────────────────────────────────────
 
@@ -2431,7 +2776,10 @@ class ConnectionPanel(QWidget):
         query = item.data(Qt.UserRole)
         if not query:
             return
-        self._active_sql_tab().set_query(query)
+        tab = self._active_sql_tab()
+        if not tab:
+            return
+        tab.set_query(query)
         self._switch_sidebar(0)
 
     def _clear_history(self):
@@ -2535,7 +2883,10 @@ class ConnectionPanel(QWidget):
         query = entry.get("query", "")
         if not query:
             return
-        self._active_sql_tab().set_query(query)
+        tab = self._active_sql_tab()
+        if not tab:
+            return
+        tab.set_query(query)
         self._switch_sidebar(0)
 
     def _show_saved_query_menu(self, entry: dict, anchor: QPushButton):
@@ -2590,8 +2941,10 @@ class ConnectionPanel(QWidget):
         if dialog.exec():
             query = dialog.get_selected_query()
             if query:
-                self._active_sql_tab().set_query(query)
-                self._switch_sidebar(0)
+                tab = self._active_sql_tab()
+                if tab:
+                    tab.set_query(query)
+                    self._switch_sidebar(0)
         self._reload_queries_list(self._queries_search.text())
 
     # ─── Table filter ─────────────────────────────────────────────────────────
@@ -2607,10 +2960,11 @@ class ConnectionPanel(QWidget):
         query = raw.lower()
 
         # ── Reset all items ───────────────────────────────────────────────────
+        default_color = ThemeManager.D_TEXT if self.current_theme == "dark" else ThemeManager.L_TEXT
         for name, item in items_map.items():
             item.setHidden(False)
             item.setText(0, name)   # clear previous highlight
-            item.setForeground(0, QBrush(QColor("#e5e5ea")))
+            item.setForeground(0, QBrush(QColor(default_color)))
 
         if not query:
             return
@@ -2717,9 +3071,46 @@ class ConnectionPanel(QWidget):
                 QPushButton:pressed { background-color: #007AFF22; }
             """)
 
+    @staticmethod
+    def _toggle_style_for(is_dark: bool) -> str:
+        """QSS for the Schema/Queries/History toggle buttons — set directly
+        per-widget (not via the app-level theme stylesheet), so it has to be
+        regenerated on every theme switch rather than relying on the QSS
+        cascade to pick up the new palette."""
+        if is_dark:
+            text, checked, hover = "#8e8e93", "#e5e5ea", "#c7c7cc"
+        else:
+            text, checked, hover = "#6e6e73", "#1c1c1e", "#3a3a3c"
+        return f"""
+            QPushButton {{
+                background: transparent;
+                color: {text};
+                border: none;
+                border-bottom: 2px solid transparent;
+                padding: 4px 12px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QPushButton:checked {{
+                color: {checked};
+                border-bottom: 2px solid #0A84FF;
+            }}
+            QPushButton:hover:!checked {{ color: {hover}; }}
+        """
+
     def update_theme(self, is_dark: bool):
         self.current_theme = "dark" if is_dark else "light"
         self._apply_pill_style()
+        # Schema tree item text color, and the category-row / sidebar-toggle
+        # label colors below, are all set directly (not via the app-level
+        # theme stylesheet), so each has to be explicitly refreshed here
+        # rather than relying on the QSS cascade to pick up the new palette.
+        self.filter_tables(self.table_search.text())
+        self._update_category_row_styles()
+        toggle_style = self._toggle_style_for(is_dark)
+        self._schema_btn.setStyleSheet(toggle_style)
+        self._queries_btn.setStyleSheet(toggle_style)
+        self._history_btn.setStyleSheet(toggle_style)
 
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
@@ -2746,20 +3137,27 @@ class ConnectionPanel(QWidget):
         return result
 
     def restore_session_tabs(self, tabs: list):
-        """Reopen tabs from saved session data."""
+        """Reopen tabs from saved session data. Stops once the tab cap
+        (issue #154 — query tabs and table tabs share Limit.MAX_QUERY_TABS)
+        is hit, rather than repeatedly failing (or popping the upgrade
+        prompt) for the rest of a silent startup restore — a Free session
+        saved with more tabs than the cap simply restores as many as fit."""
         for tab in tabs:
             try:
                 if tab.get("type") == "table":
                     name = tab.get("name", "")
                     if name in self.all_tables:
-                        self.open_table_view(name)
+                        if not self._under_tab_limit(silent=True):
+                            break
+                        self.open_table_view(name, silent=True)
                 elif tab.get("type") == "query":
-                    self.add_new_tab()
-                    idx = self.tabs.count() - 1
-                    w = self.tabs.widget(idx)
+                    w = self.add_new_tab(silent=True)
+                    if w is None:
+                        break
+                    idx = self.tabs.indexOf(w)
                     label = tab.get("name", f"Tab {idx + 1}")
                     self.tabs.setTabText(idx, label)
-                    if hasattr(w, "set_query") and tab.get("query"):
+                    if tab.get("query"):
                         w.set_query(tab["query"])
                     if tab.get("pinned") and hasattr(w, 'pin_btn'):
                         w.pin_btn.setChecked(True)
@@ -2852,17 +3250,20 @@ class ConnectionPanel(QWidget):
         _pt.save(all_pinned)
 
     def restore_pinned_tabs(self):
-        """Reopen pinned tabs from pinned_tabs.json (called on startup)."""
+        """Reopen pinned tabs from pinned_tabs.json (called on startup).
+        Stops once the Free-tier tab cap (issue #154) is hit — same
+        silent-restore treatment as restore_session_tabs."""
         from utils import pinned_tabs as _pt
         conn_name = self.label
         pinned_list = _pt.load().get(conn_name, [])
         for entry in pinned_list:
-            self.add_new_tab()
-            idx = self.tabs.count() - 1
-            w = self.tabs.widget(idx)
+            w = self.add_new_tab(silent=True)
+            if w is None:
+                break
+            idx = self.tabs.indexOf(w)
             name = entry.get("name", f"Tab {idx + 1}")
             self.tabs.setTabText(idx, f"★ {name}")
-            if hasattr(w, 'set_query') and entry.get('query'):
+            if entry.get('query'):
                 w.set_query(entry['query'])
             if hasattr(w, 'pin_btn'):
                 w.pin_btn.setChecked(True)

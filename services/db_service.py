@@ -257,7 +257,12 @@ class DbService:
         if not db_path:
             raise Exception("SQLite database path is required")
 
-        self.connection = sqlite3.connect(db_path)
+        # check_same_thread=False: DbService connections are routinely handed
+        # to a background QThread (_QueryWorker, _ExportWorker) after being
+        # opened on the main thread, and an export's producer thread hops
+        # once more — a single DbService is still only ever touched by one
+        # thread at a time, just not always the thread that opened it.
+        self.connection = sqlite3.connect(db_path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
 
         if config.get("read_only"):
@@ -635,6 +640,52 @@ class DbService:
             pass
         return []
 
+    def get_generated_columns(self, table_name: str) -> list[str]:
+        """Column names that are computed (`GENERATED ALWAYS AS`/STORED or
+        VIRTUAL) and therefore can't appear in an INSERT column list (issue
+        #160). Empty list — not an error — on any dialect/version that
+        doesn't expose this, meaning "believed to have none"."""
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+                rows = cursor.fetchall()
+                cursor.close()
+                return [r["Field"] for r in rows if "GENERATED" in (r.get("Extra") or "").upper()]
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = %s AND is_generated = 'ALWAYS'",
+                    (table_name,),
+                )
+                rows = cursor.fetchall()
+                cursor.close()
+                return [r[0] for r in rows]
+            elif self.db_type == "sqlite":
+                # PRAGMA table_xinfo adds a `hidden` column PRAGMA table_info
+                # lacks: 2 = VIRTUAL generated, 3 = STORED generated.
+                cursor = self.connection.cursor()
+                cursor.execute(f"PRAGMA table_xinfo({table_name})")
+                rows = cursor.fetchall()
+                cursor.close()
+                return [r[1] for r in rows if r[6] in (2, 3)]
+        except Exception:
+            pass
+        return []
+
+    def content_select_list(self, table_name: str) -> str:
+        """Column list for a content-export `SELECT`, with generated
+        columns excluded (issue #160) — they can't appear in the INSERT
+        statements built from that data anyway, so there's no point
+        exporting them. `"*"` when the table has none (or the dialect can't
+        tell)."""
+        generated = set(self.get_generated_columns(table_name))
+        if not generated:
+            return "*"
+        cols = [c["Field"] for c in self.get_columns(table_name) if c["Field"] not in generated]
+        return ", ".join(cols) if cols else "*"
+
     def _fetch_rows(self, cursor, max_rows):
         """fetchall(), or fetchmany(max_rows) with one extra row peeked to
         detect truncation without pulling the whole result set first."""
@@ -642,6 +693,34 @@ class DbService:
             return cursor.fetchall(), False
         rows = cursor.fetchmany(max_rows + 1)
         return rows[:max_rows], len(rows) > max_rows
+
+    def stream_table_rows(self, table_name: str, chunk_size: int = 2000):
+        """Yield (columns, rows) chunks for `SELECT * FROM table_name`, read
+        via cursor.fetchmany() instead of execute_query()'s fetchall() —
+        exports use this so memory and time-to-first-byte don't scale with
+        table size (issue #158). `rows` is a list of plain tuples in column
+        order regardless of dialect (mysql's cursor yields dicts, sqlite
+        yields sqlite3.Row, postgres yields tuples already).
+
+        Uses this DbService's own connection directly, with no reconnect
+        logic — callers exporting in the background should pass a dedicated
+        DbService instance (as `_run_query_in_tab` already does for ad-hoc
+        queries) rather than sharing the interactive connection used for
+        schema browsing.
+        """
+        if not self.connection:
+            raise Exception("No active database connection")
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(f"SELECT * FROM {table_name}")  # nosec B608
+            columns = [d[0] for d in cursor.description]
+            while True:
+                rows = cursor.fetchmany(chunk_size)
+                if not rows:
+                    break
+                yield columns, [tuple(r.values()) if isinstance(r, dict) else tuple(r) for r in rows]
+        finally:
+            cursor.close()
 
     def _execute_query_raw(self, query, max_rows=None):
         """Internal: run a SQL statement without reconnect logic.
