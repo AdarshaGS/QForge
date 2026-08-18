@@ -109,21 +109,36 @@ class XmlRowStreamWriter:
 
 
 def _quote_identifier(name: str, dialect: str = "mysql") -> str:
+    # Doubling an embedded quote char is the standard escape for both
+    # dialects — matches _sql_value_literal's handling of embedded '.
+    # Without it, a table/column name containing a backtick/quote breaks
+    # out of the identifier context in the generated SQL (issue #162).
     if dialect == "mysql":
-        return f"`{name}`"
-    return f'"{name}"'
+        return f"`{name.replace(chr(96), chr(96) * 2)}`"
+    return f'"{name.replace(chr(34), chr(34) * 2)}"'
 
 
 def _sql_value_literal(val, dialect: str = "mysql", blob_as_hex: bool = True) -> str:
+    """Checks None/str first — the two overwhelmingly common cases in a
+    streamed export, where values are plain values from a DB cursor and
+    never real pandas NaN/NaT — before falling through to pd.isna() for
+    the remaining, rarer types (numeric NaN, NaT, Decimal, etc.) it's
+    still needed for on the DataFrame-sourced call path (_copy_insert_
+    script). Reordering only skips pd.isna() calls it would've returned
+    False from anyway (pd.isna() never returns True for a str), so this
+    is a pure speed win, not a behavior change."""
+    if val is None:
+        return "NULL"
     if isinstance(val, (bytes, bytearray)):
         if not blob_as_hex:
             return "NULL"
         hexstr = val.hex()
         return f"E'\\\\x{hexstr}'" if dialect == "postgresql" else f"X'{hexstr}'"
+    if isinstance(val, str):
+        escaped = val.replace("'", "''")
+        return f"'{escaped}'"
     if pd.isna(val):
         return "NULL"
-    if isinstance(val, str):
-        return f"'{val.replace(chr(39), chr(39) * 2)}'"
     return str(val)
 
 

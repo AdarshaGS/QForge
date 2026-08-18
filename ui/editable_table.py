@@ -1,3 +1,6 @@
+import ast
+import operator
+
 from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
@@ -13,6 +16,45 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QBrush, QShortcut, QKeySequence, QCursor
 import pandas as pd
 from utils.df_export import export_dataframe
+
+
+# ── Safe arithmetic formula evaluator (issue #161) ──────────────────────
+# Replaces a raw eval() — even with {"__builtins__": {}}, Python object
+# introspection (e.g. ().__class__.__base__.__subclasses__()) still reaches
+# arbitrary classes without needing the builtins dict, so that was never a
+# real sandbox. This whitelists an AST to exactly number literals, +/-/*/
+# //%/** and unary +/-, with no names, calls, attributes, or subscripts —
+# nothing to introspect through.
+_SAFE_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_SAFE_UNARY_OPS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+
+
+def _safe_eval_arithmetic(expr: str):
+    """Evaluate a numeric expression (digits, +-*/%**, parens) with no
+    access to names, calls, attributes, or builtins. Raises ValueError on
+    anything outside that grammar."""
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_BIN_OPS:
+            return _SAFE_BIN_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_UNARY_OPS:
+            return _SAFE_UNARY_OPS[type(node.op)](_eval(node.operand))
+        raise ValueError(f"Unsupported expression: {ast.dump(node)}")
+
+    return _eval(ast.parse(expr, mode="eval"))
 
 
 # ── Colour palette ───────────────────────────────────────────────────
@@ -1719,16 +1761,15 @@ class EditableTableWidget(QTableWidget):
                 else:
                     return str(random.random())  # nosec B311
             
-            # Try to evaluate as Python expression
+            # Try to evaluate as an arithmetic expression
             elif any(op in formula for op in ['+', '-', '*', '/', '%']):
-                # {"__builtins__": {}} blocks direct builtin access but is a
-                # known-incomplete sandbox (no-builtins-needed escapes still
-                # exist) — currently safe only because on_item_changed is
-                # never fired by programmatic grid population (see
-                # _display_data_impl's itemChanged disconnect/reconnect), so
-                # a formula only ever reaches here from the local user's own
-                # typed input. Tracked for a proper fix: issue #141.
-                result = eval(formula, {"__builtins__": {}}, {})  # nosec B307
+                # AST-whitelisted, not eval() — see _safe_eval_arithmetic
+                # (issue #161). This formula can be reached with database-
+                # sourced content (bulk column edit's {value} substitution
+                # splices in the cell's current DB value), so it must be
+                # safe for arbitrary attacker-controlled input, not just
+                # the local user's own typed formula.
+                result = _safe_eval_arithmetic(formula)
                 return str(result)
             
             return formula  # Return as-is if not recognized

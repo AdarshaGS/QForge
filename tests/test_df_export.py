@@ -1,6 +1,6 @@
 import pandas as pd
 
-from utils.df_export import _sql_value_literal, _to_sql_inserts, drop_table_statement
+from utils.df_export import _quote_identifier, _sql_value_literal, _to_sql_inserts, drop_table_statement
 
 
 def test_sql_value_literal_null_for_none_and_nan():
@@ -26,6 +26,17 @@ def test_sql_value_literal_hex_encodes_blobs_per_dialect():
 
 def test_sql_value_literal_blob_as_hex_false_falls_back_to_null():
     assert _sql_value_literal(b"\x01\xff", blob_as_hex=False) == "NULL"
+
+
+def test_quote_identifier_escapes_embedded_quote_char_per_dialect():
+    """Regression for issue #162: an embedded backtick/quote in a
+    table/column name must not break out of the identifier context."""
+    assert _quote_identifier("evil`; DROP TABLE users; --", "mysql") == \
+        "`evil``; DROP TABLE users; --`"
+    assert _quote_identifier('evil"; DROP TABLE users; --', "postgresql") == \
+        '"evil""; DROP TABLE users; --"'
+    assert _quote_identifier('evil"; DROP TABLE users; --', "sqlite") == \
+        '"evil""; DROP TABLE users; --"'
 
 
 def test_to_sql_inserts_quotes_identifiers_per_dialect():
