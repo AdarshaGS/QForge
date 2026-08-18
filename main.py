@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabBar, QStackedWidget, QPushButton, QMessageBox, QProgressDialog,
-    QMenu,
+    QMenu, QDialog, QDialogButtonBox, QTextBrowser,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon
 
@@ -481,6 +481,14 @@ class MainWindow(QMainWindow):
                 # background thread over the same shared connection.
 
                 self._add_panel(panel)
+                # ConnectionDialog just closed via dialog.exec() — on macOS
+                # that leaves no window "active" at the OS level (verified:
+                # QApplication.focusWidget() is None afterward and stays
+                # None), so the editor.setFocus() inside ensure_at_least_
+                # one_tab()/add_new_tab() below is a no-op until something
+                # reclaims window activation explicitly.
+                self.activateWindow()
+                self.raise_()
                 panel.ensure_at_least_one_tab()
                 return
 
@@ -612,6 +620,10 @@ class MainWindow(QMainWindow):
         for panel in self._panels:
             panel.restore_pinned_tabs()
             panel.ensure_at_least_one_tab()
+            # Restoring N tabs in a loop leaves the last-restored one
+            # active/focused (issue #149) — reset to tab 1 once restoration
+            # for this panel is fully done.
+            panel.focus_first_tab()
 
         logger.info("Session restored")
 
@@ -958,27 +970,52 @@ class MainWindow(QMainWindow):
     # ─── Help ────────────────────────────────────────────────────────────────
 
     def _show_shortcuts(self):
-        text = """<b>QForge Keyboard Shortcuts</b>
+        sections = [
+            ("Connections", [
+                ("Cmd+N", "Open new connection (adds a tab)"),
+            ]),
+            ("Tabs", [
+                ("Cmd+T", "New query tab"),
+                ("Cmd+W", "Close current tab"),
+            ]),
+            ("Query", [
+                ("Cmd+Return", "Run query"),
+                ("Cmd+I", "Beautify SQL"),
+                ("Cmd+Space", "Autocomplete"),
+            ]),
+            ("Navigation", [
+                ("Cmd+P", "Quick search tables, columns, views, functions, history, snippets"),
+                ("Cmd+R / F5", "Refresh current view"),
+            ]),
+            ("Application", [
+                ("Cmd+Q", "Quit"),
+            ]),
+        ]
 
-<b>Connections:</b>
-• Ctrl+N  —  Open new connection (adds a tab)
+        rows = []
+        for heading, shortcuts in sections:
+            rows.append(f'<tr><td colspan="2" style="padding-top:10px;"><b>{heading}</b></td></tr>')
+            for keys, desc in shortcuts:
+                rows.append(
+                    '<tr>'
+                    f'<td style="padding:2px 16px 2px 12px; white-space:nowrap;"><code>{keys}</code></td>'
+                    f'<td style="padding:2px 0;">{desc}</td>'
+                    '</tr>'
+                )
+        html = f'<table cellspacing="0">{"".join(rows)}</table>'
 
-<b>Tabs:</b>
-• Ctrl+T  —  New query tab
-• Ctrl+W  —  Close current tab
-
-<b>Query:</b>
-• Ctrl+Return  —  Run query
-• Ctrl+I       —  Beautify SQL
-• Ctrl+Space   —  Autocomplete
-
-<b>Navigation:</b>
-• Ctrl+P / Cmd+P  —  Quick search tables, columns, views, functions, history, snippets
-• Ctrl+R / F5     —  Refresh current view
-
-<b>Application:</b>
-• Ctrl+Q  —  Quit"""
-        QMessageBox.information(self, "Keyboard Shortcuts", text)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Keyboard Shortcuts")
+        layout = QVBoxLayout(dlg)
+        browser = QTextBrowser(dlg)
+        browser.setHtml(html)
+        browser.setOpenExternalLinks(False)
+        layout.addWidget(browser)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok, parent=dlg)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.resize(480, 420)
+        dlg.exec()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
