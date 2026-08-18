@@ -46,8 +46,8 @@ PRO_LIMITS = {
 
 PRO_ONLY_FEATURES = {"schema_compare", "advanced_erd"}
 
-PRICING_URL = "https://github.com/AdarshaGS/QForge"  # placeholder — see GitHub issue #145
-PRICE_LABEL = "$49/lifetime"  # placeholder — see GitHub issue #145
+PRICING_URL = "https://qforge-licensing-production.up.railway.app/#pricing"
+PRICE_LABEL = "$49/lifetime"
 
 PRO_BENEFITS = [
     "Unlimited connections & query tabs",

@@ -54,7 +54,7 @@ def test_apply_remote_config_overrides_only_provided_keys(tmp_path, monkeypatch)
     assert ent.price_label() == "$99/year"
     # Untouched values keep their bundled defaults.
     assert ent.limit(Limit.SAVED_QUERIES) is None
-    assert ent.pricing_url() == "https://github.com/AdarshaGS/QForge"
+    assert ent.pricing_url() == "https://qforge-licensing-production.up.railway.app/#pricing"
 
 
 def test_apply_remote_config_persists_across_a_fresh_instance(tmp_path, monkeypatch):

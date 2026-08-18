@@ -14,9 +14,8 @@ import urllib.request
 
 from utils.updater import APP_VERSION
 
-# Base URL of the deployed qforge-licensing service. Placeholder until
-# it's actually hosted — swap this one line once it is.
-LICENSING_SERVICE_URL = "https://qforge-licensing.up.railway.app"
+# Base URL of the deployed qforge-licensing service.
+LICENSING_SERVICE_URL = "https://qforge-licensing-production.up.railway.app"
 
 _TIMEOUT_SECONDS = 8
 
