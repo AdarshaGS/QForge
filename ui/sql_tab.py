@@ -1794,57 +1794,32 @@ class SqlTab(QWidget):
     def get_query_at_cursor(self):
         """Get the SQL query where the cursor is positioned"""
         full_text = self.editor.toPlainText()
-        cursor = self.editor.textCursor()
-        cursor_pos = cursor.position()
-        
+        cursor_pos = self.editor.textCursor().position()
+
         if not full_text.strip():
             return None
-        
-        # Split by semicolon to find individual queries
-        queries = []
-        current_query = ""
-        current_pos = 0
-        
-        for line in full_text.split('\n'):
-            line_len = len(line) + 1  # +1 for newline
-            
-            # Check if line contains semicolon
-            if ';' in line:
-                parts = line.split(';')
-                for i, part in enumerate(parts):
-                    current_query += part
-                    current_pos += len(part)
-                    
-                    if i < len(parts) - 1:  # Not the last part
-                        current_query += ';'
-                        current_pos += 1
-                        
-                        # Store this query with its position range
-                        if current_query.strip():
-                            queries.append((
-                                current_pos - len(current_query),
-                                current_pos,
-                                current_query.strip()
-                            ))
-                        current_query = ""
-            else:
-                current_query += line + '\n'
-                current_pos += line_len
-        
-        # Add any remaining query
-        if current_query.strip():
-            queries.append((
-                current_pos - len(current_query),
-                current_pos,
-                current_query.strip()
-            ))
-        
-        # Find which query contains the cursor
-        for start_pos, end_pos, query in queries:
-            if start_pos <= cursor_pos <= end_pos:
-                return query
-        
-        # If no query found, return None
+
+        # sqlparse.parse() is string-literal/comment aware, unlike a plain
+        # ';'.split() — it won't break a statement at a semicolon that's
+        # inside a string (e.g. WHERE msg = 'a;b') or a comment (issue #166).
+        # Statement values reconstruct the original text exactly, so summing
+        # their lengths gives correct offsets into full_text.
+        try:
+            statements = sqlparse.parse(full_text)
+        except Exception:
+            # e.g. SQLParseError on pathologically large input — fall back
+            # to running the whole editor content (get_query()'s behavior
+            # when this method returns None).
+            return None
+
+        offset = 0
+        for stmt in statements:
+            text = str(stmt)
+            start, end = offset, offset + len(text)
+            if start <= cursor_pos <= end and text.strip():
+                return text.strip()
+            offset = end
+
         return None
 
     # ── Find / Replace ────────────────────────────────────────────────────────
