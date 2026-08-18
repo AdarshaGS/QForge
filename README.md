@@ -73,6 +73,14 @@ blocking the app.
 
 ### Install and run
 
+macOS, via Homebrew:
+
+```bash
+brew install AdarshaGS/qforge/qforge
+```
+
+From source (any platform, requires Python):
+
 ```bash
 git clone https://github.com/AdarshaGS/QForge.git
 cd QForge
