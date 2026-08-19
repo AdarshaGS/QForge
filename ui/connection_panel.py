@@ -2121,6 +2121,8 @@ class ConnectionPanel(QWidget):
 
     def _open_verify_dialog(self, tab):
         """Open the Query Verifier dialog pre-populated with the current tab's query."""
+        if not require_pro(Feature.QUERY_VERIFIER, "Query Verifier", self):
+            return
         from ui.query_verifier_dialog import QueryVerifierDialog
         query = tab.get_query().strip()
         dlg = QueryVerifierDialog(self.db_service, initial_query=query, parent=self)

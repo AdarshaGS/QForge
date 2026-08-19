@@ -17,7 +17,7 @@
     "query_history": 100
   },
 
-  "pro_only_features": ["schema_compare", "advanced_erd"],
+  "pro_only_features": ["schema_compare", "advanced_erd", "query_verifier"],
 
   "pricing_url": "https://qforge-licensing-production.up.railway.app/#pricing",
   "price_label": "$49/lifetime",
@@ -28,6 +28,7 @@
     "Full query history",
     "Full ER diagrams",
     "Schema Compare",
+    "Query Verifier",
     "Priority support"
   ]
 }
