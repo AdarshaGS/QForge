@@ -13,7 +13,7 @@ import base64
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-PUBLIC_KEY_B64 = "dwTI/ti4x8wrCxuHvl7HnXQYhVcjsDHqVlP10oKFuVw="
+PUBLIC_KEY_B64 = "8CJ2Q0qdO3YYAxRfb69PXTIB6Oot1Gvx6AGvTAUJSrs="
 
 
 def verify_signature(data: bytes, signature_b64: str) -> bool:
