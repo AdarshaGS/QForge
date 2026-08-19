@@ -70,6 +70,54 @@ def test_active_connections_counts_only_live_db_service_connections():
     assert overlay._active_connections() == 2
 
 
+def test_label_has_word_wrap_enabled():
+    """Regression guard for issue #169: without word wrap, a stat line
+    wider than the fixed widget width was silently clipped instead of
+    wrapping to a second line."""
+    win = _MainWindowStub()
+    overlay = PerfOverlayWidget(win)
+    assert overlay._label.wordWrap() is True
+
+
+def test_refresh_shows_cpu_percent():
+    """Regression guard for issue #170: CPU utilization was computed for
+    the offline benchmarks but never surfaced in the live overlay."""
+    win = _MainWindowStub()
+    overlay = PerfOverlayWidget(win)
+    overlay.refresh()
+    assert "CPU:" in overlay._label.text()
+
+
+def test_refresh_shows_background_task_count():
+    """Regression guard for issue #171: no in-flight background-operation
+    indicator existed under System."""
+    win = _MainWindowStub()
+    overlay = PerfOverlayWidget(win)
+
+    overlay.refresh()
+    assert "Background tasks: idle" in overlay._label.text()
+
+    perf_metrics.task_started("schema_fetch")
+    overlay.refresh()
+    assert "Background tasks: 1 schema_fetch" in overlay._label.text()
+    perf_metrics.task_finished("schema_fetch")
+
+
+def test_refresh_shows_import_export_metrics():
+    """Regression guard for issue #172: import/export operations had no
+    instrumentation anywhere, live or offline."""
+    win = _MainWindowStub()
+    overlay = PerfOverlayWidget(win)
+
+    perf_metrics.record("import_export", "export", 3200.0)
+    perf_metrics.record("import_export", "csv_import", 850.0)
+    overlay.refresh()
+
+    text = overlay._label.text()
+    assert "Export:" in text and "3200.0" in text
+    assert "CSV import:" in text and "850.0" in text
+
+
 def test_reposition_anchors_top_right():
     win = _MainWindowStub()
     overlay = PerfOverlayWidget(win)

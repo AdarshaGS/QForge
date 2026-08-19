@@ -53,6 +53,27 @@ def test_reset_clears_samples_and_counters():
     assert perf_metrics.counter_get("schema_cache") == {}
 
 
+def test_active_tasks_tracks_started_and_finished():
+    assert perf_metrics.active_tasks() == {}
+
+    perf_metrics.task_started("schema_fetch")
+    perf_metrics.task_started("schema_fetch")
+    perf_metrics.task_started("export")
+    assert perf_metrics.active_tasks() == {"schema_fetch": 2, "export": 1}
+
+    perf_metrics.task_finished("schema_fetch")
+    assert perf_metrics.active_tasks() == {"schema_fetch": 1, "export": 1}
+
+    perf_metrics.task_finished("schema_fetch")
+    perf_metrics.task_finished("export")
+    assert perf_metrics.active_tasks() == {}
+
+
+def test_task_finished_without_started_does_not_go_negative():
+    perf_metrics.task_finished("nonexistent")
+    assert perf_metrics.active_tasks() == {}
+
+
 def test_record_is_thread_safe_under_concurrent_writers():
     def writer(n):
         for i in range(50):

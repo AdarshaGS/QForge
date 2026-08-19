@@ -1,4 +1,5 @@
 import re as _re
+import time
 import pandas as pd
 import sqlparse
 
@@ -31,6 +32,7 @@ from ui.sql_highlighter import SqlHighlighter
 from ui.sql_completer import SqlCompleter
 from ui.editable_table import EditableTableWidget
 from utils.df_export import export_dataframe
+from utils import perf_metrics
 from ui.column_filter_dialog import ColumnFilterDialog
 from ui.theme_manager import ThemeManager
 from ui.snippet_manager import SnippetManager
@@ -1508,6 +1510,7 @@ class SqlTab(QWidget):
         if not file_name:
             return
 
+        _import_t0 = time.perf_counter()
         try:
             # Determine format from file extension
             if file_name.endswith('.csv'):
@@ -1529,6 +1532,7 @@ class SqlTab(QWidget):
 
             # Load the imported data into the table
             self.load_dataframe(df)
+            perf_metrics.record("import_export", "file_import", (time.perf_counter() - _import_t0) * 1000)
             self.status_label.setPlainText(f"Imported {len(df)} rows from {format_name} file")
             self.status_label.setFixedHeight(28)
 

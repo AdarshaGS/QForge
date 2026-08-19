@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 
 from services.db_service import DbService
 from ui.connection_panel import _ExportWorker
+from utils import perf_metrics
 
 _app = QApplication.instance() or QApplication([])
 
@@ -73,6 +74,23 @@ def test_writes_structure_and_content_for_every_table(db_path, tmp_path):
     assert "INSERT INTO \"users\"" in text
     assert "INSERT INTO \"orders\"" in text
     assert events["progress"] == [("users", 1), ("orders", 2)]
+
+
+def test_run_records_perf_metrics_and_clears_active_task(db_path, tmp_path):
+    """Regression guard for issue #172 (timing) and #171 (in-flight
+    gauge): run() must record duration under import_export/export and
+    never leave the task marked as still in-flight after it returns."""
+    perf_metrics.reset()
+    out = str(tmp_path / "out.sql")
+    opts = {"users": {"structure": False, "content": True, "drop": False}}
+
+    _run(db_path, opts, out)
+
+    assert perf_metrics.active_tasks() == {}
+    stats = perf_metrics.snapshot().get("import_export", {}).get("export")
+    assert stats is not None
+    assert stats["count"] == 1
+    assert stats["last"] >= 0
 
 
 def test_drop_statement_written_when_requested(db_path, tmp_path):

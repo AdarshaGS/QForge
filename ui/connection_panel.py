@@ -268,12 +268,18 @@ class _ExportWorker(QObject):
             self.finished.emit(failures)
 
     def run(self):
-        if self._format == "dot":
-            self._run_dot()
-        elif self._format in ("csv", "xml"):
-            self._run_zip()
-        else:
-            self._run_sql()
+        perf_metrics.task_started("export")
+        _t0 = time.perf_counter()
+        try:
+            if self._format == "dot":
+                self._run_dot()
+            elif self._format in ("csv", "xml"):
+                self._run_zip()
+            else:
+                self._run_sql()
+        finally:
+            perf_metrics.task_finished("export")
+            perf_metrics.record("import_export", "export", (time.perf_counter() - _t0) * 1000)
 
     def _run_sql(self):
         q = queue.Queue(maxsize=4)
@@ -1019,6 +1025,7 @@ class ConnectionPanel(QWidget):
         self._schema_fetch_t0 = time.perf_counter()
 
         def _worker():
+            perf_metrics.task_started("schema_fetch")
             try:
                 sig_done.emit(fetch_schema_snapshot(
                     conf, on_tables_ready=lambda t, c: sig_fast.emit(t, c)))
@@ -1028,6 +1035,8 @@ class ConnectionPanel(QWidget):
                 if msg in ("(0, '')", "0", "") or "not connected" in msg.lower():
                     return  # connection not ready yet — no error shown
                 sig_error.emit(msg)
+            finally:
+                perf_metrics.task_finished("schema_fetch")
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -2506,6 +2515,7 @@ class ConnectionPanel(QWidget):
             tuple(None if v == "" else v for v in row)
             for row in df.itertuples(index=False, name=None)
         ]
+        _import_t0 = time.perf_counter()
         try:
             inserted, errors = self.db_service.execute_batch(
                 insert_sql, rows,
@@ -2518,6 +2528,7 @@ class ConnectionPanel(QWidget):
             return
         finally:
             progress.close()
+            perf_metrics.record("import_export", "csv_import", (time.perf_counter() - _import_t0) * 1000)
 
         msg = f"Imported <b>{inserted:,}</b> rows into <b>{table_name}</b>."
         if errors:

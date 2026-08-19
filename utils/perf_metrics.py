@@ -17,6 +17,7 @@ from collections import deque
 _LOCK = threading.Lock()
 _SAMPLES: dict[tuple[str, str], deque] = {}
 _COUNTERS: dict[str, dict[str, int]] = {}
+_ACTIVE_TASKS: dict[str, int] = {}
 
 _MAX_SAMPLES = 50
 
@@ -46,6 +47,26 @@ def counter_get(name: str) -> dict[str, int]:
         return dict(_COUNTERS.get(name, {}))
 
 
+def task_started(name: str) -> None:
+    """Mark one background operation of *name* (e.g. "schema_fetch",
+    "export") as started — a live in-flight gauge, not a rolling sample
+    (issue #171). Always pair with task_finished() in a try/finally."""
+    with _LOCK:
+        _ACTIVE_TASKS[name] = _ACTIVE_TASKS.get(name, 0) + 1
+
+
+def task_finished(name: str) -> None:
+    with _LOCK:
+        _ACTIVE_TASKS[name] = max(0, _ACTIVE_TASKS.get(name, 0) - 1)
+
+
+def active_tasks() -> dict[str, int]:
+    """name -> count of currently in-flight operations, omitting any name
+    whose count has dropped back to zero."""
+    with _LOCK:
+        return {k: v for k, v in _ACTIVE_TASKS.items() if v > 0}
+
+
 def snapshot() -> dict[str, dict[str, dict]]:
     """category -> name -> {last, mean, p95, count}, for the overlay to poll."""
     with _LOCK:
@@ -71,3 +92,4 @@ def reset() -> None:
     with _LOCK:
         _SAMPLES.clear()
         _COUNTERS.clear()
+        _ACTIVE_TASKS.clear()
