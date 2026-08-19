@@ -4,6 +4,7 @@ import uuid
 
 from utils import credential_store
 from utils import environment
+from utils import onboarding
 from utils.logger import get_logger
 from utils.paths import app_data_dir
 from ui.theme_manager import ThemeManager
@@ -120,6 +121,15 @@ class ConnectionDialog(QDialog):
         self.connection_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.connection_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         left_layout.addWidget(self.connection_tree)
+
+        # Annotated empty state (issue #164) — a first-time user's only
+        # in-app path to discovering SSH tunnels, the SQL editor, and the
+        # differentiator features (Schema Compare, Query Verifier) beyond
+        # the bare "add a connection" form on the right. Static copy, not
+        # an interactive tour: those features live in the main window,
+        # which doesn't exist yet at this point in a fresh install.
+        self._first_run_hint = self._build_first_run_hint()
+        left_layout.addWidget(self._first_run_hint)
 
         new_conn_btn = QPushButton("+ New Connection")
         new_conn_btn.setToolTip("Clear form to create a new connection")
@@ -669,12 +679,57 @@ class ConnectionDialog(QDialog):
                 self._restrict_permissions(self.CONNECTION_FILE)
                 break
 
+    def _build_first_run_hint(self) -> QWidget:
+        box = QWidget()
+        box.setStyleSheet(
+            "QWidget { background: #1c2733; border: 1px solid #2f3f4f; border-radius: 6px; }"
+        )
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(10, 10, 10, 8)
+        outer.setSpacing(6)
+
+        header_row = QHBoxLayout()
+        title = QLabel("Once you're connected")
+        title.setStyleSheet("font-size: 12px; font-weight: bold; color: #9fc9ff; border: none;")
+        header_row.addWidget(title)
+        header_row.addStretch()
+        dismiss_btn = QPushButton("✕")
+        dismiss_btn.setFixedSize(18, 18)
+        dismiss_btn.setToolTip("Dismiss")
+        dismiss_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; color: #8e8e93; font-size: 12px; }"
+            "QPushButton:hover { color: #e5e5ea; }"
+        )
+        dismiss_btn.clicked.connect(self._dismiss_first_run_hint)
+        header_row.addWidget(dismiss_btn)
+        outer.addLayout(header_row)
+
+        body = QLabel(
+            "🔌  SSH tunnel support for remote databases\n"
+            "▶  Schema-aware SQL autocomplete\n"
+            "🔍  Schema Compare & Query Verifier"
+        )
+        body.setStyleSheet("font-size: 11px; color: #c7c7cc; border: none;")
+        body.setWordWrap(True)
+        outer.addWidget(body)
+
+        return box
+
+    def _dismiss_first_run_hint(self):
+        onboarding.dismiss_connection_hint()
+        self._update_first_run_hint_visibility()
+
+    def _update_first_run_hint_visibility(self):
+        show = not self.connections and not onboarding.is_connection_hint_dismissed()
+        self._first_run_hint.setVisible(show)
+
     def load_connections(self):
         self._migrate_legacy_connections()
         self.connection_tree.clear()
         self.connections = []
 
         if not os.path.exists(self.CONNECTION_FILE):
+            self._update_first_run_hint_visibility()
             return
 
         try:
@@ -682,6 +737,7 @@ class ConnectionDialog(QDialog):
                 raw = json.load(f)
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
+            self._update_first_run_hint_visibility()
             return
         if not isinstance(raw, list):
             raw = []
@@ -742,6 +798,7 @@ class ConnectionDialog(QDialog):
 
         # Refresh the group combo with all known group names
         self._populate_group_combo()
+        self._update_first_run_hint_visibility()
 
     def _populate_group_combo(self):
         """Rebuild the group combo items from all saved connections."""
