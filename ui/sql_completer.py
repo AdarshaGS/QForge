@@ -853,6 +853,32 @@ class SqlCompleter:
         while i > 0 and (query[i - 1].isalnum() or query[i - 1] in '_.'):
             i -= 1
 
+        # A multi-word completion (e.g. "SHOW PROCESSLIST", "ORDER BY") can
+        # match on a substring of just its *last* word (_score's `pl in nl`
+        # contains-check) even though the user already typed the leading
+        # word(s) themselves — see issue #153. Walk backward past
+        # already-typed, whitespace-separated words that case-insensitively
+        # match the completion's own leading words, so the whole phrase
+        # gets replaced instead of only the word being typed (which would
+        # otherwise leave "SHOW " on the line and insert "SHOW PROCESSLIST"
+        # right after it, duplicating "SHOW ").
+        words = completion.split(' ')
+        if len(words) > 1:
+            word_start = i
+            for w in reversed(words[:-1]):
+                j = word_start
+                while j > 0 and query[j - 1] == ' ':
+                    j -= 1
+                if j == word_start:  # no separating space — no earlier word here
+                    break
+                k = j
+                while k > 0 and (query[k - 1].isalnum() or query[k - 1] in '_.'):
+                    k -= 1
+                if query[k:j].lower() != w.lower():
+                    break
+                word_start = k
+            i = word_start
+
         cursor.setPosition(i)
         cursor.setPosition(pos, QTextCursor.KeepAnchor)
 

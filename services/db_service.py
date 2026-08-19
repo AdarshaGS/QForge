@@ -41,6 +41,57 @@ def _ensure_dsskey_stub():
         paramiko.DSSKey = _dsskey_stub_class(paramiko)
 
 
+def _lenient_read_row_from_packet(self, packet):
+    """Drop-in replacement for pymysql.connections.MySQLResult's own
+    row-decoder (copied from pymysql/connections.py, MIT licensed), with
+    one change: a column that fails strict UTF-8 decoding falls back to
+    errors='replace' instead of raising, so one bad byte in one cell shows
+    up as U+FFFD instead of aborting the entire page fetch (issue #150)."""
+    row = []
+    for encoding, converter in self.converters:
+        try:
+            data = packet.read_length_coded_string()
+        except IndexError:
+            break
+        if data is not None:
+            if encoding is not None:
+                try:
+                    data = data.decode(encoding)
+                except UnicodeDecodeError:
+                    data = data.decode(encoding, errors="replace")
+            if converter is not None:
+                data = converter(data)
+        row.append(data)
+    return tuple(row)
+
+
+def _ensure_lenient_mysql_decoding():
+    """Idempotently patch pymysql to survive non-UTF-8-clean string columns
+    (issue #150) instead of failing the whole page fetch on one bad byte.
+
+    pymysql has no public hook for this: the `conv`/decoders connection
+    param only supplies a converter that runs *after* string decoding
+    already succeeded (services/db_service.py's own read of
+    pymysql/connections.py's MySQLResult._get_descriptions confirms this —
+    TEXT/VARCHAR columns get converter=None). The actual `data.decode(encoding)`
+    call is hardcoded, strict, inside the private
+    MySQLResult._read_row_from_packet. Patching that one method (rather
+    than subclassing Connection/MySQLResult) covers both of pymysql's
+    internal call sites that construct MySQLResult, since they all share
+    this one class method.
+
+    Guarded so a future pymysql release that reshapes this internal doesn't
+    crash QForge on import — it just silently loses the lenient-decode
+    behavior and pymysql's original strict behavior returns."""
+    try:
+        import pymysql.connections as _pymysql_connections
+        if not hasattr(_pymysql_connections.MySQLResult, '_read_row_from_packet'):
+            return
+        _pymysql_connections.MySQLResult._read_row_from_packet = _lenient_read_row_from_packet
+    except Exception as ex:
+        logger.warning(f"Could not patch pymysql for lenient decoding: {ex}")
+
+
 class ReadOnlyViolation(Exception):
     """Raised when a write statement is attempted on a read-only connection.
     This is the backstop guard — always active regardless of which UI entry
@@ -162,6 +213,7 @@ class DbService:
     
     def _connect_mysql(self, config):
         """Connect to MySQL database"""
+        _ensure_lenient_mysql_decoding()
         # Check if SSH tunnel is needed
         ssh_tunnel_config = config.get("ssh_tunnel", {"enabled": False})
         

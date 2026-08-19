@@ -791,6 +791,21 @@ class SqlTab(QWidget):
                 return True
             return False   # let QLineEdit handle other keys
 
+        # self.esc_shortcut (bare "Esc", WindowShortcut context) is matched
+        # by Qt's shortcut dispatch *before* a real KeyPress is ever
+        # delivered to self.editor — via a ShortcutOverride event sent to
+        # the focus widget first. self.editor never claims it, so Escape
+        # always fired hide_filter() and the KeyPress-based Key_Escape
+        # branch below never ran while the popup was visible (issue #152).
+        # Claiming ShortcutOverride for that one case pre-empts the
+        # shortcut so the real KeyPress reaches the handling below instead;
+        # every other Escape (popup not visible) still falls through to
+        # the shortcut exactly as before.
+        if (obj is self.editor and event.type() == event.Type.ShortcutOverride
+                and event.key() == Qt.Key_Escape and self.completer.popup_visible):
+            event.accept()
+            return True
+
         if obj != self.editor or event.type() != event.Type.KeyPress:
             return super().eventFilter(obj, event)
 
