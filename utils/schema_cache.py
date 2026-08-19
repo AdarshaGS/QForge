@@ -15,6 +15,7 @@ import time
 
 from utils.logger import get_logger
 from utils.paths import app_data_dir
+from utils import perf_metrics
 
 logger = get_logger()
 
@@ -44,7 +45,9 @@ def load(connection_id: str, database: str) -> dict | None:
     if not connection_id:
         return None
     try:
-        return _read_all().get(_key(connection_id, database))
+        entry = _read_all().get(_key(connection_id, database))
+        perf_metrics.counter_inc("schema_cache", "hit" if entry is not None else "miss")
+        return entry
     except Exception as ex:
         logger.warning(f"Failed to load schema cache from {_FILE}: {ex}")
     return None

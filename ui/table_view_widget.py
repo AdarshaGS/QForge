@@ -20,7 +20,9 @@ from ui.theme_manager import ThemeManager
 
 from ui.sql_tab import SqlTab
 from utils.logger import get_logger
+from utils import perf_metrics
 import pandas as pd
+import time
 
 logger = get_logger()
 
@@ -461,6 +463,7 @@ class TableViewWidget(QWidget):
 
     def load_table_data(self):
         """Load the current page for current filter and sort, refreshing row count"""
+        _page_load_t0 = time.perf_counter()
         try:
             # A real COUNT(*) — MySQL's INFORMATION_SCHEMA.TABLES.TABLE_ROWS
             # looked appealingly fast, but it's only an approximate
@@ -537,6 +540,8 @@ class TableViewWidget(QWidget):
                 df = pd.DataFrame(columns=self.columns)
             
             self.data_table.load_data(df, table_name=self.table_name)
+            perf_metrics.record("result_grid", "page_load", (time.perf_counter() - _page_load_t0) * 1000)
+            perf_metrics.record("result_grid", "rows_rendered", len(df))
             # load_data() resets the grid's own sort state — restore it so
             # the header shows the arrow/highlight for the column this page
             # was actually ordered by (sorting itself is done server-side,

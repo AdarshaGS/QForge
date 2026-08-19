@@ -1,8 +1,10 @@
+import time
 import pymysql
 import pandas as pd
 import sqlite3
 from utils.logger import get_logger
 from utils import schema_cache
+from utils import perf_metrics
 from services import query_classifier
 
 logger = get_logger()
@@ -197,6 +199,7 @@ class DbService:
 
         logger.info(f"Connecting to {db_type} database: {config['name']}")
 
+        _connect_t0 = time.perf_counter()
         if db_type == "mysql":
             self._connect_mysql(config)
         elif db_type == "postgresql":
@@ -205,6 +208,7 @@ class DbService:
             self._connect_sqlite(config)
         else:
             raise Exception(f"Unsupported database type: {db_type}")
+        perf_metrics.record("database", "db_connect", (time.perf_counter() - _connect_t0) * 1000)
 
         self.connection_name = config["name"]
         self._config = config   # save for reconnect

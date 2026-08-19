@@ -50,6 +50,7 @@ from services.entitlements import Feature, Limit, entitlements
 from utils.logger import get_logger
 from utils import environment
 from utils import schema_cache
+from utils import perf_metrics
 from utils.df_export import (
     export_dataframe, _to_sql_inserts, drop_table_statement,
     SqlInsertStreamWriter, CsvRowStreamWriter, XmlRowStreamWriter,
@@ -516,6 +517,7 @@ class ConnectionPanel(QWidget):
         self._schema_status_item = None
         self._schema_tables_seen = 0
         self._schema_retry_item = None
+        self._schema_fetch_t0 = None  # perf_metrics: set by _spawn_schema_fetch, read by _on_schema_loaded
         self._notify_schema_refresh = False
 
         # Wire bridge signals → main-thread handlers (connected once here so
@@ -1014,6 +1016,7 @@ class ConnectionPanel(QWidget):
         sig_done  = self._schema_done
         sig_error = self._schema_error
         sig_fast  = self._schema_fast
+        self._schema_fetch_t0 = time.perf_counter()
 
         def _worker():
             try:
@@ -1081,6 +1084,9 @@ class ConnectionPanel(QWidget):
     def _on_schema_loaded(self, result: dict):
         """Main-thread: populate the schema tree from background result."""
         self._stop_schema_loading_indicator()
+        if self._schema_fetch_t0 is not None:
+            perf_metrics.record("database", "schema_load", (time.perf_counter() - self._schema_fetch_t0) * 1000)
+            self._schema_fetch_t0 = None
         # Update DB list + pill
         dbs = result.get("dbs", [])
         self._available_dbs = dbs
@@ -1241,6 +1247,7 @@ class ConnectionPanel(QWidget):
         # connection mid-reconnect. The (potentially slower) schema listing
         # always runs on a background thread over its OWN dedicated
         # connection (services/schema_snapshot.py) either way.
+        _switch_t0 = time.perf_counter()
         if self.db_service.db_type == "mysql" and self.db_service.connection:
             try:
                 self.db_service.select_db(new_db)
@@ -1254,6 +1261,7 @@ class ConnectionPanel(QWidget):
             except Exception as ex:
                 self._on_schema_error(str(ex))
                 return
+        perf_metrics.record("database", "db_switch", (time.perf_counter() - _switch_t0) * 1000)
 
         # Only commit the switch to tracked state/the pill once the
         # connection has actually confirmed it. Setting these eagerly
@@ -1779,6 +1787,7 @@ class ConnectionPanel(QWidget):
 
     def _on_query_done(self, tab, df, elapsed):
         """Receives worker `done` signal via bridge — guaranteed main thread."""
+        perf_metrics.record("sql_editor", "query_execute", elapsed * 1000)
         tab._query_running = False
         self._restore_run_btn(tab)
         tab.cancel_btn.setEnabled(False)
@@ -1801,6 +1810,7 @@ class ConnectionPanel(QWidget):
 
     def _on_query_multi_done(self, tab, results: list, elapsed: float):
         """Multi-statement result handler — shows each SELECT in its own sub-tab."""
+        perf_metrics.record("sql_editor", "query_execute", elapsed * 1000)
         tab._query_running = False
         self._restore_run_btn(tab)
         tab.cancel_btn.setEnabled(False)

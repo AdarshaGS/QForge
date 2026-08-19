@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import signal
+import time
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -19,6 +20,7 @@ from ui.connection_dialog import ConnectionDialog
 from ui.connection_panel import ConnectionPanel
 from ui.license_dialog import LicenseDialog
 from ui.theme_manager import ThemeManager
+from ui.perf_overlay import PerfOverlayWidget
 from utils.logger import setup_logger, get_logger
 from utils.updater import UpdateChecker, APP_VERSION
 from utils.self_updater import UpdateInstaller, running_app_bundle_path, relaunch
@@ -28,6 +30,7 @@ from utils import install_source
 from utils.paths import app_data_dir
 from utils import environment
 from utils import schema_cache
+from utils import perf_metrics
 
 logger = setup_logger()
 
@@ -69,6 +72,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
+        # Startup-stage timing (issue #59) — read by benchmarks/bench_startup.py
+        # and shown live in the dev overlay (issue #43, ui/perf_overlay.py).
+        # Process start itself (interpreter launch, `import` of this module)
+        # happens before this constructor runs at all, so it isn't a stage
+        # here — only stages reachable from inside MainWindow are timed.
+        _startup_t0 = time.perf_counter()
+
         self._panels: list[ConnectionPanel] = []
         self.query_history = QueryHistory()
         self.saved_queries = SavedQueries()
@@ -76,9 +86,11 @@ class MainWindow(QMainWindow):
 
         self.apply_theme()
         self._init_ui()
+        perf_metrics.record("startup", "window_created", (time.perf_counter() - _startup_t0) * 1000)
 
         # Open first connection (blocks until success or user quits)
         self._prompt_new_connection(allow_cancel_quit=True)
+        perf_metrics.record("startup", "connection_manager_ready", (time.perf_counter() - _startup_t0) * 1000)
 
         # Keyboard shortcuts. Ctrl+T/P/R/N/Q are NOT bound here — each already
         # has an identical-key QAction in the menu bar (_create_menu_bar,
@@ -93,7 +105,16 @@ class MainWindow(QMainWindow):
             lambda: self._current_panel() and self._current_panel().refresh_current_view()
         )
 
+        # Developer performance overlay (issue #43) — hidden from normal
+        # users on purpose: no menu item, not in the shortcuts-help dialog.
+        # Ctrl+Shift+Alt+P toggles it; QFORGE_DEV_OVERLAY=1 auto-shows it.
+        self._perf_overlay = PerfOverlayWidget(self)
+        QShortcut(QKeySequence("Ctrl+Shift+Alt+P"), self).activated.connect(self._perf_overlay.toggle)
+        if os.environ.get("QFORGE_DEV_OVERLAY") == "1":
+            self._perf_overlay.toggle()
+
         self.restore_session()
+        perf_metrics.record("startup", "ui_interactive", (time.perf_counter() - _startup_t0) * 1000)
         self._start_update_check()
         self._start_entitlement_config_check()
 
@@ -271,6 +292,12 @@ class MainWindow(QMainWindow):
             relaunch(app_path)
 
     # ─── UI ──────────────────────────────────────────────────────────────────
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        overlay = getattr(self, "_perf_overlay", None)
+        if overlay is not None and overlay.isVisible():
+            overlay.reposition()
 
     def _init_ui(self):
         self.setWindowTitle("QForge")

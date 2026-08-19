@@ -10,6 +10,7 @@ Architecture:
 from __future__ import annotations
 
 import re
+from time import perf_counter
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal, QPoint, QSize, QRect, QTimer
@@ -21,6 +22,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QFontMetrics, QTextCursor,
 )
+
+from utils import perf_metrics
 
 # ─── Vocabulary ───────────────────────────────────────────────────────────────
 
@@ -529,7 +532,9 @@ class SqlCompleter:
         self._aliases = self._extract_aliases(query)
 
         context = self._parse_context(query, pos)
+        _t0 = perf_counter()
         items   = self._build_suggestions(prefix, context, query)
+        perf_metrics.record("sql_editor", "autocomplete_latency", (perf_counter() - _t0) * 1000)
 
         if not items:
             self.hide_popup()
