@@ -25,6 +25,7 @@ class QueryLibraryDialog(QDialog):
 
         self.saved_queries = saved_queries
         self.selected_query = None
+        self.selected_name = None
 
         self.setWindowTitle("Saved Queries")
         self.resize(800, 600)
@@ -166,7 +167,11 @@ class QueryLibraryDialog(QDialog):
             return
 
         self.selected_query = entry["query"]
+        self.selected_name = entry["name"]
         self.accept()
 
     def get_selected_query(self):
         return self.selected_query
+
+    def get_selected_name(self):
+        return self.selected_name

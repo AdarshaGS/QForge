@@ -2986,6 +2986,9 @@ class ConnectionPanel(QWidget):
         if not tab:
             return
         tab.set_query(query)
+        name = entry.get("name", "").strip()
+        if name:
+            self.tabs.setTabText(self.tabs.indexOf(tab), name)
 
     def _show_saved_query_menu(self, entry: dict, anchor: QPushButton):
         menu = QMenu(self)
@@ -3032,6 +3035,7 @@ class ConnectionPanel(QWidget):
         name, ok = QInputDialog.getText(self, "Save Query", "Name:")
         if ok and name.strip():
             self.saved_queries.add(name.strip(), query)
+            self.tabs.setTabText(self.tabs.indexOf(tab), name.strip())
             self._switch_sidebar(1)
 
     def _open_query_library(self):
@@ -3042,6 +3046,9 @@ class ConnectionPanel(QWidget):
                 tab = self._active_sql_tab()
                 if tab:
                     tab.set_query(query)
+                    name = (dialog.get_selected_name() or "").strip()
+                    if name:
+                        self.tabs.setTabText(self.tabs.indexOf(tab), name)
         self._reload_queries_list(self._queries_search.text())
 
     # ─── Table filter ─────────────────────────────────────────────────────────
