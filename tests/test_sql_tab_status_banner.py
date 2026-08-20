@@ -63,3 +63,22 @@ def test_very_long_error_is_capped_and_the_rest_is_reachable_by_scrolling():
     assert scrollbar.isVisible()
     assert scrollbar.maximum() > 0
     tab.hide()
+
+
+def test_error_plus_hint_under_the_cap_needs_no_scrolling_at_all():
+    """A too-tight fixed +16px chrome allowance let the box come out a few
+    px shorter than the actual rendered content even after the wrapped-
+    height fix above — content_h still fit under _STATUS_MAX_HEIGHT, so no
+    scrollbar should ever be needed for it, but the box was silently a
+    couple of pixels too short and clipped the last line's descenders."""
+    tab = _shown_tab()
+    msg = (
+        '(1064, "You have an error in your SQL syntax; check the manual '
+        "that corresponds to your MySQL server version for the right "
+        "syntax to use near 'fghjk' at line 1\")"
+    )
+    tab.show_error(msg, query="SHOW fghjk", elapsed=0.0)
+    _app.processEvents()
+    assert tab.status_label.height() < tab._STATUS_MAX_HEIGHT
+    assert tab.status_label.verticalScrollBar().maximum() == 0
+    tab.hide()

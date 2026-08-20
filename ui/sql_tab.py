@@ -1407,7 +1407,14 @@ class SqlTab(QWidget):
             # actual wrapped line count.
             fm = QFontMetrics(self.status_label.font())
             rect = fm.boundingRect(QRect(0, 0, width, 100_000), Qt.TextWordWrap, text)
-            content_h = rect.height() + 16
+            # +32 covers the widget's non-text chrome: the QSS "padding"
+            # each caller's stylesheet sets (up to 16px vertical, e.g.
+            # show_error's "padding: 8px 10px") plus QTextDocument's own
+            # 4px default document margin on each side (8px). Measured
+            # empirically against real render output — a too-small value
+            # here reintroduces the exact clipping this fix exists to
+            # prevent, just by a few px instead of by a full line.
+            content_h = rect.height() + 32
         else:
             # Not yet laid out (e.g. the very first call, from init_ui,
             # before the tab has a real window/width) — fall back to the
