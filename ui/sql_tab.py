@@ -3,7 +3,7 @@ import time
 import pandas as pd
 import sqlparse
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QRect
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QSizePolicy,
 )
-from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat
+from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat, QFontMetrics
 
 from ui.code_editor import CodeEditor
 from PySide6.QtGui import QTextCursor, QKeyEvent, QShortcut, QKeySequence
@@ -1378,14 +1378,47 @@ class SqlTab(QWidget):
 
 
 
+    # Cap on the status/error banner's height before it scrolls instead of
+    # growing further (issue #147, raised from 150 — a multi-line error +
+    # hint routinely exceeded that with nothing to indicate more was
+    # hidden below the fold).
+    _STATUS_MAX_HEIGHT = 300
+
     def _set_status(self, text: str, style: str = "", height: int = 28):
-        """Helper: show text in the status_label (QPlainTextEdit)."""
-        lines = text.count('\n') + 1
-        h = min(max(height, lines * 20 + 16), 150)
-        self.status_label.setFixedHeight(h)
+        """Helper: show text in the status_label (QPlainTextEdit), sized to
+        fit the text's actual wrapped height rather than just counting
+        literal '\\n's — a long single line that word-wraps across several
+        visual lines was undercounted as one, which is what let it get
+        clipped below the fixed height with no visible way to see the
+        rest (issue #147). Still capped at _STATUS_MAX_HEIGHT; anything
+        beyond that scrolls (setVerticalScrollBarPolicy(ScrollBarAsNeeded)
+        in init_ui)."""
         self.status_label.setPlainText(text)
         if style:
             self.status_label.setStyleSheet(style)
+
+        width = self.status_label.viewport().width() or self.status_label.width()
+        if width > 0:
+            # QPlainTextEdit's internal document uses QPlainTextDocumentLayout,
+            # which (unlike QTextEdit's QTextDocumentLayout) doesn't compute a
+            # meaningful wrapped size via document().setTextWidth()/.size() —
+            # it reports a near-flat height regardless of wrapping. Measuring
+            # with QFontMetrics against the same width instead gives the
+            # actual wrapped line count.
+            fm = QFontMetrics(self.status_label.font())
+            rect = fm.boundingRect(QRect(0, 0, width, 100_000), Qt.TextWordWrap, text)
+            content_h = rect.height() + 16
+        else:
+            # Not yet laid out (e.g. the very first call, from init_ui,
+            # before the tab has a real window/width) — fall back to the
+            # old literal-newline estimate. Only ever used for the short
+            # initial placeholder text; a real query error can't happen
+            # before the tab is part of a shown, sized window.
+            lines = text.count('\n') + 1
+            content_h = lines * 20 + 16
+
+        h = min(max(height, content_h), self._STATUS_MAX_HEIGHT)
+        self.status_label.setFixedHeight(int(h))
         self.status_label.show()
 
     def update_status(self, rows, execution_time, truncated=False):
@@ -1404,8 +1437,8 @@ class SqlTab(QWidget):
             """,
         )
 
-    # Fits status_label's tallest case (150px cap in _set_status) + margins.
-    _COLLAPSED_RESULT_HEIGHT = 170
+    # Fits status_label's tallest case (_STATUS_MAX_HEIGHT) + margins.
+    _COLLAPSED_RESULT_HEIGHT = _STATUS_MAX_HEIGHT + 20
 
     def _collapse_result_area(self):
         """Shrink the splitter's bottom pane to just fit the status line,
