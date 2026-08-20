@@ -2809,6 +2809,11 @@ class ConnectionPanel(QWidget):
         for i in range(self.tabs.count() - 1, -1, -1):
             w = self.tabs.widget(i)
             if isinstance(w, SqlTab):
+                # Found one, but it's not the visible tab (e.g. a table
+                # Data/Structure view is active) — bring it to front so
+                # callers that set/insert into it don't silently write to
+                # a tab the user isn't looking at (issue #175).
+                self.tabs.setCurrentWidget(w)
                 return w
         return self.add_new_tab()
 
@@ -2875,7 +2880,6 @@ class ConnectionPanel(QWidget):
         if not tab:
             return
         tab.set_query(query)
-        self._switch_sidebar(0)
 
     def _clear_history(self):
         self.query_history.queries.clear()
@@ -2982,7 +2986,6 @@ class ConnectionPanel(QWidget):
         if not tab:
             return
         tab.set_query(query)
-        self._switch_sidebar(0)
 
     def _show_saved_query_menu(self, entry: dict, anchor: QPushButton):
         menu = QMenu(self)
@@ -3039,7 +3042,6 @@ class ConnectionPanel(QWidget):
                 tab = self._active_sql_tab()
                 if tab:
                     tab.set_query(query)
-                    self._switch_sidebar(0)
         self._reload_queries_list(self._queries_search.text())
 
     # ─── Table filter ─────────────────────────────────────────────────────────
