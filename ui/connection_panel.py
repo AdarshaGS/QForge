@@ -44,6 +44,7 @@ from ui.column_selection_dialog import ColumnSelectionDialog
 from ui.theme_manager import ThemeManager
 from ui.erd_dialog import ErdDialog
 from ui.schema_compare_dialog import SchemaCompareDialog
+from ui.mock_data_dialog import MockDataDialog
 from ui import query_guard_dialog
 from ui.upgrade_dialog import require_pro, require_under_limit
 from services.entitlements import Feature, Limit, entitlements
@@ -55,6 +56,7 @@ from utils.df_export import (
     export_dataframe, _to_sql_inserts, drop_table_statement,
     SqlInsertStreamWriter, CsvRowStreamWriter, XmlRowStreamWriter,
     strip_auto_increment_value, strip_generated_column_clauses,
+    _quote_identifier,
 )
 from services import query_classifier
 from services import table_organization
@@ -1493,8 +1495,10 @@ class ConnectionPanel(QWidget):
         # ── Table operations ────────────────────────────────────────────
         clone_action = None
         truncate_action = None
+        mock_data_action = None
         if not is_view:
             clone_action = menu.addAction("Clone")
+            mock_data_action = menu.addAction("🧪 Generate Mock Data…")
         refresh_action = menu.addAction("🔄 Refresh Schema")
         refresh_action.setShortcut(QKeySequence("Ctrl+Shift+R"))  # mirrors the real global binding below
         menu.addSeparator()
@@ -1541,6 +1545,8 @@ class ConnectionPanel(QWidget):
             self._copy_insert_script(table_name)
         elif clone_action is not None and action == clone_action:
             self._clone_table(table_name)
+        elif mock_data_action is not None and action == mock_data_action:
+            self.show_mock_data_generator(table_name)
         elif action == refresh_action:
             self.load_schema(notify=True)
         elif truncate_action is not None and action == truncate_action:
@@ -2266,6 +2272,80 @@ class ConnectionPanel(QWidget):
                     self.load_schema()
             except Exception as ex:
                 QMessageBox.critical(self, "Error", str(ex))
+
+    def _sample_fk_values(self, ref_table: str, ref_column: str, limit: int = 200) -> list:
+        """Read-only sample of existing values for a foreign-key target
+        (issue #77's "Foreign-key references" generator) — a SELECT, so it
+        works even on a read-only connection. Never raises; MockDataDialog
+        treats a failed/empty sample as "no valid FK values available" and
+        warns instead of blocking generation entirely."""
+        db_type = self.db_service.db_type
+        table_sql = _quote_identifier(ref_table, db_type)
+        col_sql = _quote_identifier(ref_column, db_type)
+        df = self.db_service.execute_query(
+            f"SELECT DISTINCT {col_sql} FROM {table_sql} LIMIT {int(limit)}",  # nosec B608
+            max_rows=limit,
+        )
+        return df.iloc[:, 0].dropna().tolist()
+
+    def show_mock_data_generator(self, table_name: str):
+        """Opens the Mock Data Generator (issue #77). Environment/read-only
+        safety gating happens up front, before the dialog even opens —
+        Production is blocked outright and Read-only connections are
+        blocked outright, matching the issue's Environment/Read-Only
+        Protection tables; Staging requires an explicit confirmation first.
+        _guard_write below is the existing backstop (mainly re-covers
+        read-only if state changed mid-flow) — no extra_reason is passed to
+        it so Staging isn't asked to confirm a second time."""
+        connection_name = self.config.get("name", "Connection")
+        env = environment.normalize(self.config.get("environment"))
+        read_only = bool(self.config.get("read_only"))
+        if not query_guard_dialog.mock_data_generation_allowed(self, connection_name, env, read_only):
+            return
+
+        try:
+            columns = self.db_service.get_columns(table_name)
+            primary_keys = self.db_service.get_primary_keys(table_name)
+            foreign_keys = self.db_service.get_foreign_keys(table_name)
+            generated_columns = self.db_service.get_generated_columns(table_name)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Could not load schema for {table_name}:\n{ex}")
+            return
+
+        dialog = MockDataDialog(
+            table_name, columns, primary_keys, foreign_keys, generated_columns,
+            dialect=self.db_service.db_type, fk_sampler=self._sample_fk_values, parent=self,
+        )
+        if not dialog.exec():
+            return
+
+        sql = dialog.get_sql()
+        if not sql.strip():
+            QMessageBox.information(self, "No Data", "No columns were selected to insert.")
+            return
+
+        try:
+            if not self._guard_write(sql):
+                return
+            reply = QMessageBox.question(
+                self, "Insert Mock Data",
+                f"Execute the following SQL?\n\n{sql[:2000]}" + ("\n…" if len(sql) > 2000 else ""),
+                QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            for stmt in query_classifier.split_statements(sql):
+                self.db_service.execute_update(stmt)
+            QMessageBox.information(self, "Success", f"Mock data inserted into {table_name}.")
+
+            for i in range(self.tabs.count()):
+                w = self.tabs.widget(i)
+                if isinstance(w, TableViewWidget) and w.table_name == table_name:
+                    w._warn_and_discard_changes()
+                    w.current_page = 1
+                    w.load_table_data()
+                    break
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
 
     # ─── CSV Import ──────────────────────────────────────────────────────────
 

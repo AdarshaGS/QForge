@@ -126,3 +126,72 @@ def show_dangerous_confirmation(parent, connection_name: str, env: str,
     buttons.rejected.connect(dlg.reject)
     dlg.exec()
     return result["confirmed"]
+
+
+def show_environment_blocked(parent, connection_name: str, env: str, message: str) -> None:
+    """Informational hard block, same visual shape as
+    show_read_only_blocked — used for Production-blocked Mock Data
+    Generation (issue #77), which has no in-dialog override, matching how
+    the read-only block above offers none either."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Blocked")
+    dlg.setMinimumWidth(480)
+    layout = QVBoxLayout(dlg)
+
+    layout.addLayout(_header_row(connection_name, env))
+    label = QLabel(message)
+    label.setWordWrap(True)
+    layout.addWidget(label)
+
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+    buttons.accepted.connect(dlg.accept)
+    layout.addWidget(buttons)
+    dlg.exec()
+
+
+def mock_data_generation_allowed(parent, connection_name: str, env: str, read_only: bool) -> bool:
+    """Gate for the whole Mock Data Generation flow (issue #77) — called
+    before the generator dialog even opens, not just before execution,
+    per the issue's Environment/Read-Only Protection tables:
+
+        Read-only   -> blocked outright, regardless of environment
+        Production  -> blocked by default, no override here
+        Staging     -> strong warning + confirmation
+        else        -> allowed, no dialog
+    """
+    if read_only:
+        dlg = QDialog(parent)
+        dlg.setWindowTitle("Blocked — Read-only Connection")
+        dlg.setMinimumWidth(480)
+        layout = QVBoxLayout(dlg)
+        layout.addLayout(_header_row(connection_name, env))
+        label = QLabel(
+            "This connection is read-only, so QForge blocked Mock Data "
+            "Generation. Turn off Read-only for this connection in the "
+            "Connection Manager if you intend to insert data."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.exec()
+        return False
+
+    if env == environment.PRODUCTION:
+        show_environment_blocked(
+            parent, connection_name, env,
+            "Mock Data Generation is blocked by default on Production "
+            "connections. Reclassify this connection's environment in the "
+            "Connection Manager if this is intentional.",
+        )
+        return False
+
+    if env == environment.STAGING:
+        return show_dangerous_confirmation(
+            parent, connection_name, env,
+            ["Generate and insert synthetic rows into tables on this connection"],
+            ["Mock data generation will insert synthetic rows into a Staging database."],
+        )
+
+    return True
