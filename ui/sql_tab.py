@@ -1757,23 +1757,30 @@ class SqlTab(QWidget):
         self.status_label.show()
 
     def update_status(self, rows, execution_time, truncated=False):
-        suffix = " — result truncated, add a LIMIT to see more" if truncated else ""
+        """Row count and query time now live only in the bottom status bar
+        (issue #178 follow-up) — showing them a second time in a text line
+        above the grid was redundant. status_label is reserved for the one
+        thing the bottom bar can't show: the truncation warning."""
         self._error_card_scroll.hide()
         if rows > 0:
             self._empty_state.hide()
-        self._set_status(
-            f"✓  {rows} rows • {execution_time * 1000:.0f} ms{suffix}",
-            """
-            QPlainTextEdit {
-                color: #0078d4;
-                padding: 5px;
-                font-size: 12px;
-                font-weight: 500;
-                background: transparent;
-                border: none;
-            }
-            """,
-        )
+        if truncated:
+            self._set_status(
+                "⚠  Result truncated — add a LIMIT to see more",
+                """
+                QPlainTextEdit {
+                    color: #ff9f0a;
+                    padding: 5px;
+                    font-size: 12px;
+                    font-weight: 500;
+                    background: transparent;
+                    border: none;
+                }
+                """,
+            )
+        else:
+            self.status_label.hide()
+            self.status_label.setFixedHeight(0)
         self._result_actions_bar.show()
         self._query_time_lbl.setText(f"Query time: {execution_time * 1000:.0f} ms")
         self._rows_status_lbl.setText(f"Rows: {rows}")

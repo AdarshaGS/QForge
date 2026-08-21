@@ -133,6 +133,26 @@ def test_update_status_sets_query_time_and_rows_labels():
     tab.hide()
 
 
+def test_update_status_no_longer_repeats_rows_and_time_above_the_grid():
+    """Rows/time now live only in the bottom status bar — showing them a
+    second time in status_label was redundant."""
+    tab = _shown_tab()
+    tab.update_status(96, 0.003)
+    assert not tab.status_label.isVisible()
+    assert tab.status_label.toPlainText() != "✓  96 rows • 3 ms"
+    tab.hide()
+
+
+def test_update_status_still_warns_on_truncated_results():
+    """The one thing status_label is still for: a warning the bottom bar
+    has no room to show."""
+    tab = _shown_tab()
+    tab.update_status(500, 0.02, truncated=True)
+    assert tab.status_label.isVisible()
+    assert "truncated" in tab.status_label.toPlainText().lower()
+    tab.hide()
+
+
 def test_show_error_sets_rows_to_zero_and_query_time_from_elapsed():
     tab = _shown_tab()
     tab.show_error("ERROR: boom", elapsed=0.05)
