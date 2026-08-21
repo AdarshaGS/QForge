@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QAbstractItemView,
     QSizePolicy,
+    QScrollArea,
 )
 from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat, QFontMetrics
 
@@ -93,6 +94,79 @@ def _sql_error_hint(message: str, query: str = "") -> str:
         if m:
             return hint(m) if callable(hint) else hint
     return ""
+
+
+# ─── Error card: title + location (issue #178) ───────────────────────────────
+
+_MYSQL_CODE_RE = _re.compile(r"^\(?(\d{3,5}),")
+_ERROR_LINE_RE = _re.compile(r"at line (\d+)", _re.IGNORECASE)
+_ERROR_NEAR_RE = _re.compile(r"near ['\"](.+?)['\"]", _re.IGNORECASE)
+
+
+def _sql_error_title(message: str) -> str:
+    """Best-effort short title for the error card header, e.g. 'SQL Syntax
+    Error (1064)'. Falls back to a generic title when nothing matches."""
+    ml = message.lower()
+    code_m = _MYSQL_CODE_RE.match(message.strip())
+    code_suffix = f" ({code_m.group(1)})" if code_m else ""
+
+    if "syntax" in ml:
+        return f"SQL Syntax Error{code_suffix}"
+    if "unknown column" in ml:
+        return "Unknown Column"
+    if "doesn't exist" in ml or "does not exist" in ml:
+        return "Table Not Found"
+    if "access denied" in ml or "permission denied" in ml:
+        return "Permission Denied"
+    if "duplicate entry" in ml:
+        return "Duplicate Entry"
+    if "constraint" in ml:
+        return "Constraint Violation"
+    if "lost connection" in ml or "gone away" in ml or "broken pipe" in ml \
+            or "connection refused" in ml or "could not connect" in ml:
+        return "Connection Error"
+    if "lock wait" in ml or "deadlock" in ml:
+        return "Lock Timeout"
+    if "cannot be null" in ml or "null value" in ml:
+        return "Missing Required Value"
+    if "cancelled" in ml or "canceling" in ml:
+        return "Query Cancelled"
+    return f"SQL Error{code_suffix}" if code_suffix else "Query Error"
+
+
+def _sql_error_location(message: str, query: str) -> tuple[int, int] | None:
+    """Best-effort (line, column) — both 1-indexed — of the error within
+    *query*, or None if nothing in the message anchors a position. MySQL/
+    Postgres error text commonly includes "at line N" and/or "near '...'";
+    column is found by locating that quoted token in the query text. Not
+    guaranteed exact for every driver/error shape — best-effort, matching
+    what a human would eyeball from the message, not a real parser."""
+    line_m = _ERROR_LINE_RE.search(message)
+    near_m = _ERROR_NEAR_RE.search(message)
+
+    if not near_m or not query:
+        return (int(line_m.group(1)), 1) if line_m else None
+
+    token = near_m.group(1)
+    line = int(line_m.group(1)) if line_m else 1
+    lines = query.split("\n")
+
+    # Try the reported line first — cheaper and usually right when present.
+    if line_m:
+        line_idx = min(max(line - 1, 0), len(lines) - 1)
+        col = lines[line_idx].find(token)
+        if col != -1:
+            return (line, col + 1)
+
+    # Fall back to a whole-query search, recomputing line/col from the
+    # absolute offset — covers drivers that give "near" without "at line".
+    pos = query.find(token)
+    if pos == -1:
+        return (line, 1) if line_m else None
+    before = query[:pos]
+    line = before.count("\n") + 1
+    col = pos - (before.rfind("\n") + 1) + 1
+    return (line, col)
 
 
 class SqlTab(QWidget):
@@ -595,6 +669,176 @@ class SqlTab(QWidget):
         self.status_label.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.status_label.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
+        # ── Result-row icon toolbar (issue #178) — download/filter already
+        # exist elsewhere (export_data(), the Ctrl+F filter panel); this
+        # just surfaces them as icons next to the row-count summary. Grid
+        # is the only real view so its button is a plain state indicator;
+        # chart is a visible stub (no chart view exists anywhere yet).
+        self._result_actions_bar = QWidget()
+        _actions_layout = QHBoxLayout(self._result_actions_bar)
+        _actions_layout.setContentsMargins(0, 0, 4, 0)
+        _actions_layout.setSpacing(2)
+        _actions_layout.addStretch()
+
+        def _icon_btn(symbol: str, tooltip: str, checkable: bool = False) -> QPushButton:
+            b = QPushButton(symbol)
+            b.setFixedSize(26, 24)
+            b.setToolTip(tooltip)
+            b.setCheckable(checkable)
+            b.setStyleSheet("""
+                QPushButton {
+                    background: transparent;
+                    color: #8e8e93;
+                    border: none;
+                    border-radius: 4px;
+                    font-size: 13px;
+                }
+                QPushButton:hover:!disabled { background: #3a3a3c; color: #e5e5ea; }
+                QPushButton:checked { color: #0A84FF; }
+                QPushButton:disabled { color: #48484a; }
+            """)
+            return b
+
+        self._grid_view_btn = _icon_btn("▦", "Grid view (current)", checkable=True)
+        self._grid_view_btn.setChecked(True)
+        self._grid_view_btn.setEnabled(False)   # only view that exists today
+        _actions_layout.addWidget(self._grid_view_btn)
+
+        self._chart_view_btn = _icon_btn("📈", "Chart view — coming soon")
+        self._chart_view_btn.setEnabled(False)
+        _actions_layout.addWidget(self._chart_view_btn)
+
+        self._download_icon_btn = _icon_btn("⬇", "Export results")
+        self._download_icon_btn.clicked.connect(self.export_data)
+        _actions_layout.addWidget(self._download_icon_btn)
+
+        self._filter_icon_btn = _icon_btn("▽", "Filter results (Ctrl+F)")
+        self._filter_icon_btn.clicked.connect(self.toggle_filter)
+        _actions_layout.addWidget(self._filter_icon_btn)
+
+        self._result_actions_bar.hide()   # shown only alongside a successful result
+
+        # ── Empty-state illustration for a successful 0-row query (issue
+        # #178) — a genuine SELECT with columns but no rows previously just
+        # showed a blank grid with nothing to explain why.
+        self._empty_state = QWidget()
+        _empty_layout = QVBoxLayout(self._empty_state)
+        _empty_layout.setAlignment(Qt.AlignCenter)
+        _empty_layout.setSpacing(6)
+        _empty_icon = QLabel("🔍")
+        _empty_icon.setAlignment(Qt.AlignCenter)
+        _empty_icon.setStyleSheet("font-size: 40px; background: transparent;")
+        _empty_heading = QLabel("No rows returned")
+        _empty_heading.setAlignment(Qt.AlignCenter)
+        _empty_heading.setStyleSheet(
+            "color: #e5e5ea; font-size: 15px; font-weight: 600; background: transparent;")
+        _empty_subtitle = QLabel("The query executed successfully.")
+        _empty_subtitle.setAlignment(Qt.AlignCenter)
+        _empty_subtitle.setStyleSheet("color: #8e8e93; font-size: 12px; background: transparent;")
+        _empty_layout.addWidget(_empty_icon)
+        _empty_layout.addWidget(_empty_heading)
+        _empty_layout.addWidget(_empty_subtitle)
+        self._empty_state.hide()
+
+        # ── Structured error card (issue #178) — replaces show_error()'s
+        # single plain-text banner with a title, the message, an "Error
+        # Location" section, a monospace snippet with a caret under the
+        # error column (best-effort — see _sql_error_location), and an
+        # "Error Details" section for the existing hint text.
+        self._error_card = QWidget()
+        self._error_card.setStyleSheet("""
+            QWidget#errorCard {
+                background-color: #3a1a1a;
+                border-radius: 6px;
+                border-left: 3px solid #f48771;
+            }
+        """)
+        self._error_card.setObjectName("errorCard")
+        _err_layout = QVBoxLayout(self._error_card)
+        _err_layout.setContentsMargins(14, 12, 14, 12)
+        _err_layout.setSpacing(8)
+
+        _err_title_row = QHBoxLayout()
+        _err_title_row.setSpacing(8)
+        self._error_title_icon = QLabel("⊗")
+        self._error_title_icon.setStyleSheet(
+            "color: #f48771; font-size: 16px; background: transparent;")
+        self._error_title_lbl = QLabel("")
+        self._error_title_lbl.setStyleSheet(
+            "color: #f48771; font-size: 14px; font-weight: 600; background: transparent;")
+        _err_title_row.addWidget(self._error_title_icon)
+        _err_title_row.addWidget(self._error_title_lbl, 1)
+        _err_layout.addLayout(_err_title_row)
+
+        self._error_message_lbl = QLabel("")
+        self._error_message_lbl.setWordWrap(True)
+        self._error_message_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._error_message_lbl.setStyleSheet(
+            "color: #e5c6c1; font-size: 12px; background: transparent;")
+        _err_layout.addWidget(self._error_message_lbl)
+
+        self._error_elapsed_lbl = QLabel("")
+        self._error_elapsed_lbl.setStyleSheet(
+            "color: #8e6a63; font-size: 11px; background: transparent;")
+        _err_layout.addWidget(self._error_elapsed_lbl)
+
+        self._error_location_section = QWidget()
+        _loc_layout = QVBoxLayout(self._error_location_section)
+        _loc_layout.setContentsMargins(0, 4, 0, 0)
+        _loc_layout.setSpacing(3)
+        _loc_heading = QLabel("Error Location")
+        _loc_heading.setStyleSheet(
+            "color: #f4a99a; font-size: 11px; font-weight: 600; background: transparent;")
+        self._error_location_lbl = QLabel("")
+        self._error_location_lbl.setStyleSheet(
+            "color: #e5c6c1; font-size: 12px; background: transparent;")
+        self._error_snippet = QPlainTextEdit()
+        self._error_snippet.setReadOnly(True)
+        self._error_snippet.setFixedHeight(46)
+        self._error_snippet.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self._error_snippet.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #2a1414;
+                color: #d0d0d0;
+                font-family: Menlo, Consolas, monospace;
+                font-size: 12px;
+                border: 1px solid #4a2a2a;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+        """)
+        _loc_layout.addWidget(_loc_heading)
+        _loc_layout.addWidget(self._error_location_lbl)
+        _loc_layout.addWidget(self._error_snippet)
+        _err_layout.addWidget(self._error_location_section)
+        self._error_location_section.hide()   # only shown when a location was found
+
+        self._error_details_section = QWidget()
+        _det_layout = QVBoxLayout(self._error_details_section)
+        _det_layout.setContentsMargins(0, 4, 0, 0)
+        _det_layout.setSpacing(3)
+        _det_heading = QLabel("Error Details")
+        _det_heading.setStyleSheet(
+            "color: #f4a99a; font-size: 11px; font-weight: 600; background: transparent;")
+        self._error_details_lbl = QLabel("")
+        self._error_details_lbl.setWordWrap(True)
+        self._error_details_lbl.setStyleSheet(
+            "color: #e5c6c1; font-size: 12px; background: transparent;")
+        _det_layout.addWidget(_det_heading)
+        _det_layout.addWidget(self._error_details_lbl)
+        _err_layout.addWidget(self._error_details_section)
+        self._error_details_section.hide()   # only shown when a hint matched
+
+        # Scrollable, not just fixed-size (issue #147/#178): a pathologically
+        # long message + hint could otherwise still exceed the splitter's
+        # bottom pane with no way to see the rest — the exact class of bug
+        # #147 fixed for the old plain-text banner, now guarded here too.
+        self._error_card_scroll = QScrollArea()
+        self._error_card_scroll.setWidgetResizable(True)
+        self._error_card_scroll.setFrameShape(QScrollArea.NoFrame)
+        self._error_card_scroll.setWidget(self._error_card)
+        self._error_card_scroll.hide()
+
         # ==================================
         # RESULT GRID
         # ==================================
@@ -674,7 +918,17 @@ class SqlTab(QWidget):
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         bottom_layout.setSpacing(2)
         bottom_layout.addWidget(self.filter_container)
-        bottom_layout.addWidget(self.status_label)
+
+        status_row = QWidget()
+        status_row_layout = QHBoxLayout(status_row)
+        status_row_layout.setContentsMargins(0, 0, 0, 0)
+        status_row_layout.setSpacing(0)
+        status_row_layout.addWidget(self.status_label, 1)
+        status_row_layout.addWidget(self._result_actions_bar)
+        bottom_layout.addWidget(status_row)
+
+        bottom_layout.addWidget(self._error_card_scroll)
+        bottom_layout.addWidget(self._empty_state)
         bottom_layout.addWidget(self.result_table)
         bottom_layout.addWidget(self._pagination_bar)
         bottom_widget.setLayout(bottom_layout)
@@ -685,6 +939,7 @@ class SqlTab(QWidget):
         self.splitter.setSizes([300, 500])  # Initial sizes
         
         layout.addWidget(self.splitter)
+        layout.addWidget(self._build_tab_status_bar())
 
         self.setLayout(layout)
 
@@ -1172,11 +1427,20 @@ class SqlTab(QWidget):
         # execution time" already comes from update_status() (issue #24 —
         # writes should show execution details, not an empty grid).
         if len(dataframe.columns) > 0:
-            self.result_table.show()
-            self._pagination_bar.show()
-            self._refresh_result_view()
+            if len(dataframe) == 0:
+                # A genuine SELECT that matched nothing — show the empty-
+                # state illustration instead of a blank grid (issue #178).
+                self.result_table.hide()
+                self._pagination_bar.hide()
+                self._empty_state.show()
+            else:
+                self._empty_state.hide()
+                self.result_table.show()
+                self._pagination_bar.show()
+                self._refresh_result_view()
             self._expand_result_area()
         else:
+            self._empty_state.hide()
             self.result_table.hide()
             self._pagination_bar.hide()
             self._collapse_result_area()
@@ -1378,6 +1642,70 @@ class SqlTab(QWidget):
 
 
 
+    # ─── Bottom status bar (issue #178) ──────────────────────────────────────
+
+    _CONNECTION_STATE_STYLE = {
+        # status -> (label text, dot/text colour)
+        "idle":         ("Ready",        "#30d158"),
+        "running":      ("Running…",     "#0A84FF"),
+        "connecting":   ("Connecting…",  "#ff9f0a"),
+        "disconnected": ("Disconnected", "#f48771"),
+    }
+
+    def _build_tab_status_bar(self) -> QWidget:
+        """Persistent bar under the splitter — always visible, unlike the
+        per-query status_label/error card above which only show up once a
+        query has run. Reflects *connection* state (idle/running/
+        connecting/disconnected), not query success/failure: a failed
+        query still leaves the connection idle, and the error itself is
+        already shown by the error card, so duplicating "Error" here would
+        just race ConnectionPanel's own health_changed('idle') that fires
+        right after every show_error() call anyway."""
+        bar = QWidget()
+        bar.setFixedHeight(24)
+        bar.setStyleSheet("background-color: #1e1e1e; border-top: 1px solid #2c2c2e;")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setSpacing(14)
+
+        def _seg(text: str = "") -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color: #8e8e93; font-size: 11px; background: transparent;")
+            layout.addWidget(lbl)
+            return lbl
+
+        self._readiness_lbl = _seg("●  Ready")
+        self._readiness_lbl.setStyleSheet(
+            "color: #30d158; font-size: 11px; font-weight: 600; background: transparent;")
+        self._query_time_lbl = _seg("Query time: —")
+        self._rows_status_lbl = _seg("Rows: —")
+        layout.addStretch()
+        self._cursor_pos_lbl = _seg("Ln 1, Col 1")
+        _seg("UTF-8")
+        self._dialect_lbl = _seg("")
+
+        self.editor.cursorPositionChanged.connect(self._update_cursor_position_label)
+        self._update_cursor_position_label()
+
+        return bar
+
+    def _update_cursor_position_label(self):
+        cursor = self.editor.textCursor()
+        self._cursor_pos_lbl.setText(f"Ln {cursor.blockNumber() + 1}, Col {cursor.columnNumber() + 1}")
+
+    def set_connection_state(self, status: str):
+        """Called by ConnectionPanel whenever its health_changed signal
+        fires, for every open SqlTab (issue #178)."""
+        text, color = self._CONNECTION_STATE_STYLE.get(status, ("Ready", "#8e8e93"))
+        self._readiness_lbl.setText(f"●  {text}")
+        self._readiness_lbl.setStyleSheet(
+            f"color: {color}; font-size: 11px; font-weight: 600; background: transparent;")
+
+    def set_dialect(self, dialect: str):
+        """Called once per tab at creation (mirrors set_schema()) with the
+        connection's DB type, e.g. 'MySQL' (issue #178)."""
+        self._dialect_lbl.setText(dialect)
+
     # Cap on the status/error banner's height before it scrolls instead of
     # growing further (issue #147, raised from 150 — a multi-line error +
     # hint routinely exceeded that with nothing to indicate more was
@@ -1429,9 +1757,12 @@ class SqlTab(QWidget):
         self.status_label.show()
 
     def update_status(self, rows, execution_time, truncated=False):
-        suffix = " | result truncated — add a LIMIT to see more" if truncated else ""
+        suffix = " — result truncated, add a LIMIT to see more" if truncated else ""
+        self._error_card_scroll.hide()
+        if rows > 0:
+            self._empty_state.hide()
         self._set_status(
-            f"{rows} rows | {execution_time:.3f}s{suffix}",
+            f"✓  {rows} rows • {execution_time * 1000:.0f} ms{suffix}",
             """
             QPlainTextEdit {
                 color: #0078d4;
@@ -1443,6 +1774,9 @@ class SqlTab(QWidget):
             }
             """,
         )
+        self._result_actions_bar.show()
+        self._query_time_lbl.setText(f"Query time: {execution_time * 1000:.0f} ms")
+        self._rows_status_lbl.setText(f"Rows: {rows}")
 
     # Fits status_label's tallest case (_STATUS_MAX_HEIGHT) + margins.
     _COLLAPSED_RESULT_HEIGHT = _STATUS_MAX_HEIGHT + 20
@@ -1469,36 +1803,47 @@ class SqlTab(QWidget):
             self.splitter.setSizes(sizes)
 
     def show_error(self, message: str, query: str = "", elapsed: float = 0.0):
-        """Display a SQL error inline with actionable hints — always selectable."""
+        """Display a SQL error as a structured card — title, message, best-
+        effort location + snippet, and the existing hint text (issue
+        #178) — always selectable."""
         self.result_table.clearContents()
         self.result_table.setRowCount(0)
         self.result_table.setColumnCount(0)
         self.result_table.hide()
         self._pagination_bar.hide()
+        self._empty_state.hide()
+        self._result_actions_bar.hide()
+        self.status_label.hide()
+        self.status_label.setFixedHeight(0)
+
+        self._error_title_lbl.setText(_sql_error_title(message))
+        self._error_message_lbl.setText(message)
+        self._error_elapsed_lbl.setText(f"({elapsed:.3f}s)" if elapsed > 0 else "")
+
+        location = _sql_error_location(message, query)
+        if location:
+            line, col = location
+            self._error_location_lbl.setText(f"Line {line}, Column {col}")
+            lines = query.split("\n") if query else []
+            line_idx = min(max(line - 1, 0), len(lines) - 1) if lines else -1
+            snippet_line = lines[line_idx] if 0 <= line_idx < len(lines) else query
+            caret = " " * max(0, col - 1) + "^"
+            self._error_snippet.setPlainText(f"{snippet_line}\n{caret}")
+            self._error_location_section.show()
+        else:
+            self._error_location_section.hide()
 
         hint = _sql_error_hint(message, query)
-        time_str = f"  ({elapsed:.2f}s)" if elapsed > 0 else ""
-        display = f"❌  {message}{time_str}"
         if hint:
-            display += f"\n💡  {hint}"
+            self._error_details_lbl.setText(hint)
+            self._error_details_section.show()
+        else:
+            self._error_details_section.hide()
 
-        self._set_status(
-            display,
-            """
-            QPlainTextEdit {
-                color: #f48771;
-                padding: 8px 10px;
-                font-size: 12px;
-                font-weight: 500;
-                background-color: #3a1a1a;
-                border-radius: 4px;
-                border-left: 3px solid #f48771;
-                selection-background-color: #6a3a3a;
-                border: none;
-            }
-            """,
-        )
-        self._collapse_result_area()
+        self._error_card_scroll.show()
+        self._expand_result_area()
+        self._query_time_lbl.setText(f"Query time: {elapsed * 1000:.0f} ms" if elapsed > 0 else "Query time: —")
+        self._rows_status_lbl.setText("Rows: 0")
 
     def show_cancelled(self):
         """Show a neutral 'query cancelled' status."""
@@ -1507,6 +1852,9 @@ class SqlTab(QWidget):
         self.result_table.setColumnCount(0)
         self.result_table.hide()
         self._pagination_bar.hide()
+        self._error_card_scroll.hide()
+        self._empty_state.hide()
+        self._result_actions_bar.hide()
         self._set_status(
             "⊘  Query cancelled",
             """

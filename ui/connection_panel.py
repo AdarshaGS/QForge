@@ -540,13 +540,14 @@ class ConnectionPanel(QWidget):
         self._export_finished_sig.connect(self._on_export_finished, Qt.QueuedConnection)
         self._export_errored_sig.connect(self._on_export_errored, Qt.QueuedConnection)
         self._export_cancelled_sig.connect(self._on_export_cancelled, Qt.QueuedConnection)
+        self.health_changed.connect(self._update_tab_status_bars, Qt.QueuedConnection)
         self._column_cache: dict = {}   # {table: [col, ...]} for autocomplete
 
         self._build_ui()
         self.load_schema()
 
         if self._connecting:
-            self.health_changed.emit('connecting')
+            self._emit_health('connecting')
             self._connect_in_background()
 
         # ── Periodic health check (every 30 s) ──────────────────────────
@@ -1064,10 +1065,10 @@ class ConnectionPanel(QWidget):
         self._connecting = False
         self._update_pill_label()
         if error:
-            self.health_changed.emit('disconnected')
+            self._emit_health('disconnected')
             QMessageBox.critical(self, "Connection Failed", error)
         else:
-            self.health_changed.emit('idle')
+            self._emit_health('idle')
             # Now that self.db_service is genuinely live, re-run the schema
             # fetch so the tree/autocomplete reflect the real connection
             # (e.g. if the configured database didn't exist and MySQL fell
@@ -1717,6 +1718,8 @@ class ConnectionPanel(QWidget):
         tab.commit_sql.connect(lambda sqls, t=tab: self._execute_commit_sql(sqls, t))
         # Push current schema so autocomplete works immediately
         tab.set_schema(self.all_tables, self._column_cache)
+        tab.set_dialect(self._dialect_display_name())
+        tab.set_connection_state(getattr(self, '_last_health', 'idle'))
         self._attach_close_btn(idx)
         self.tabs.setCurrentWidget(tab)
         tab.update_theme(self.current_theme == "dark")
@@ -1816,7 +1819,7 @@ class ConnectionPanel(QWidget):
         self.query_history.add_query(query, self.config["name"], len(df), elapsed)
         if self._sidebar_stack.currentIndex() == 2:
             self._reload_history_list(self._history_search.text())
-        self.health_changed.emit('idle')
+        self._emit_health('idle')
         if self.tabs.currentWidget() is not tab:
             tab_name = self.tabs.tabText(self.tabs.indexOf(tab))
             self._show_query_toast(tab_name, len(df), elapsed)
@@ -1858,7 +1861,7 @@ class ConnectionPanel(QWidget):
             msgs = "\n".join(f"[{lbl}] {ex}" for lbl, ex in error_results)
             tab.show_error(msgs, elapsed=elapsed)
 
-        self.health_changed.emit('idle')
+        self._emit_health('idle')
         self._finalize_query_connection(tab)
 
 
@@ -1873,9 +1876,9 @@ class ConnectionPanel(QWidget):
         tab.show_error(message, query=query, elapsed=elapsed)
         # Connection errors flip to disconnected; others stay idle
         if any(k in message.lower() for k in ('lost', 'disconnect', 'gone away', 'server has gone')):
-            self.health_changed.emit('disconnected')
+            self._emit_health('disconnected')
         else:
-            self.health_changed.emit('idle')
+            self._emit_health('idle')
         self._finalize_query_connection(tab)
 
     def _on_query_cancelled(self, tab):
@@ -1887,6 +1890,11 @@ class ConnectionPanel(QWidget):
             tab._query_thread.quit()
         tab.show_cancelled()
         self._finalize_query_connection(tab)
+        # Every other query-completion path (_on_query_done, _on_query_errored,
+        # the multi-result path) emits health_changed('idle') right after —
+        # this one didn't, leaving the status bar's readiness dot stuck on
+        # "Running…" forever after a cancel (issue #178).
+        self._emit_health('idle')
 
     # ── Parameterised query helpers ────────────────────────────────────────────
 
@@ -2007,7 +2015,7 @@ class ConnectionPanel(QWidget):
             }
         """)
         tab.cancel_btn.setEnabled(True)
-        self.health_changed.emit('running')
+        self._emit_health('running')
 
         # Flush the UI immediately so the button turns green before any
         # blocking work (DB connect, sqlparse format) happens on this thread.
@@ -3304,7 +3312,7 @@ class ConnectionPanel(QWidget):
             except Exception:
                 pass
             self.load_schema()
-            self.health_changed.emit('idle')
+            self._emit_health('idle')
             db_type = self.config.get('type', 'DB').upper()
             self.reconnected.emit(f"Reconnected to {db_type} — {self.label}")
             # Any table tab still stuck on a stale connection error (from
@@ -3313,7 +3321,7 @@ class ConnectionPanel(QWidget):
             self._reload_errored_table_tabs()
         except Exception as ex:
             QMessageBox.critical(self, "Reconnect Failed", str(ex))
-            self.health_changed.emit('disconnected')
+            self._emit_health('disconnected')
 
     # ─── Health check ────────────────────────────────────────────────────────────
 
@@ -3334,7 +3342,7 @@ class ConnectionPanel(QWidget):
                 status = 'idle' if ok else 'disconnected'
                 self._last_health = status
                 # Emit on main thread via a queued call
-                self.health_changed.emit(status)
+                self._emit_health(status)
                 if ok and was_disconnected:
                     db_type = self.config.get('type', 'DB').upper()
                     self.reconnected.emit(f"Reconnected to {db_type} — {self.label}")
@@ -3404,6 +3412,27 @@ class ConnectionPanel(QWidget):
             w = self.tabs.widget(i)
             if isinstance(w, TableViewWidget):
                 w.reload_if_errored()
+
+    def _emit_health(self, status: str):
+        """Single choke point for health_changed — keeps self._last_health
+        (read by _check_health's was-disconnected check, and by every new
+        SqlTab's initial status-bar state, issue #178) in sync with every
+        emission instead of just the _check_health polling path that used
+        to be the only writer of it."""
+        self._last_health = status
+        self.health_changed.emit(status)
+
+    def _update_tab_status_bars(self, status: str):
+        """Fan health_changed out to every open SqlTab's bottom status bar
+        (issue #178) — one connection per panel, shared by every tab."""
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, SqlTab):
+                w.set_connection_state(status)
+
+    def _dialect_display_name(self) -> str:
+        return {"mysql": "MySQL", "postgresql": "PostgreSQL", "sqlite": "SQLite"}.get(
+            self.config.get("type", ""), self.config.get("type", "DB").upper())
 
     def disconnect(self):
         try:

@@ -1,8 +1,7 @@
-"""Regression tests for issue #147 — the SQL error/status banner clipped
-long messages at a fixed 150px with no visible way to see the rest. A
-long single line with no literal '\\n' word-wraps across several visual
-lines that the old height formula (counting only literal newlines)
-never accounted for."""
+"""Regression tests for issue #147 (the SQL error banner clipped long
+messages with no way to see the rest) and its follow-on, issue #178 (the
+error banner was replaced by a structured card: title / message /
+location / snippet / hint — still must never silently clip text)."""
 import os
 
 import pytest
@@ -27,7 +26,7 @@ def _shown_tab():
     return tab
 
 
-def test_short_error_does_not_grow_to_the_cap():
+def test_short_error_does_not_grow_the_plain_status_label():
     tab = _shown_tab()
     tab.show_error("ERROR: syntax error near X")
     _app.processEvents()
@@ -35,10 +34,13 @@ def test_short_error_does_not_grow_to_the_cap():
     tab.hide()
 
 
-def test_long_wrapping_single_line_error_grows_past_the_old_36px_estimate():
-    """Pre-fix, a message with zero literal '\\n's was always sized as if
-    it were exactly one line (lines=1 -> 1*20+16=36px), regardless of how
-    many visual lines it actually wrapped into."""
+def test_long_wrapping_single_line_error_is_shown_in_full_not_truncated():
+    """The old plain-text banner sized itself by counting literal '\\n's,
+    so a long single line with none wrapped across several visual lines
+    it never accounted for, clipping the rest. The error card's message
+    label word-wraps in a normal (uncapped) Qt layout instead, so the
+    full string is always present regardless of how many lines it wraps
+    into — there's no manual height estimate left to get wrong."""
     tab = _shown_tab()
     long_single_line = (
         "ERROR 1064 (42000): You have an error in your SQL syntax; check "
@@ -49,36 +51,57 @@ def test_long_wrapping_single_line_error_grows_past_the_old_36px_estimate():
     assert "\n" not in long_single_line
     tab.show_error(long_single_line)
     _app.processEvents()
-    assert tab.status_label.height() > 36
+    assert tab._error_card_scroll.isVisible()
+    assert tab._error_message_lbl.text() == long_single_line
     tab.hide()
 
 
-def test_very_long_error_is_capped_and_the_rest_is_reachable_by_scrolling():
+def test_very_long_error_stays_reachable_via_the_card_scroll_area():
     tab = _shown_tab()
-    huge = "\n".join(f"ERROR line {i}: something went wrong in detail" for i in range(40))
+    huge = "\n".join(f"ERROR line {i}: something went wrong in detail" for i in range(80))
     tab.show_error(huge)
     _app.processEvents()
-    assert tab.status_label.height() == tab._STATUS_MAX_HEIGHT
-    scrollbar = tab.status_label.verticalScrollBar()
-    assert scrollbar.isVisible()
-    assert scrollbar.maximum() > 0
+    assert tab._error_card_scroll.isVisible()
+    # Full text present in the label regardless of length...
+    assert tab._error_message_lbl.text() == huge
+    # ...and if it doesn't fit the pane, the scroll area (not the label
+    # itself) is what makes the rest reachable — the same guarantee #147
+    # established, just relocated to the new widget.
+    content_taller_than_viewport = (
+        tab._error_card.sizeHint().height() > tab._error_card_scroll.viewport().height()
+    )
+    if content_taller_than_viewport:
+        assert tab._error_card_scroll.verticalScrollBar().maximum() > 0
     tab.hide()
 
 
-def test_error_plus_hint_under_the_cap_needs_no_scrolling_at_all():
-    """A too-tight fixed +16px chrome allowance let the box come out a few
-    px shorter than the actual rendered content even after the wrapped-
-    height fix above — content_h still fit under _STATUS_MAX_HEIGHT, so no
-    scrollbar should ever be needed for it, but the box was silently a
-    couple of pixels too short and clipped the last line's descenders."""
+def test_error_with_hint_populates_message_location_and_details_sections():
     tab = _shown_tab()
     msg = (
         '(1064, "You have an error in your SQL syntax; check the manual '
         "that corresponds to your MySQL server version for the right "
         "syntax to use near 'fghjk' at line 1\")"
     )
-    tab.show_error(msg, query="SHOW fghjk", elapsed=0.0)
+    tab.show_error(msg, query="SHOW fghjk", elapsed=0.005)
     _app.processEvents()
-    assert tab.status_label.height() < tab._STATUS_MAX_HEIGHT
-    assert tab.status_label.verticalScrollBar().maximum() == 0
+
+    assert tab._error_card_scroll.isVisible()
+    assert "Syntax Error" in tab._error_title_lbl.text()
+    assert tab._error_message_lbl.text() == msg
+    assert "0.005" in tab._error_elapsed_lbl.text()
+    assert tab._error_location_section.isVisible()
+    assert tab._error_location_lbl.text() == "Line 1, Column 6"  # "fghjk" in "SHOW fghjk"
+    assert "fghjk" in tab._error_snippet.toPlainText()
+    assert tab._error_details_section.isVisible()
+    assert "missing commas" in tab._error_details_lbl.text().lower()
+    tab.hide()
+
+
+def test_show_error_hides_the_normal_status_label_and_empty_state():
+    tab = _shown_tab()
+    tab.show_error("ERROR: syntax error near X")
+    _app.processEvents()
+    assert not tab.status_label.isVisible()
+    assert not tab._empty_state.isVisible()
+    assert not tab._result_actions_bar.isVisible()
     tab.hide()
