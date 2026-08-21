@@ -12,14 +12,20 @@ from __future__ import annotations
 
 import statistics
 import threading
+import time
 from collections import deque
 
 _LOCK = threading.Lock()
 _SAMPLES: dict[tuple[str, str], deque] = {}
 _COUNTERS: dict[str, dict[str, int]] = {}
 _ACTIVE_TASKS: dict[str, int] = {}
+_SUSPEND_WINDOWS: list[tuple[float, float]] = []
+_WATCHDOG_STARTED = False
 
 _MAX_SAMPLES = 50
+_WATCHDOG_INTERVAL_S = 1.0
+_SUSPEND_GAP_THRESHOLD_S = 3.0
+_MAX_SUSPEND_WINDOWS = 20
 
 
 def record(category: str, name: str, value: float) -> None:
@@ -67,6 +73,48 @@ def active_tasks() -> dict[str, int]:
         return {k: v for k, v in _ACTIVE_TASKS.items() if v > 0}
 
 
+def start_suspend_watchdog() -> None:
+    """Idempotent — safe to call from multiple entry points. Spawns a
+    daemon thread that does nothing but sleep in a loop and check how long
+    each sleep actually took. A thread with no work has no legitimate
+    reason to wake up late; if it does, the whole process (not just one
+    busy thread) was almost certainly suspended for that stretch — system
+    sleep, macOS App Nap, a debugger pause. Recording those windows lets a
+    slow-looking sample get checked against them: "the machine was asleep"
+    and "this operation was genuinely slow" produce identical elapsed-time
+    numbers from inside the stalled process, and only an independent,
+    otherwise-idle clock can tell them apart (issue #174)."""
+    global _WATCHDOG_STARTED
+    with _LOCK:
+        if _WATCHDOG_STARTED:
+            return
+        _WATCHDOG_STARTED = True
+
+    def _loop():
+        last = time.time()
+        while True:
+            time.sleep(_WATCHDOG_INTERVAL_S)
+            now = time.time()
+            gap = now - last
+            if gap > _SUSPEND_GAP_THRESHOLD_S:
+                with _LOCK:
+                    _SUSPEND_WINDOWS.append((last, now))
+                    del _SUSPEND_WINDOWS[:-_MAX_SUSPEND_WINDOWS]
+            last = now
+
+    threading.Thread(target=_loop, daemon=True, name="perf_metrics_suspend_watchdog").start()
+
+
+def likely_suspended_between(start_ts: float, end_ts: float) -> bool:
+    """True if a detected suspend window overlaps [start_ts, end_ts] —
+    both time.time() epoch seconds, e.g. captured immediately before/after
+    the operation being measured (not perf_counter(), which isn't epoch-
+    relative and can't be compared against the watchdog's clock)."""
+    with _LOCK:
+        windows = list(_SUSPEND_WINDOWS)
+    return any(w_start < end_ts and start_ts < w_end for w_start, w_end in windows)
+
+
 def snapshot() -> dict[str, dict[str, dict]]:
     """category -> name -> {last, mean, p95, count}, for the overlay to poll."""
     with _LOCK:
@@ -88,8 +136,11 @@ def snapshot() -> dict[str, dict[str, dict]]:
 
 
 def reset() -> None:
-    """Clear all recorded samples and counters. Test-only."""
+    """Clear all recorded samples and counters. Test-only. Does not stop
+    the suspend watchdog thread (if started) — it has no per-test state
+    worth tearing down, just clears its recorded windows."""
     with _LOCK:
         _SAMPLES.clear()
         _COUNTERS.clear()
         _ACTIVE_TASKS.clear()
+        _SUSPEND_WINDOWS.clear()

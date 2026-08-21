@@ -469,6 +469,7 @@ class TableViewWidget(QWidget):
     def load_table_data(self):
         """Load the current page for current filter and sort, refreshing row count"""
         _page_load_t0 = time.perf_counter()
+        _page_load_wall_start = time.time()
         try:
             # A real COUNT(*) — MySQL's INFORMATION_SCHEMA.TABLES.TABLE_ROWS
             # looked appealingly fast, but it's only an approximate
@@ -545,7 +546,19 @@ class TableViewWidget(QWidget):
                 df = pd.DataFrame(columns=self.columns)
             
             self.data_table.load_data(df, table_name=self.table_name)
-            perf_metrics.record("result_grid", "page_load", (time.perf_counter() - _page_load_t0) * 1000)
+            _page_load_ms = (time.perf_counter() - _page_load_t0) * 1000
+            # issue #174: a page load spanning a detected system
+            # suspend/sleep isn't a real measurement of this operation's
+            # cost — don't let it pollute page_load's mean/p95 with a
+            # number that has nothing to do with query or render speed.
+            if perf_metrics.likely_suspended_between(_page_load_wall_start, time.time()):
+                perf_metrics.counter_inc("suspend_filtered", "page_load")
+                logger.info(
+                    f"load_table_data took {_page_load_ms:.0f}ms but overlapped a detected "
+                    "system suspend — not recorded as a normal page_load sample"
+                )
+            else:
+                perf_metrics.record("result_grid", "page_load", _page_load_ms)
             perf_metrics.record("result_grid", "rows_rendered", len(df))
             # load_data() resets the grid's own sort state — restore it so
             # the header shows the arrow/highlight for the column this page

@@ -11,6 +11,7 @@ reproduce that native race, so this test only guards that the call
 sequence stays in place — it can't re-verify the underlying OS behavior.
 """
 import os
+import time
 
 import pytest
 
@@ -28,11 +29,21 @@ _app = QApplication.instance() or QApplication([])
 
 class _StubDialog(QDialog):
     """Stands in for ConnectionDialog — a real QDialog so .exec() still
-    goes through genuine Qt modal open/close, just pre-accepted."""
+    goes through genuine Qt modal open/close, just pre-accepted.
+
+    _DELAY_S is a deliberate, measurable exec() delay: this is the one
+    place in the suite that constructs a real ConnectionPanel/SqlTab via
+    this stub pattern — a second such site elsewhere in the suite crashes
+    with a shiboken "object already deleted" lifecycle error regardless
+    of which two tests they are, so issue #173's dialog_wait accumulation
+    is verified here too rather than in a separate test."""
+    _DELAY_S = 0.05
+
     def __init__(self, auto_connect_last=False, parent=None):
         super().__init__(parent)
 
     def exec(self):
+        time.sleep(self._DELAY_S)
         return QDialog.Accepted
 
     def get_selected_connection(self):
@@ -53,6 +64,7 @@ class _MainWindowStub(QWidget):
         self.current_theme = "dark"
         self.activate_calls = 0
         self.raise_calls = 0
+        self._dialog_wait_ms = 0.0  # normally set in MainWindow.__init__ (issue #173)
 
     def activateWindow(self):
         self.activate_calls += 1
@@ -75,3 +87,7 @@ def test_prompt_new_connection_reactivates_window_after_connecting(monkeypatch):
     assert len(win._panels) == 1
     assert win.activate_calls >= 1
     assert win.raise_calls >= 1
+    # issue #173: the modal dialog's own exec() time (real human
+    # think-time) must be accumulated for MainWindow.__init__ to subtract
+    # back out of the startup-stage timings.
+    assert win._dialog_wait_ms >= _StubDialog._DELAY_S * 1000

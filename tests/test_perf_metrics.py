@@ -74,6 +74,42 @@ def test_task_finished_without_started_does_not_go_negative():
     assert perf_metrics.active_tasks() == {}
 
 
+def test_likely_suspended_between_true_when_windows_overlap():
+    """Regression guard for issue #174 — doesn't wait for the real
+    watchdog thread (needs 3+ real seconds to trigger); injects a
+    synthetic suspend window directly, same as the watchdog would record."""
+    perf_metrics._SUSPEND_WINDOWS.append((100.0, 110.0))
+    assert perf_metrics.likely_suspended_between(105.0, 108.0) is True   # fully inside
+    assert perf_metrics.likely_suspended_between(95.0, 102.0) is True    # overlaps start
+    assert perf_metrics.likely_suspended_between(108.0, 115.0) is True   # overlaps end
+    assert perf_metrics.likely_suspended_between(90.0, 99.0) is False    # before
+    assert perf_metrics.likely_suspended_between(111.0, 120.0) is False  # after
+
+
+def test_likely_suspended_between_false_with_no_windows():
+    assert perf_metrics.likely_suspended_between(0.0, 1_000_000.0) is False
+
+
+def test_reset_clears_suspend_windows():
+    perf_metrics._SUSPEND_WINDOWS.append((100.0, 110.0))
+    perf_metrics.reset()
+    assert perf_metrics.likely_suspended_between(100.0, 110.0) is False
+
+
+def test_start_suspend_watchdog_is_idempotent():
+    """Calling it repeatedly (every MainWindow construction in tests that
+    build a real one) must not spawn a new thread each time."""
+    import threading as _threading
+
+    perf_metrics.start_suspend_watchdog()
+    perf_metrics.start_suspend_watchdog()
+    perf_metrics.start_suspend_watchdog()
+    watchdog_threads = [
+        t for t in _threading.enumerate() if t.name == "perf_metrics_suspend_watchdog"
+    ]
+    assert len(watchdog_threads) == 1
+
+
 def test_record_is_thread_safe_under_concurrent_writers():
     def writer(n):
         for i in range(50):

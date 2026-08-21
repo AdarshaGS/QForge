@@ -78,6 +78,7 @@ class MainWindow(QMainWindow):
         # happens before this constructor runs at all, so it isn't a stage
         # here — only stages reachable from inside MainWindow are timed.
         _startup_t0 = time.perf_counter()
+        perf_metrics.start_suspend_watchdog()
 
         self._panels: list[ConnectionPanel] = []
         self.query_history = QueryHistory()
@@ -88,9 +89,14 @@ class MainWindow(QMainWindow):
         self._init_ui()
         perf_metrics.record("startup", "window_created", (time.perf_counter() - _startup_t0) * 1000)
 
-        # Open first connection (blocks until success or user quits)
+        # Open first connection (blocks until success or user quits).
+        # _prompt_new_connection accumulates the modal dialog's own exec()
+        # time into this — see its comment (issue #173).
+        self._dialog_wait_ms = 0.0
         self._prompt_new_connection(allow_cancel_quit=True)
-        perf_metrics.record("startup", "connection_manager_ready", (time.perf_counter() - _startup_t0) * 1000)
+        _elapsed_ms = (time.perf_counter() - _startup_t0) * 1000
+        perf_metrics.record("startup", "dialog_wait", self._dialog_wait_ms)
+        perf_metrics.record("startup", "connection_manager_ready", _elapsed_ms - self._dialog_wait_ms)
 
         # Keyboard shortcuts. Ctrl+T/P/R/N/Q are NOT bound here — each already
         # has an identical-key QAction in the menu bar (_create_menu_bar,
@@ -114,7 +120,10 @@ class MainWindow(QMainWindow):
             self._perf_overlay.toggle()
 
         self.restore_session()
-        perf_metrics.record("startup", "ui_interactive", (time.perf_counter() - _startup_t0) * 1000)
+        perf_metrics.record(
+            "startup", "ui_interactive",
+            (time.perf_counter() - _startup_t0) * 1000 - self._dialog_wait_ms,
+        )
         self._start_update_check()
         self._start_entitlement_config_check()
 
@@ -443,7 +452,17 @@ class MainWindow(QMainWindow):
             # while the main window is in native full-screen kicks the app
             # out to a new desktop/Space instead of staying put (issue #15).
             dialog = ConnectionDialog(auto_connect_last=(len(self._panels) == 0), parent=self)
-            if not dialog.exec():
+            # dialog.exec()'s blocking modal loop is the user picking a
+            # connection and clicking Connect — real human think-time, not
+            # app overhead. Accumulated (the while loop can re-prompt on an
+            # invalid/empty selection) and subtracted back out of the
+            # startup-stage timings in __init__ (issue #173) so "app took
+            # 5 seconds to start" isn't actually "you took 5 seconds to
+            # click a connection."
+            _dialog_t0 = time.perf_counter()
+            accepted = dialog.exec()
+            self._dialog_wait_ms += (time.perf_counter() - _dialog_t0) * 1000
+            if not accepted:
                 if allow_cancel_quit and not self._panels:
                     sys.exit()
                 return

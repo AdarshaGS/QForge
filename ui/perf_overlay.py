@@ -160,6 +160,11 @@ class PerfOverlayWidget(QWidget):
         for stage in _STARTUP_STAGES:
             if stage in startup:
                 lines.append(f"Startup — {stage}: {startup[stage]['last']:.0f} ms")
+        if "dialog_wait" in startup:
+            # Not a stage like the others — this is the time already
+            # subtracted out of connection_manager_ready/ui_interactive
+            # above, not additional time on top of them (issue #173).
+            lines.append(f"Startup — dialog wait (human, excluded above): {startup['dialog_wait']['last']:.0f} ms")
 
         lines += [
             "<br><b>Database</b>",
@@ -180,6 +185,7 @@ class PerfOverlayWidget(QWidget):
             "<br><b>System</b>",
             f"Schema cache: {cache_ratio}",
             f"Background tasks: {tasks_line}",
+            f"Suspend events filtered: {sum(perf_metrics.counter_get('suspend_filtered').values())}",
         ]
         self._label.setText("<br>".join(lines))
         self.reposition()
