@@ -7,6 +7,8 @@ run them on a worker thread (same shape as utils/entitlement_fetcher.py's
 EntitlementConfigFetcher) so a slow/unreachable server never freezes the
 dialog.
 """
+from datetime import date
+
 from PySide6.QtCore import QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
@@ -22,12 +24,13 @@ from PySide6.QtWidgets import (
 )
 
 from services.entitlements import Edition, entitlements
-from services.license_manager import license_manager
+from services.license_manager import GRACE_PERIOD_DAYS, license_manager
 
 
-class _LicenseActionWorker(QThread):
-    """Runs a single license_manager call (activate or deactivate) off
-    the UI thread and emits whatever it returns."""
+class LicenseActionWorker(QThread):
+    """Runs a single license_manager call (activate, deactivate, or the
+    background revalidate_online() in main.py) off the UI thread and
+    emits whatever it returns."""
 
     finished_with_result = Signal(object)
 
@@ -77,6 +80,23 @@ class LicenseDialog(QDialog):
         if license_id:
             layout.addWidget(QLabel(f"License ID: {license_id[:8]}…"))
         layout.addWidget(QLabel(f"Expires: {expires_at or 'No expiration'}"))
+
+        status = license_manager.validation_status()
+        if status and status.get("last_validated_at"):
+            try:
+                last_validated = date.fromisoformat(status["last_validated_at"])
+                days_ago = (date.today() - last_validated).days
+                layout.addWidget(QLabel(f"Last verified online: {status['last_validated_at']} ({days_ago} day(s) ago)"))
+                remaining = GRACE_PERIOD_DAYS - days_ago
+                if 0 <= remaining <= 3:
+                    warning = QLabel(
+                        f"Offline grace period ends in {remaining} day(s) — "
+                        "connect to the internet to keep Pro active."
+                    )
+                    warning.setWordWrap(True)
+                    layout.addWidget(warning)
+            except ValueError:
+                pass
 
         divider = QFrame()
         divider.setFrameShape(QFrame.HLine)
@@ -135,7 +155,7 @@ class LicenseDialog(QDialog):
             self.deactivate_btn.setEnabled(not busy)
 
     def _run_worker(self, fn, on_finished):
-        self._worker = _LicenseActionWorker(fn, parent=self)
+        self._worker = LicenseActionWorker(fn, parent=self)
         self._worker.finished_with_result.connect(on_finished)
         self._worker.start()
 

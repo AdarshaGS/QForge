@@ -91,6 +91,33 @@ def test_activate_online_malformed_response_returns_network_error(monkeypatch):
     assert result == {"ok": False, "reason": "network_error"}
 
 
+def test_validate_online_success(monkeypatch):
+    captured = _mock_urlopen(monkeypatch, response={"ok": True, "status": "active", "device_limit": 2, "seats_used": 1})
+
+    result = licensing_client.validate_online("the-key", "install-1")
+
+    assert result == {"ok": True, "status": "active", "device_limit": 2, "seats_used": 1}
+    assert captured["method"] == "POST"
+    assert captured["url"] == f"{licensing_client.LICENSING_SERVICE_URL}/validate"
+    assert captured["body"] == {"license_key": "the-key", "installation_id": "install-1"}
+
+
+def test_validate_online_passes_through_revoked_status(monkeypatch):
+    _mock_urlopen(monkeypatch, response={"ok": False, "status": "revoked", "reason": "license_revoked"})
+
+    result = licensing_client.validate_online("the-key", "install-1")
+
+    assert result == {"ok": False, "status": "revoked", "reason": "license_revoked"}
+
+
+def test_validate_online_network_failure_returns_network_error(monkeypatch):
+    _mock_urlopen(monkeypatch, raises=urllib.error.URLError("no connection"))
+
+    result = licensing_client.validate_online("the-key", "install-1")
+
+    assert result == {"ok": False, "reason": "network_error"}
+
+
 def test_deactivate_online_never_raises_on_network_failure(monkeypatch):
     _mock_urlopen(monkeypatch, raises=urllib.error.URLError("no connection"))
     licensing_client.deactivate_online("the-key", "install-1")  # must not raise

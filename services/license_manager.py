@@ -6,20 +6,34 @@ read, verified, and turned into an edition string.
 Signature validation is always local and offline (a key signed by
 scripts/issue_license.py or qforge-licensing's admin API). activate()
 additionally calls out to the qforge-licensing service (services/
-licensing_client.py) to enforce the license's device limit — the one
-place in the app that touches the network for licensing. load() and
-current_edition() stay purely local, so every app launch after the first
-activation is fully offline; see qforge-licensing's ARCHITECTURE.md §7/§8.
+licensing_client.py) to enforce the license's device limit — load() and
+current_edition() stay purely local (the validation cache below lives in
+the OS keychain, not the network), so every app launch after the first
+activation is fully offline unless a background revalidate_online() call
+(see main.py) succeeds in reaching the server. See qforge-licensing's
+ARCHITECTURE.md §7/§8.
 
 Fails closed to "free" on any invalid/missing/expired/tampered/unreachable
 state — this is the sole gate between "user typed something in a box" and
 the app granting Pro capabilities, so every failure path returns the same
 safe default rather than raising.
+
+Offline grace period: load() also checks a small validation cache (OS
+keychain, not license.json — so it can't be hand-edited the way a plain
+JSON field could) recording when the license was last confirmed with the
+server. That cache is refreshed by activate() and by the periodic
+revalidate_online() below; if it goes stale for more than GRACE_PERIOD_DAYS,
+or the server explicitly reports the license revoked/suspended/expired, or
+the system clock appears to have been rolled back, load() fails closed —
+even though the signature itself is still valid.
 """
 import base64
 import json
 import os
 from datetime import date
+
+import keyring
+from keyring.errors import PasswordDeleteError
 
 from services import licensing_client
 from utils.installation_id import get_installation_id
@@ -31,6 +45,48 @@ logger = get_logger()
 
 _LICENSE_FILE = os.path.join(app_data_dir(), "license.json")
 _SEPARATOR = "."
+
+_VALIDATION_KEYRING_SERVICE = "QForge-License-Validation"
+_VALIDATION_KEYRING_ACCOUNT = "state"
+GRACE_PERIOD_DAYS = 14
+
+_BAD_SERVER_STATUSES = ("revoked", "suspended", "expired", "not_activated")
+
+
+def _load_validation_cache() -> dict | None:
+    """The cached {"last_validated_at": iso_date, "server_status": ...}
+    state, or None if missing/unreadable/malformed. Never raises."""
+    try:
+        raw = keyring.get_password(_VALIDATION_KEYRING_SERVICE, _VALIDATION_KEYRING_ACCOUNT)
+    except Exception as ex:
+        logger.warning(f"Keychain: failed to read license validation cache: {ex}")
+        return None
+    if not raw:
+        return None
+    try:
+        cache = json.loads(raw)
+        return cache if isinstance(cache, dict) else None
+    except Exception:
+        return None
+
+
+def _save_validation_cache(cache: dict) -> None:
+    """Best-effort — a failure here just means the next load() sees a
+    stale/missing cache and fails closed, same safe direction as every
+    other failure mode in this module."""
+    try:
+        keyring.set_password(_VALIDATION_KEYRING_SERVICE, _VALIDATION_KEYRING_ACCOUNT, json.dumps(cache))
+    except Exception as ex:
+        logger.warning(f"Keychain: failed to save license validation cache: {ex}")
+
+
+def _clear_validation_cache() -> None:
+    try:
+        keyring.delete_password(_VALIDATION_KEYRING_SERVICE, _VALIDATION_KEYRING_ACCOUNT)
+    except PasswordDeleteError:
+        pass  # nothing stored — fine
+    except Exception as ex:
+        logger.warning(f"Keychain: failed to clear license validation cache: {ex}")
 
 
 def canonical_payload_bytes(payload: dict) -> bytes:
@@ -102,13 +158,45 @@ class LicenseManager:
 
     def load(self) -> dict | None:
         """Validated license payload, or None — covers "no license file",
-        "unreadable file", "bad signature", "tampered payload", and
-        "expired", all folding to the same Free-by-default result."""
+        "unreadable file", "bad signature", "tampered payload", "expired",
+        "server-confirmed revoked/suspended/expired/deactivated", "clock
+        rolled back", and "offline grace period expired", all folding to
+        the same Free-by-default result."""
         stored = self._load_raw()
         if stored is None:
             return None
         payload, _ = _validate_key_string(stored.get("key", ""))
+        if payload is None:
+            return None
+
+        cache = _load_validation_cache()
+        if cache is None:
+            # activate() always seeds this cache; a missing entry means
+            # it was lost or cleared (or predates this check) — fail
+            # closed, same as every other missing/tampered state here.
+            return None
+        if cache.get("server_status") in _BAD_SERVER_STATUSES:
+            return None
+
+        try:
+            last_validated = date.fromisoformat(cache.get("last_validated_at", ""))
+        except (TypeError, ValueError):
+            return None  # malformed cache — fail closed
+
+        today = date.today()
+        if today < last_validated:
+            logger.warning("License validation timestamp is ahead of the system clock — possible clock rollback.")
+            return None
+        if (today - last_validated).days > GRACE_PERIOD_DAYS:
+            return None
+
         return payload
+
+    def validation_status(self) -> dict | None:
+        """The raw validation-cache dict, for display only
+        (ui/license_dialog.py) — load() already folds this into pass/fail;
+        this lets the UI show *why* without duplicating that logic."""
+        return _load_validation_cache()
 
     def activate(self, key_string: str) -> tuple[bool, str]:
         """Validate locally before ever touching the network or the
@@ -143,6 +231,7 @@ class LicenseManager:
         except OSError as ex:
             logger.error(f"Failed to write license file: {ex}")
             return False, f"Could not save the license: {ex}"
+        _save_validation_cache({"last_validated_at": date.today().isoformat(), "server_status": "active"})
         return True, ""
 
     def deactivate(self):
@@ -159,6 +248,48 @@ class LicenseManager:
                 os.remove(_LICENSE_FILE)
         except OSError as ex:
             logger.warning(f"Failed to remove license file: {ex}")
+        _clear_validation_cache()
+
+    def revalidate_online(self) -> None:
+        """Re-checks the stored license with the licensing service.
+        Called at most once per app launch (see main.py), only when
+        locally Pro. Never raises; safe to call from a background thread.
+
+        - No locally-valid license → no-op, nothing to revalidate.
+        - Server confirms "active" → resets the offline-grace-period clock.
+        - Server confirms revoked/suspended/expired, or this installation
+          isn't a live seat ("not_activated") → records that explicit bad
+          state; load() fails closed immediately regardless of how fresh
+          the grace period otherwise looks.
+        - network_error / invalid_license (the latter shouldn't happen
+          post local signature check) → cache is left untouched, so an
+          unreachable server never cuts the grace period short.
+        """
+        stored = self._load_raw()
+        if stored is None:
+            return
+        key_string = stored.get("key", "")
+        payload, _ = _validate_key_string(key_string)
+        if payload is None:
+            return
+
+        result = licensing_client.validate_online(key_string, get_installation_id())
+        status = result.get("status")
+        reason = result.get("reason")
+
+        if result.get("ok") and status == "active":
+            _save_validation_cache({"last_validated_at": date.today().isoformat(), "server_status": "active"})
+            return
+
+        bad_status = status if status in _BAD_SERVER_STATUSES else (
+            "not_activated" if reason == "not_activated" else None
+        )
+        if bad_status:
+            cache = _load_validation_cache() or {}
+            cache["server_status"] = bad_status
+            _save_validation_cache(cache)
+        # else: network_error / invalid_license / anything unrecognized —
+        # leave the cache exactly as it is.
 
     def current_edition(self) -> str:
         """"pro" or "free" — a plain string, not the Edition enum: keeps

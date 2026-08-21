@@ -50,6 +50,21 @@ def activate_online(license_key: str, installation_id: str) -> dict:
     return result
 
 
+def validate_online(license_key: str, installation_id: str) -> dict:
+    """{"ok": True, "status": "active", "device_limit": ..., "seats_used": ...}
+    on a still-live seat, {"ok": False, "status": "revoked" | "suspended" |
+    "expired" | "active", "reason": ...} on a server-confirmed bad state, or
+    {"ok": False, "reason": "invalid_license"} — the same shape
+    qforge-licensing's POST /validate returns, with "network_error" added
+    locally for anything that never got a response at all. Doesn't register
+    a new device or consume a seat — see services/license_manager.py's
+    revalidate_online()."""
+    result = _post("/validate", {"license_key": license_key, "installation_id": installation_id})
+    if result is None:
+        return {"ok": False, "reason": "network_error"}
+    return result
+
+
 def deactivate_online(license_key: str, installation_id: str) -> None:
     """Best-effort — mirrors POST /deactivate's own "best-effort cleanup,
     not a security boundary" design. Failures are swallowed; the caller

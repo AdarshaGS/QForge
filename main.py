@@ -16,9 +16,10 @@ from services.db_service import DbService
 from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
 from services.entitlements import Edition, entitlements
+from services.license_manager import license_manager
 from ui.connection_dialog import ConnectionDialog
 from ui.connection_panel import ConnectionPanel
-from ui.license_dialog import LicenseDialog
+from ui.license_dialog import LicenseActionWorker, LicenseDialog
 from ui.theme_manager import ThemeManager
 from ui.perf_overlay import PerfOverlayWidget
 from utils.logger import setup_logger, get_logger
@@ -126,6 +127,21 @@ class MainWindow(QMainWindow):
         )
         self._start_update_check()
         self._start_entitlement_config_check()
+        self._start_license_revalidation()
+
+    # ─── License revalidation (offline grace period) ───────────────────────────
+
+    def _start_license_revalidation(self):
+        """Background, best-effort re-check with the licensing service —
+        at most once per launch, only for locally-Pro installs (Free has
+        nothing to revalidate). See LicenseManager.revalidate_online() for
+        the grace-period/revocation contract; a stale or unreachable
+        server just leaves the existing grace period running."""
+        if entitlements.edition() is not Edition.PRO:
+            return
+        self._license_revalidation_worker = LicenseActionWorker(license_manager.revalidate_online)
+        self._license_revalidation_worker.finished_with_result.connect(lambda _: self._refresh_pro_menu_labels())
+        self._license_revalidation_worker.start()
 
     # ─── Entitlement config (Free/Pro limits, live-overridable) ────────────────
 
