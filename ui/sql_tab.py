@@ -875,7 +875,6 @@ class SqlTab(QWidget):
         # existed before any query had run (issue #24). The status area
         # takes the space instead.
         self.result_table.hide()
-        self._set_status("Run a query to see results here.")
 
         # ── Pagination bar ─────────────────────────────────────────────
         self._pagination_bar = QWidget()
@@ -919,13 +918,14 @@ class SqlTab(QWidget):
         bottom_layout.setSpacing(2)
         bottom_layout.addWidget(self.filter_container)
 
-        status_row = QWidget()
-        status_row_layout = QHBoxLayout(status_row)
+        self._status_row = QWidget()
+        status_row_layout = QHBoxLayout(self._status_row)
         status_row_layout.setContentsMargins(0, 0, 0, 0)
         status_row_layout.setSpacing(0)
         status_row_layout.addWidget(self.status_label, 1)
         status_row_layout.addWidget(self._result_actions_bar)
-        bottom_layout.addWidget(status_row)
+        bottom_layout.addWidget(self._status_row)
+        self._set_status("Run a query to see results here.")
 
         bottom_layout.addWidget(self._error_card_scroll)
         bottom_layout.addWidget(self._empty_state)
@@ -1755,13 +1755,16 @@ class SqlTab(QWidget):
         h = min(max(height, content_h), self._STATUS_MAX_HEIGHT)
         self.status_label.setFixedHeight(int(h))
         self.status_label.show()
+        self._status_row.show()
 
     def update_status(self, rows, execution_time, truncated=False):
-        """Row count and query time now live only in the bottom status bar
-        (issue #178 follow-up) — showing them a second time in a text line
-        above the grid was redundant. status_label is reserved for the one
-        thing the bottom bar can't show: the truncation warning."""
+        """Row count and query time live only in the bottom status bar —
+        no text/icon row above the grid on a normal successful query
+        (issue #178 follow-up: that row was removed entirely per
+        feedback against a live screenshot). The one exception is the
+        truncation warning, which the bottom bar has no room for."""
         self._error_card_scroll.hide()
+        self._result_actions_bar.hide()
         if rows > 0:
             self._empty_state.hide()
         if truncated:
@@ -1781,7 +1784,7 @@ class SqlTab(QWidget):
         else:
             self.status_label.hide()
             self.status_label.setFixedHeight(0)
-        self._result_actions_bar.show()
+            self._status_row.hide()
         self._query_time_lbl.setText(f"Query time: {execution_time * 1000:.0f} ms")
         self._rows_status_lbl.setText(f"Rows: {rows}")
 
@@ -1822,6 +1825,7 @@ class SqlTab(QWidget):
         self._result_actions_bar.hide()
         self.status_label.hide()
         self.status_label.setFixedHeight(0)
+        self._status_row.hide()
 
         self._error_title_lbl.setText(_sql_error_title(message))
         self._error_message_lbl.setText(message)

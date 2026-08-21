@@ -78,12 +78,16 @@ def test_filter_icon_triggers_toggle_filter(monkeypatch):
     tab.hide()
 
 
-def test_result_actions_bar_shown_on_success_hidden_on_error():
+def test_result_actions_bar_stays_hidden_on_success_and_on_error():
+    """The row-action icon toolbar was removed from the success path
+    entirely per feedback against a live screenshot — update_status() no
+    longer shows any row above the grid at all except the truncation
+    warning."""
     tab = _shown_tab()
     assert not tab._result_actions_bar.isVisible()
 
     tab.update_status(3, 0.01)
-    assert tab._result_actions_bar.isVisible()
+    assert not tab._result_actions_bar.isVisible()
 
     tab.show_error("ERROR: boom")
     assert not tab._result_actions_bar.isVisible()
