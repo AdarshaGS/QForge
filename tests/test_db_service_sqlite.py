@@ -420,3 +420,60 @@ def test_connect_missing_database_path_raises():
     service = DbService()
     with pytest.raises(Exception):
         service.connect({"type": "sqlite", "name": "t"})
+
+
+# ─── Adversarial identifiers (issue #114) ────────────────────────────────
+# A table/column name containing an embedded double-quote — achievable via
+# a quoted identifier, as any real SQLite CREATE TABLE can use — must not
+# break out of the identifier context in QForge's own generated metadata
+# queries (SHOW/PRAGMA-equivalents, content export, table browsing).
+
+_EVIL_TABLE = 'e"vil'
+_EVIL_COLUMN = 'na"me'
+
+
+@pytest.fixture
+def evil_db(db_path):
+    service = DbService()
+    service.connect({"type": "sqlite", "name": "test", "database": db_path})
+    service.execute_update(
+        'CREATE TABLE "e""vil" (id INTEGER PRIMARY KEY, "na""me" TEXT)'
+    )
+    service.execute_update('INSERT INTO "e""vil" (id, "na""me") VALUES (1, \'x\')')
+    yield service
+    service.disconnect()
+
+
+def test_get_columns_survives_quote_in_table_name(evil_db):
+    cols = evil_db.get_columns(_EVIL_TABLE)
+    assert [c["Field"] for c in cols] == ["id", _EVIL_COLUMN]
+
+
+def test_get_primary_keys_survives_quote_in_table_name(evil_db):
+    assert evil_db.get_primary_keys(_EVIL_TABLE) == ["id"]
+
+
+def test_get_indexes_survives_quote_in_table_name(evil_db):
+    evil_db.execute_update('CREATE INDEX "idx_evil" ON "e""vil" ("na""me")')
+    names = [idx["name"] for idx in evil_db.get_indexes(_EVIL_TABLE)]
+    assert "idx_evil" in names
+
+
+def test_content_select_list_quotes_columns(db_path):
+    service = DbService()
+    service.connect({"type": "sqlite", "name": "test", "database": db_path})
+    service.execute_update(
+        'CREATE TABLE "e""vil" (id INTEGER PRIMARY KEY, "na""me" TEXT, '
+        "total INTEGER GENERATED ALWAYS AS (id * 2) STORED)"
+    )
+    service.execute_update('INSERT INTO "e""vil" (id, "na""me") VALUES (1, \'x\')')
+    select_list = service.content_select_list(_EVIL_TABLE)
+    df = service.execute_query(f"SELECT {select_list} FROM {service._q(_EVIL_TABLE)}")
+    assert list(df.columns) == ["id", _EVIL_COLUMN]
+    service.disconnect()
+
+
+def test_stream_table_rows_survives_quote_in_table_name(evil_db):
+    columns, rows = next(evil_db.stream_table_rows(_EVIL_TABLE))
+    assert columns == ["id", _EVIL_COLUMN]
+    assert rows == [(1, "x")]

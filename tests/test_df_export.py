@@ -1,6 +1,9 @@
 import pandas as pd
 
-from utils.df_export import _quote_identifier, _sql_value_literal, _to_sql_inserts, drop_table_statement
+from utils.df_export import (
+    _guarded_for_spreadsheet, _quote_identifier, _sql_value_literal,
+    _to_sql_inserts, drop_table_statement,
+)
 
 
 def test_sql_value_literal_null_for_none_and_nan():
@@ -37,6 +40,20 @@ def test_quote_identifier_escapes_embedded_quote_char_per_dialect():
         '"evil""; DROP TABLE users; --"'
     assert _quote_identifier('evil"; DROP TABLE users; --', "sqlite") == \
         '"evil""; DROP TABLE users; --"'
+
+
+def test_guarded_for_spreadsheet_neutralizes_string_cells_only():
+    """Issue #115: export_dataframe()'s CSV/XLSX paths go through
+    _guarded_for_spreadsheet before pandas serializes the file. Only
+    object-dtype (string) cells are touched — a numeric column's negative
+    values are left as real numbers, not turned into guarded text."""
+    df = pd.DataFrame({
+        "note": ["=cmd(calc)", "plain"],
+        "amount": [-5, 10],
+    })
+    guarded = _guarded_for_spreadsheet(df)
+    assert list(guarded["note"]) == ["'=cmd(calc)", "plain"]
+    assert list(guarded["amount"]) == [-5, 10]
 
 
 def test_to_sql_inserts_quotes_identifiers_per_dialect():

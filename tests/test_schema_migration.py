@@ -131,12 +131,28 @@ def test_default_value_quoting_heuristic():
     assert _column_def_sql(keyword).endswith("DEFAULT CURRENT_TIMESTAMP")
 
 
+def test_default_value_injection_on_numeric_type_is_quoted_not_raw():
+    """Issue #114: a crafted/compromised source database could report an
+    'int'-typed column with a non-numeric default. Older code trusted the
+    column's declared *type* to decide whether to emit DEFAULT unquoted —
+    the fix validates the *value* itself instead, so injection-shaped text
+    lands inside a quoted (and escaped) string literal rather than as raw
+    SQL."""
+    malicious = _col("retries", "int", default="0); DROP TABLE users; --")
+    assert _column_def_sql(malicious).endswith("DEFAULT '0); DROP TABLE users; --'")
+
+
+def test_default_value_with_embedded_quote_is_escaped():
+    malicious = _col("bio", "varchar(50)", default="o'brien")
+    assert _column_def_sql(malicious).endswith("DEFAULT 'o''brien'")
+
+
 def test_index_primary_key_special_cased_for_mysql():
     idx = IndexDiff(name="PRIMARY", change="removed", source={"columns": "id", "unique": True, "type": "BTREE"})
 
     stmts = _index_sql("users", idx, "mysql")
 
-    assert stmts == ["ALTER TABLE `users` ADD PRIMARY KEY (id);"]
+    assert stmts == ["ALTER TABLE `users` ADD PRIMARY KEY (`id`);"]
 
 
 def test_index_add_and_drop_for_postgres():
@@ -144,4 +160,19 @@ def test_index_add_and_drop_for_postgres():
     removed = IndexDiff(name="idx_sku", change="removed", source={"columns": "sku", "unique": True})
 
     assert _index_sql("items", added, "postgresql") == ['DROP INDEX "idx_extra";']
-    assert _index_sql("items", removed, "postgresql") == ['CREATE UNIQUE INDEX "idx_sku" ON "items" (sku);']
+    assert _index_sql("items", removed, "postgresql") == ['CREATE UNIQUE INDEX "idx_sku" ON "items" ("sku");']
+
+
+def test_index_column_list_with_malicious_column_name_is_quoted_per_column():
+    """Issue #114: DbService.get_indexes()'s 'columns' field is a raw,
+    unquoted, comma-joined string (it doubles as display text elsewhere) —
+    _index_sql must quote each column individually when turning it into
+    DDL, not interpolate the joined string as-is."""
+    idx = IndexDiff(
+        name="idx_evil", change="removed",
+        source={"columns": 'sku, name"); DROP TABLE items; --', "unique": False},
+    )
+    stmts = _index_sql("items", idx, "postgresql")
+    assert stmts == [
+        'CREATE INDEX "idx_evil" ON "items" ("sku", "name""); DROP TABLE items; --");'
+    ]

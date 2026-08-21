@@ -70,6 +70,14 @@ logger = get_logger()
 # DataFrame length is exactly that).
 MASS_WRITE_ROW_THRESHOLD = 5000
 
+# Issue #115: guardrails on CSV/TSV import — a crafted or accidentally huge
+# file (zip bomb-adjacent: a small file that decompresses/parses into an
+# enormous row count isn't possible for plain-text CSV the way it is for
+# .xlsx, but an ordinary multi-GB file is still an easy way to hang the app
+# or exhaust memory) fails with a clear message instead of an unbounded read.
+IMPORT_MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024  # 500 MiB
+IMPORT_MAX_ROWS = 2_000_000
+
 
 # ── Background query worker (must be a top-level class for PySide6) ──────────
 
@@ -2553,10 +2561,31 @@ class ConnectionPanel(QWidget):
             return
 
         try:
+            file_size = os.path.getsize(file_path)
+        except OSError as ex:
+            QMessageBox.critical(self, "Import Error", f"Could not read file:\n{ex}")
+            return
+        if file_size > IMPORT_MAX_FILE_SIZE_BYTES:
+            QMessageBox.critical(
+                self, "Import Error",
+                f"File is {file_size / (1024 * 1024):,.0f} MiB, over the "
+                f"{IMPORT_MAX_FILE_SIZE_BYTES // (1024 * 1024):,} MiB import limit.")
+            return
+
+        try:
             sep = "\t" if file_path.endswith((".tsv", ".txt")) else ","
-            df = pd.read_csv(file_path, sep=sep, keep_default_na=False)
+            df = pd.read_csv(
+                file_path, sep=sep, keep_default_na=False,
+                nrows=IMPORT_MAX_ROWS + 1,
+            )
         except Exception as ex:
             QMessageBox.critical(self, "Import Error", f"Could not read file:\n{ex}")
+            return
+
+        if len(df) > IMPORT_MAX_ROWS:
+            QMessageBox.critical(
+                self, "Import Error",
+                f"File has more than {IMPORT_MAX_ROWS:,} rows — over the import limit.")
             return
 
         if df.empty:
@@ -2580,15 +2609,15 @@ class ConnectionPanel(QWidget):
         if db_type == "sqlite":
             ph = "?"
 
-        cols_sql = ", ".join(
-            f"`{c}`" if db_type == "mysql" else f'"{c}"'
-            for c in df.columns
-        )
+        # Issue #114/#115: column names come straight from the imported
+        # file's header row — untrusted input — so they're quoted and
+        # escaped the same way _quote_identifier already handles exported
+        # SQL, not just wrapped in bare backticks/quotes.
+        cols_sql = ", ".join(_quote_identifier(c, db_type) for c in df.columns)
         placeholders = ", ".join([ph] * len(df.columns))
         insert_sql = (
-            f"INSERT INTO `{table_name}` ({cols_sql}) VALUES ({placeholders})"  # nosec B608
-            if db_type == "mysql"
-            else f'INSERT INTO "{table_name}" ({cols_sql}) VALUES ({placeholders})'  # nosec B608
+            f"INSERT INTO {_quote_identifier(table_name, db_type)} "
+            f"({cols_sql}) VALUES ({placeholders})"  # nosec B608 -- identifiers quoted/escaped via _quote_identifier(), values parameterized
         )
 
         mass_write_reason = (

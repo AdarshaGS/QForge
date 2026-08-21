@@ -1,3 +1,4 @@
+import os
 import re as _re
 import time
 import pandas as pd
@@ -101,6 +102,14 @@ def _sql_error_hint(message: str, query: str = "") -> str:
 _MYSQL_CODE_RE = _re.compile(r"^\(?(\d{3,5}),")
 _ERROR_LINE_RE = _re.compile(r"at line (\d+)", _re.IGNORECASE)
 _ERROR_NEAR_RE = _re.compile(r"near ['\"](.+?)['\"]", _re.IGNORECASE)
+
+# Issue #115: guardrails on CSV/JSON/Excel import into a query tab's result
+# grid. A file-size cap rejects an oversized file (including a maliciously
+# crafted small .xlsx that would decompress into an enormous sheet) before
+# it's even opened; the row cap catches a large-but-not-huge JSON/Excel file
+# that a byte-size check alone wouldn't.
+_IMPORT_MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024  # 500 MiB
+_IMPORT_MAX_ROWS = 2_000_000
 
 
 def _sql_error_title(message: str) -> str:
@@ -1909,11 +1918,23 @@ class SqlTab(QWidget):
         if not file_name:
             return
 
+        try:
+            file_size = os.path.getsize(file_name)
+        except OSError as ex:
+            QMessageBox.critical(self, "Error", f"Could not read file:\n{ex}")
+            return
+        if file_size > _IMPORT_MAX_FILE_SIZE_BYTES:
+            QMessageBox.critical(
+                self, "Error",
+                f"File is {file_size / (1024 * 1024):,.0f} MiB, over the "
+                f"{_IMPORT_MAX_FILE_SIZE_BYTES // (1024 * 1024):,} MiB import limit.")
+            return
+
         _import_t0 = time.perf_counter()
         try:
             # Determine format from file extension
             if file_name.endswith('.csv'):
-                df = pd.read_csv(file_name)
+                df = pd.read_csv(file_name, nrows=_IMPORT_MAX_ROWS + 1)
                 format_name = "CSV"
             elif file_name.endswith('.json'):
                 df = pd.read_json(file_name)
@@ -1927,6 +1948,12 @@ class SqlTab(QWidget):
                     "Unsupported Format",
                     "Please select a CSV, JSON, or Excel file"
                 )
+                return
+
+            if len(df) > _IMPORT_MAX_ROWS:
+                QMessageBox.critical(
+                    self, "Error",
+                    f"File has more than {_IMPORT_MAX_ROWS:,} rows — over the import limit.")
                 return
 
             # Load the imported data into the table

@@ -27,9 +27,9 @@ ROWS_PER_TABLE = 200
 def _make_sqlite_db(path: str) -> None:
     conn = sqlite3.connect(path)
     for t in range(TABLE_COUNT):
-        conn.execute(f"CREATE TABLE t{t} (id INTEGER PRIMARY KEY, name TEXT, value REAL)")
+        conn.execute(f"CREATE TABLE t{t} (id INTEGER PRIMARY KEY, name TEXT, value REAL)")  # nosec B608 -- t is a local range(TABLE_COUNT) index, not external input
         conn.executemany(
-            f"INSERT INTO t{t} (name, value) VALUES (?, ?)",
+            f"INSERT INTO t{t} (name, value) VALUES (?, ?)",  # nosec B608 -- t is a local range(TABLE_COUNT) index, not external input
             [(f"row-{i}", i * 1.5) for i in range(ROWS_PER_TABLE)],
         )
     conn.commit()

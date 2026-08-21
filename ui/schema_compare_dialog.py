@@ -36,15 +36,25 @@ _CHANGE_COLORS = {
 def _load_connection_profiles() -> list:
     """Raw (credential-free) connection list for populating the source/
     target pickers — full credentials are only resolved for the two
-    connections actually chosen, at Compare time (see _resolve_config)."""
+    connections actually chosen, at Compare time (see _resolve_config).
+
+    Only used for display labels, so this doesn't need the full field
+    validation ConnectionDialog._sanitize_connection_entry does — but a
+    hand-edited or malicious connections.json (issue #116) can still put
+    a non-list at the top level or non-dict entries in it, which would
+    otherwise crash _profile_label's/.get() calls below. Drop anything
+    that isn't a dict rather than trusting the file's shape."""
     path = ConnectionDialog.CONNECTION_FILE
     if not os.path.exists(path):
         return []
     try:
         with open(path, "r") as f:
-            return json.load(f)
+            raw = json.load(f)
     except Exception:
         return []
+    if not isinstance(raw, list):
+        return []
+    return [conn for conn in raw if isinstance(conn, dict)]
 
 
 def _profile_label(conn: dict) -> str:

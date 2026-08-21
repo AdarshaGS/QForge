@@ -152,16 +152,16 @@ def _render_pattern(pattern: str, seq: int) -> str:
     DB-adjacent, user-authored text that class of bug comes from)."""
     def repl(m: re.Match) -> str:
         token, lo, hi = m.group(1), m.group(2), m.group(3)
-        if token == "seq":
+        if token == "seq":  # nosec B105 -- token name, not a secret
             return str(seq + 1)
-        if token == "seq0":
+        if token == "seq0":  # nosec B105 -- token name, not a secret
             return str(seq)
-        if token == "uuid":
+        if token == "uuid":  # nosec B105 -- token name, not a secret
             return str(uuid.uuid4())
-        if token == "random_int":
+        if token == "random_int":  # nosec B105 -- token name, not a secret
             lo_v = int(lo) if lo is not None else 1
             hi_v = int(hi) if hi is not None else 1000
-            return str(random.randint(min(lo_v, hi_v), max(lo_v, hi_v)))
+            return str(random.randint(min(lo_v, hi_v), max(lo_v, hi_v)))  # nosec B311 -- mock/sample data, not security-sensitive
         return m.group(0)
     return _TOKEN_RE.sub(repl, pattern)
 
@@ -176,20 +176,20 @@ def _parse_date(value: str) -> date:
 def _gen_integer(spec: ColumnSpec, seq: int):
     lo = spec.options.get("min", 1)
     hi = spec.options.get("max", 100_000)
-    return random.randint(min(lo, hi), max(lo, hi))
+    return random.randint(min(lo, hi), max(lo, hi))  # nosec B311 -- mock/sample data, not security-sensitive
 
 
 def _gen_float(spec: ColumnSpec, seq: int):
     lo = spec.options.get("min", 0.0)
     hi = spec.options.get("max", 1000.0)
     decimals = spec.options.get("decimals", 2)
-    return round(random.uniform(min(lo, hi), max(lo, hi)), decimals)
+    return round(random.uniform(min(lo, hi), max(lo, hi)), decimals)  # nosec B311 -- mock/sample data, not security-sensitive
 
 
 def _gen_string(spec: ColumnSpec, seq: int):
     length = spec.options.get("length", 10)
     alphabet = string.ascii_lowercase + string.digits
-    return "".join(random.choices(alphabet, k=max(length, 1)))
+    return "".join(random.choices(alphabet, k=max(length, 1)))  # nosec B311 -- mock/sample data, not security-sensitive
 
 
 def _gen_uuid(spec: ColumnSpec, seq: int):
@@ -197,14 +197,14 @@ def _gen_uuid(spec: ColumnSpec, seq: int):
 
 
 def _gen_boolean(spec: ColumnSpec, seq: int):
-    return random.choice([True, False])
+    return random.choice([True, False])  # nosec B311 -- mock/sample data, not security-sensitive
 
 
 def _gen_date(spec: ColumnSpec, seq: int):
     start = _parse_date(spec.options.get("start", "2020-01-01"))
     end = _parse_date(spec.options.get("end", date.today().isoformat()))
     delta = max((end - start).days, 0)
-    d = start + timedelta(days=random.randint(0, delta))
+    d = start + timedelta(days=random.randint(0, delta))  # nosec B311 -- mock/sample data, not security-sensitive
     return d.isoformat()  # returned as str so _sql_value_literal quotes it
 
 
@@ -212,8 +212,8 @@ def _gen_datetime(spec: ColumnSpec, seq: int):
     start = _parse_date(spec.options.get("start", "2020-01-01"))
     end = _parse_date(spec.options.get("end", date.today().isoformat()))
     delta = max((end - start).days, 0)
-    d = start + timedelta(days=random.randint(0, delta))
-    dt = datetime.combine(d, datetime.min.time()) + timedelta(seconds=random.randint(0, 86_399))
+    d = start + timedelta(days=random.randint(0, delta))  # nosec B311 -- mock/sample data, not security-sensitive
+    dt = datetime.combine(d, datetime.min.time()) + timedelta(seconds=random.randint(0, 86_399))  # nosec B311 -- mock/sample data, not security-sensitive
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -259,7 +259,7 @@ _SIMPLE_GENERATORS = {
 
 def _generate_value(spec: ColumnSpec, seq: int, pool: list):
     if spec.generator == "foreign_key":
-        return random.choice(pool) if pool else None
+        return random.choice(pool) if pool else None  # nosec B311 -- mock/sample data, not security-sensitive
     if spec.generator == "custom_pattern":
         return _render_pattern(spec.options.get("pattern", "{seq}"), seq)
     fn = _SIMPLE_GENERATORS.get(spec.generator)
@@ -284,7 +284,7 @@ def generate_dataframe(columns: list[dict], row_count: int,
     for seq in range(row_count):
         for name in active:
             spec = specs[name]
-            if spec.generator != "null" and spec.null_rate > 0 and random.random() < spec.null_rate:
+            if spec.generator != "null" and spec.null_rate > 0 and random.random() < spec.null_rate:  # nosec B311 -- mock/sample data, not security-sensitive
                 data[name].append(None)
                 continue
             data[name].append(_generate_value(spec, seq, fk_pools.get(name, [])))

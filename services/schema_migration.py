@@ -8,8 +8,8 @@ user copy/export, and run themselves wherever they choose.
 """
 from services.db_service import DbService
 from services.schema_diff import SchemaDiff
+from utils.df_export import _quote_identifier as _quote
 
-_NUMERIC_TYPE_HINTS = ("int", "decimal", "float", "double", "bit", "numeric", "real")
 _DEFAULT_KEYWORDS = {"CURRENT_TIMESTAMP", "NULL", "NOW()"}
 
 
@@ -64,18 +64,24 @@ def _diff_for_table(diff: SchemaDiff, table_name: str) -> SchemaDiff:
     return scoped
 
 
-def _quote(ident: str, db_type: str) -> str:
-    return f"`{ident}`" if db_type == "mysql" else f'"{ident}"'
-
-
 def _default_clause(info) -> str:
+    """Emits DEFAULT <val> unquoted only when *val* itself parses as a
+    number — not, as before, whenever the column's declared *type* merely
+    looked numeric. info.default comes from the source database's own
+    schema metadata (issue #114): a crafted/compromised source DB could
+    otherwise put injection-shaped text (e.g. `0); DROP TABLE x; --`) in an
+    int column's declared default and have it emitted raw into this
+    generated DDL."""
     if info.default is None:
         return ""
     val = str(info.default)
-    is_numeric_type = any(hint in (info.data_type or "").lower() for hint in _NUMERIC_TYPE_HINTS)
-    if val.upper() in _DEFAULT_KEYWORDS or is_numeric_type:
+    if val.upper() in _DEFAULT_KEYWORDS:
         return f" DEFAULT {val}"
-    return f" DEFAULT '{val.replace(chr(39), chr(39) * 2)}'"
+    try:
+        float(val)
+        return f" DEFAULT {val}"
+    except ValueError:
+        return f" DEFAULT '{val.replace(chr(39), chr(39) * 2)}'"
 
 
 def _column_def_sql(info) -> str:
@@ -121,13 +127,22 @@ def _alter_table_sql(table_diff, db_type: str) -> list:
     return stmts
 
 
+def _quoted_column_list(cols: str, db_type: str) -> str:
+    """*cols* is DbService.get_indexes()'s comma-joined 'columns' field —
+    raw, unquoted column names, since that's also used for plain display
+    (Structure panel, ERD). Quoting happens here instead, at the one place
+    it's turned into DDL text, matching the same crafted-schema-metadata
+    threat _quote() already guards CREATE/ALTER/DROP against (issue #114)."""
+    return ", ".join(_quote(c.strip(), db_type) for c in cols.split(",") if c.strip())
+
+
 def _index_sql(table_name: str, idx, db_type: str) -> list:
     t = _quote(table_name, db_type)
     name = idx.name
     is_pk = name.upper() == "PRIMARY" and db_type == "mysql"
 
     def _create(info):
-        cols = info.get("columns", "")
+        cols = _quoted_column_list(info.get("columns", ""), db_type)
         if is_pk:
             return [f"ALTER TABLE {t} ADD PRIMARY KEY ({cols});"]
         unique = "UNIQUE " if info.get("unique") else ""

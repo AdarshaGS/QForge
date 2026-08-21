@@ -5,6 +5,7 @@ import sqlite3
 from utils.logger import get_logger
 from utils import schema_cache
 from utils import perf_metrics
+from utils.df_export import _quote_identifier
 from services import query_classifier
 
 logger = get_logger()
@@ -119,6 +120,16 @@ class DbService:
         self.read_only = False
         self.in_transaction = False
         self._config = None   # stored for auto-reconnect
+
+    def _q(self, identifier: str) -> str:
+        """Quote *identifier* (table/column/index name) for this
+        connection's dialect, escaping any embedded quote char the same way
+        utils/df_export._quote_identifier does for exported SQL (issue
+        #114) — table/column names ultimately come from the connected
+        database's own schema metadata, which a crafted or compromised
+        database can put anything into. SQLite accepts the same
+        double-quoted identifier syntax as PostgreSQL."""
+        return _quote_identifier(identifier, "mysql" if self.db_type == "mysql" else "postgresql")
 
     def _guard(self, sql: str):
         """Raise ReadOnlyViolation if *sql* contains a write statement and
@@ -653,7 +664,7 @@ class DbService:
                 return [{"column": r[0], "ref_table": r[1], "ref_column": r[2]} for r in rows]
             elif self.db_type == "sqlite":
                 cursor = self.connection.cursor()
-                cursor.execute(f"PRAGMA foreign_key_list({table_name})")
+                cursor.execute(f"PRAGMA foreign_key_list({self._q(table_name)})")
                 rows = cursor.fetchall()
                 cursor.close()
                 return [{"column": r[3], "ref_table": r[2], "ref_column": r[4]} for r in rows]
@@ -667,7 +678,7 @@ class DbService:
         try:
             if self.db_type == "mysql":
                 cursor = self.connection.cursor()
-                cursor.execute(f"SHOW KEYS FROM `{table_name}` WHERE Key_name = 'PRIMARY'")
+                cursor.execute(f"SHOW KEYS FROM {self._q(table_name)} WHERE Key_name = 'PRIMARY'")
                 rows = cursor.fetchall()
                 cursor.close()
                 rows.sort(key=lambda r: r["Seq_in_index"])
@@ -687,7 +698,7 @@ class DbService:
                 return [r[0] for r in rows]
             elif self.db_type == "sqlite":
                 cursor = self.connection.cursor()
-                cursor.execute(f"PRAGMA table_info({table_name})")
+                cursor.execute(f"PRAGMA table_info({self._q(table_name)})")
                 rows = cursor.fetchall()
                 cursor.close()
                 pk_rows = sorted((r for r in rows if r[5] > 0), key=lambda r: r[5])
@@ -704,7 +715,7 @@ class DbService:
         try:
             if self.db_type == "mysql":
                 cursor = self.connection.cursor()
-                cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+                cursor.execute(f"SHOW COLUMNS FROM {self._q(table_name)}")
                 rows = cursor.fetchall()
                 cursor.close()
                 return [r["Field"] for r in rows if "GENERATED" in (r.get("Extra") or "").upper()]
@@ -722,7 +733,7 @@ class DbService:
                 # PRAGMA table_xinfo adds a `hidden` column PRAGMA table_info
                 # lacks: 2 = VIRTUAL generated, 3 = STORED generated.
                 cursor = self.connection.cursor()
-                cursor.execute(f"PRAGMA table_xinfo({table_name})")
+                cursor.execute(f"PRAGMA table_xinfo({self._q(table_name)})")
                 rows = cursor.fetchall()
                 cursor.close()
                 return [r[1] for r in rows if r[6] in (2, 3)]
@@ -739,7 +750,7 @@ class DbService:
         generated = set(self.get_generated_columns(table_name))
         if not generated:
             return "*"
-        cols = [c["Field"] for c in self.get_columns(table_name) if c["Field"] not in generated]
+        cols = [self._q(c["Field"]) for c in self.get_columns(table_name) if c["Field"] not in generated]
         return ", ".join(cols) if cols else "*"
 
     def _fetch_rows(self, cursor, max_rows):
@@ -768,7 +779,7 @@ class DbService:
             raise Exception("No active database connection")
         cursor = self.connection.cursor()
         try:
-            cursor.execute(f"SELECT * FROM {table_name}")  # nosec B608
+            cursor.execute(f"SELECT * FROM {self._q(table_name)}")  # nosec B608 -- identifier quoted/escaped via self._q()
             columns = [d[0] for d in cursor.description]
             while True:
                 rows = cursor.fetchmany(chunk_size)
@@ -1060,7 +1071,7 @@ class DbService:
         
         if self.db_type == "mysql":
             cursor = self.connection.cursor()
-            cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+            cursor.execute(f"SHOW COLUMNS FROM {self._q(table_name)}")
             return cursor.fetchall()
         
         elif self.db_type == "postgresql":
@@ -1079,10 +1090,10 @@ class DbService:
         
         elif self.db_type == "sqlite":
             cursor = self.connection.cursor()
-            cursor.execute(f"PRAGMA table_info({table_name})")
+            cursor.execute(f"PRAGMA table_info({self._q(table_name)})")
             result = cursor.fetchall()
             # Convert to dict format
-            return [{"Field": row[1], "Type": row[2], "Null": "YES" if not row[3] else "NO", 
+            return [{"Field": row[1], "Type": row[2], "Null": "YES" if not row[3] else "NO",
                     "Default": row[4]} for row in result]
         
         else:
@@ -1104,7 +1115,7 @@ class DbService:
         not a full pg_dump (no comments/non-FK constraints)."""
         cursor = self.connection.cursor()
         if self.db_type == "mysql":
-            cursor.execute(f"SHOW CREATE TABLE `{table_name}`")
+            cursor.execute(f"SHOW CREATE TABLE {self._q(table_name)}")
             row = cursor.fetchone()
             return list(row.values())[1] + ";" if row else ""
 
@@ -1134,15 +1145,15 @@ class DbService:
             pk_cols = [r[0] for r in cursor.fetchall()]
             col_defs = []
             for c in self.get_columns(table_name):
-                line = f'"{c["Field"]}" {c["Type"]}'
+                line = f'{self._q(c["Field"])} {c["Type"]}'
                 if c["Null"] == "NO":
                     line += " NOT NULL"
                 if c["Default"] is not None:
                     line += f' DEFAULT {c["Default"]}'
                 col_defs.append(line)
             if pk_cols:
-                col_defs.append(f'PRIMARY KEY ({", ".join(pk_cols)})')
-            statements = [f'CREATE TABLE "{table_name}" (\n  ' + ",\n  ".join(col_defs) + "\n);"]
+                col_defs.append(f'PRIMARY KEY ({", ".join(self._q(c) for c in pk_cols)})')
+            statements = [f'CREATE TABLE {self._q(table_name)} (\n  ' + ",\n  ".join(col_defs) + "\n);"]
 
             cursor.execute(
                 "SELECT conname FROM pg_constraint WHERE conrelid = %s::regclass AND contype = 'p'",
@@ -1162,8 +1173,8 @@ class DbService:
 
             for fk in self.get_foreign_keys(table_name):
                 statements.append(
-                    f'ALTER TABLE "{table_name}" ADD FOREIGN KEY ("{fk["column"]}") '
-                    f'REFERENCES "{fk["ref_table"]}" ("{fk["ref_column"]}");'
+                    f'ALTER TABLE {self._q(table_name)} ADD FOREIGN KEY ({self._q(fk["column"])}) '
+                    f'REFERENCES {self._q(fk["ref_table"])} ({self._q(fk["ref_column"])});'
                 )
             return "\n".join(statements)
 
@@ -1212,7 +1223,7 @@ class DbService:
                 tables = [r[0] for r in cursor.fetchall()]
                 result = {}
                 for tbl in tables:
-                    cursor.execute(f"PRAGMA table_info({tbl})")
+                    cursor.execute(f"PRAGMA table_info({self._q(tbl)})")
                     result[tbl] = [r[1] for r in cursor.fetchall()]
                 return result
 
@@ -1242,7 +1253,7 @@ class DbService:
         cursor = self.connection.cursor()
 
         cursor.execute(
-            f"DESCRIBE `{table_name}`"
+            f"DESCRIBE {self._q(table_name)}"
         )
 
         result = cursor.fetchall()
@@ -1260,7 +1271,7 @@ class DbService:
         try:
             if self.db_type == "mysql":
                 cursor = self.connection.cursor()
-                cursor.execute(f"SHOW INDEX FROM `{table_name}`")
+                cursor.execute(f"SHOW INDEX FROM {self._q(table_name)}")
                 rows = cursor.fetchall()
                 cursor.close()
                 # Group columns by index name
@@ -1302,14 +1313,14 @@ class DbService:
                 return [{"name": r[0], "unique": r[1], "type": r[2], "columns": r[3]} for r in rows]
             elif self.db_type == "sqlite":
                 cursor = self.connection.cursor()
-                cursor.execute(f"PRAGMA index_list({table_name})")
+                cursor.execute(f"PRAGMA index_list({self._q(table_name)})")
                 idx_list = cursor.fetchall()
                 indexes = []
                 for row in idx_list:
                     row = dict(row) if hasattr(row, 'keys') else row
                     idx_name = row[1] if isinstance(row, (list, tuple)) else row.get("name", "")
                     unique = bool(row[2] if isinstance(row, (list, tuple)) else row.get("unique", 0))
-                    cursor.execute(f"PRAGMA index_info({idx_name})")
+                    cursor.execute(f"PRAGMA index_info({self._q(idx_name)})")
                     info_rows = [dict(r) if hasattr(r, 'keys') else r for r in cursor.fetchall()]
                     cols = ", ".join(str(r[2] if isinstance(r, (list, tuple)) else r.get("name", ""))
                                     for r in info_rows)

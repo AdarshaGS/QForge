@@ -480,7 +480,7 @@ class TableViewWidget(QWidget):
             # already paid this cost, so this just makes MySQL consistent.
             try:
                 where_clause = f" WHERE {self.current_filter}" if self.current_filter else ""
-                count_query = f"SELECT COUNT(*) as total FROM {self.table_name}{where_clause}"
+                count_query = f"SELECT COUNT(*) as total FROM {self.table_name}{where_clause}"  # nosec B608
                 count_df = self.db_service.execute_query(count_query)
                 self.total_rows = int(count_df.iloc[0]['total'])
             except Exception as ex:

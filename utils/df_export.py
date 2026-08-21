@@ -64,11 +64,29 @@ def _cell_str(val, blob_as_hex: bool = True) -> str:
     return str(val)
 
 
+_FORMULA_LEAD_CHARS = ("=", "+", "-", "@")
+
+
+def _csv_formula_guard(value: str) -> str:
+    """Neutralize spreadsheet-formula injection (issue #115): a cell whose
+    text begins with =, +, -, or @ is read as a formula by Excel/Numbers/
+    Sheets when a CSV QForge exported is later opened there — e.g. a DB
+    value of `=cmd(...)` would execute on open. A leading apostrophe forces
+    literal-text interpretation there (shown only in the formula bar, not
+    the cell itself) — the standard OWASP-documented mitigation. Applied to
+    every cell regardless of the source column's type, since by the time a
+    value reaches here it's already display text; the one side effect is a
+    negative number importing back as text rather than numeric, which is
+    the accepted trade-off for closing the code-execution vector."""
+    return "'" + value if value[:1] in _FORMULA_LEAD_CHARS else value
+
+
 class CsvRowStreamWriter:
     """Incrementally writes CSV rows to an open text file handle (issue
     #159), header first. Column values that are `bytes`/`bytearray` are
     hex-encoded (or best-effort decoded) via the same `blob_as_hex` toggle
-    the SQL export uses."""
+    the SQL export uses. Cells are also passed through _csv_formula_guard
+    (issue #115)."""
 
     def __init__(self, fh, columns, blob_as_hex: bool = True):
         self._blob_as_hex = blob_as_hex
@@ -77,7 +95,8 @@ class CsvRowStreamWriter:
 
     def write_rows(self, rows):
         for row in rows:
-            self._writer.writerow([_cell_str(v, self._blob_as_hex) for v in row])
+            self._writer.writerow(
+                [_csv_formula_guard(_cell_str(v, self._blob_as_hex)) for v in row])
 
     def close(self):
         pass
@@ -199,6 +218,18 @@ def _to_sql_inserts(df, table_name: str, dialect: str = "mysql",
     return buf.getvalue().rstrip("\n")
 
 
+def _guarded_for_spreadsheet(df: pd.DataFrame) -> pd.DataFrame:
+    """Copy of *df* with every string cell passed through
+    _csv_formula_guard (issue #115), for the CSV/XLSX export paths below.
+    Checks each value's actual type rather than the column's dtype —
+    pandas' string dtype varies by version/backend (plain `object`, the
+    newer dedicated `str` dtype, or pandas' nullable `string[...]`), so a
+    dtype-based column filter would silently stop guarding on some pandas
+    versions. Non-string values (numbers, dates, None/NaN) pass through
+    untouched and keep their native pandas serialization."""
+    return df.map(lambda v: _csv_formula_guard(v) if isinstance(v, str) else v)
+
+
 def export_dataframe(parent, df, default_name: str, table_name: str = "table"):
     """Prompt for a save file and export `df` as CSV/JSON/Excel/SQL.
 
@@ -218,12 +249,12 @@ def export_dataframe(parent, df, default_name: str, table_name: str = "table"):
         if file_name.endswith(".json"):
             df.to_json(file_name, orient="records", indent=2, force_ascii=False)
         elif file_name.endswith(".xlsx"):
-            df.to_excel(file_name, index=False, engine="openpyxl")
+            _guarded_for_spreadsheet(df).to_excel(file_name, index=False, engine="openpyxl")
         elif file_name.endswith(".sql"):
             with open(file_name, "w", encoding="utf-8") as fh:
                 fh.write(_to_sql_inserts(df, table_name))
         else:
-            df.to_csv(file_name, index=False)
+            _guarded_for_spreadsheet(df).to_csv(file_name, index=False)
         QMessageBox.information(parent, "Export", f"Exported {len(df)} rows to:\n{file_name}")
     except Exception as ex:
         QMessageBox.critical(parent, "Export Error", str(ex))

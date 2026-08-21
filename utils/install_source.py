@@ -7,7 +7,7 @@ there, breaking future `brew upgrade`/`brew uninstall`.
 """
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 -- list-form argv only, never shell=True; see brew_path()/detect()
 
 HOMEBREW = "homebrew"
 DIRECT = "direct"
@@ -43,7 +43,7 @@ def detect() -> str:
         result = subprocess.run(
             [brew, "list", "--cask", "--versions", CASK_NAME],
             capture_output=True, text=True, timeout=10,
-        )
+        )  # nosec B603 -- brew resolved via shutil.which()/fixed paths above, CASK_NAME is a module constant
     except Exception:
         return UNKNOWN
     if result.returncode == 0 and result.stdout.strip():
