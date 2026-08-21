@@ -1073,6 +1073,11 @@ class ConnectionPanel(QWidget):
             # (e.g. if the configured database didn't exist and MySQL fell
             # back to another one — see fetch_schema_snapshot's switched_db).
             self.load_schema()
+            # Session restore can create a TableViewWidget before this
+            # background connect finishes (issue #176) — its first load
+            # hits "No active database connection" and never retries on
+            # its own. Now that db_service is genuinely live, retry those.
+            self._reload_errored_table_tabs()
 
     def _on_schema_tables_ready(self, tables: list, columns: dict):
         """Push tables/columns to autocomplete as soon as they're fetched —
@@ -3302,6 +3307,10 @@ class ConnectionPanel(QWidget):
             self.health_changed.emit('idle')
             db_type = self.config.get('type', 'DB').upper()
             self.reconnected.emit(f"Reconnected to {db_type} — {self.label}")
+            # Any table tab still stuck on a stale connection error (from
+            # before this reconnect, or from session restore racing an
+            # earlier connect) can now be retried (issue #176).
+            self._reload_errored_table_tabs()
         except Exception as ex:
             QMessageBox.critical(self, "Reconnect Failed", str(ex))
             self.health_changed.emit('disconnected')
@@ -3384,6 +3393,17 @@ class ConnectionPanel(QWidget):
         read_only_suffix = "  🔒 READ-ONLY" if self.config.get("read_only") else ""
         ver_suffix = f"  [{ver}]" if ver else ""
         return f"{base}{env_suffix}{read_only_suffix}{ver_suffix}"
+
+    def _reload_errored_table_tabs(self):
+        """Retry every open TableViewWidget currently stuck on a connection
+        error, now that a (re)connect has actually completed (issue #176).
+        A no-op for tabs that already loaded real data — mirrors the
+        tx-cleanup loop in disconnect() below, just for the opposite
+        direction (connection coming back, not going away)."""
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, TableViewWidget):
+                w.reload_if_errored()
 
     def disconnect(self):
         try:

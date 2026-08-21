@@ -114,6 +114,11 @@ class TableViewWidget(QWidget):
         self.filter_conditions = []  # List of (column, operator, value) tuples
         self.filter_visible = False
         self._structure_loaded = False
+        # Set by load_table_data() — lets a caller (ConnectionPanel, once a
+        # (re)connect actually completes) tell apart a tab stuck on a
+        # connection error from one that's already showing real data,
+        # without string-matching limit_label's text (issue #176).
+        self._load_failed = False
 
         # Pagination state
         self.current_page = 1          # 1-indexed
@@ -569,10 +574,21 @@ class TableViewWidget(QWidget):
             self.next_btn.setEnabled(self.current_page < total_pages)
             
             logger.info(f"Loaded page {self.current_page} ({len(df)} rows) from {self.table_name}")
+            self._load_failed = False
         except Exception as ex:
             logger.error(f"Failed to load table data: {str(ex)}")
             self.limit_label.setText(f"Error: {str(ex)}")
-    
+            self._load_failed = True
+
+    def reload_if_errored(self):
+        """Retry the current page if the last load attempt failed (issue
+        #176) — e.g. this tab was restored/opened before the connection
+        was actually live. A no-op for a tab that's already showing real
+        data, so it's safe to call on every open TableViewWidget whenever
+        a (re)connect completes."""
+        if self._load_failed:
+            self.load_table_data()
+
     def prev_page(self):
         """Load previous page"""
         if self.current_page > 1:
