@@ -299,6 +299,24 @@ warns you so you can fix your keyring setup. Treat exported profiles, logs,
 and query history appropriately: SQL text can still contain sensitive
 information.
 
+### macOS: one-time re-auth after a signing change
+
+macOS ties keychain item ownership to the code signature of the app that
+stored it. If you upgrade from an ad-hoc-signed build of QForge to a build
+signed with a real Apple Developer ID (or vice versa), the first time the
+new build touches a password saved by the old one:
+
+- **Reading** a saved password may show a one-time macOS "QForge wants to
+  use your confidential information stored in ... keychain" prompt. Choose
+  **Always Allow** and the password loads normally from then on.
+- **Saving/updating** a password under the new signature clears out the
+  old, now-inaccessible keychain item and stores a fresh one automatically
+  — no dialog, no lost data.
+
+This is a one-time transition per changed signature, not something that
+recurs on every launch. If a password ever comes up unexpectedly empty
+after such an upgrade, re-enter it once in the connection dialog and save.
+
 ### Uninstalling (Homebrew)
 
 ```bash

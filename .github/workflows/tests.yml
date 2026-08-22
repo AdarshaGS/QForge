@@ -48,3 +48,10 @@ jobs:
       # *new*, not on the audited-clean baseline.
       - name: Run bandit (static security analysis)
         run: bandit -c pyproject.toml -r . -x ./tests,./venv,./build,./dist,./graphify-out
+
+      # Issue #120: catch known CVEs in pinned third-party dependencies
+      # (PySide6, cryptography, paramiko/sshtunnel, psycopg2, pandas, ...)
+      # before they ship in a release. Distinct from bandit above, which
+      # scans QForge's own source rather than dependency advisories.
+      - name: Run pip-audit (dependency vulnerability scan)
+        run: pip-audit -r requirements.txt
