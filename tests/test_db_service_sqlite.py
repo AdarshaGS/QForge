@@ -91,6 +91,35 @@ def test_get_all_columns_maps_table_to_columns(db):
     assert "name" in mapping["users"]
 
 
+def test_get_all_column_details_reports_type_nullable_and_pk(db):
+    details = db.get_all_column_details()
+    cols = {c["name"]: c for c in details["users"]}
+    assert cols["id"]["key"] == "PRI"
+    assert cols["name"]["nullable"] is False
+    assert cols["name"]["key"] == ""
+
+
+def test_get_all_column_details_empty_for_table_with_no_rows_matches_get_columns(db):
+    db.execute_update("CREATE TABLE empty_table (note TEXT)")
+    details = db.get_all_column_details()
+    assert [c["name"] for c in details["empty_table"]] == ["note"]
+    assert details["empty_table"][0]["key"] == ""
+
+
+def test_get_all_foreign_keys_maps_table_to_its_fk_list(db):
+    db.execute_update(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, "
+        "user_id INTEGER REFERENCES users(id))"
+    )
+    fks = db.get_all_foreign_keys()
+    assert fks["orders"] == [{"column": "user_id", "ref_table": "users", "ref_column": "id"}]
+    assert "users" not in fks  # users has no outgoing FK, so it's simply absent
+
+
+def test_get_all_foreign_keys_empty_dict_when_no_fks_anywhere(db):
+    assert db.get_all_foreign_keys() == {}
+
+
 # ─── Transaction controls (Slice 4, ai/load-context.md) ────────────────────
 
 
@@ -377,9 +406,9 @@ def test_execute_multi_query_runs_all_statements(db):
     results = db.execute_multi_query(script)
     assert len(results) == 2
     _, df1 = results[0]
-    _, df2 = results[1]
+    _, affected = results[1]
     assert list(df1["name"]) == ["Alice", "Bob"]
-    assert df2 is None  # UPDATE has no result set
+    assert affected == 1  # UPDATE affected 1 row, no result set
     assert db.execute_query("SELECT name FROM users WHERE id = 1").iloc[0]["name"] == "Zed"
 
 

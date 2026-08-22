@@ -475,7 +475,7 @@ class ConnectionPanel(QWidget):
     # Bridge signals for background schema load
     _schema_done   = Signal(object)   # (schema_data dict)
     _schema_error  = Signal(str)      # error message
-    _schema_fast   = Signal(list, dict)   # (tables, columns) — arrives ahead of _schema_done
+    _schema_fast   = Signal(list, dict, dict, dict)   # (tables, columns, column_details, foreign_keys) — arrives ahead of _schema_done
     # Bridge signal for the optimistic-open background connect (issue: lag on
     # previously-visited remote/SSH connections despite a warm schema cache)
     _bg_connect_done = Signal(str)    # error message, "" on success
@@ -552,6 +552,8 @@ class ConnectionPanel(QWidget):
         self._export_cancelled_sig.connect(self._on_export_cancelled, Qt.QueuedConnection)
         self.health_changed.connect(self._update_tab_status_bars, Qt.QueuedConnection)
         self._column_cache: dict = {}   # {table: [col, ...]} for autocomplete
+        self._column_details_cache: dict = {}   # {table: [{name,type,nullable,default,key}, ...]}
+        self._foreign_keys_cache: dict = {}     # {table: [{column, ref_table, ref_column}, ...]}
 
         self._build_ui()
         self.load_schema()
@@ -987,7 +989,9 @@ class ConnectionPanel(QWidget):
         (_on_schema_loaded) rebuilds the tree with current data."""
         if not cached:
             return False
-        self._on_schema_tables_ready(cached.get("tables", []), cached.get("columns", {}))
+        self._on_schema_tables_ready(
+            cached.get("tables", []), cached.get("columns", {}),
+            cached.get("column_details", {}), cached.get("foreign_keys", {}))
         self._on_schema_loaded(cached)
         if schema_cache.is_stale(cached):
             stale_item = QTreeWidgetItem(["⏱ Cached schema (stale) — refreshing…"])
@@ -1039,7 +1043,7 @@ class ConnectionPanel(QWidget):
             perf_metrics.task_started("schema_fetch")
             try:
                 sig_done.emit(fetch_schema_snapshot(
-                    conf, on_tables_ready=lambda t, c: sig_fast.emit(t, c)))
+                    conf, on_tables_ready=lambda t, c, cd, fk: sig_fast.emit(t, c, cd, fk)))
             except Exception as ex:
                 # Suppress silent "not connected" errors (e.g. (0, '') on startup)
                 msg = str(ex)
@@ -1090,15 +1094,20 @@ class ConnectionPanel(QWidget):
             # its own. Now that db_service is genuinely live, retry those.
             self._reload_errored_table_tabs()
 
-    def _on_schema_tables_ready(self, tables: list, columns: dict):
+    def _on_schema_tables_ready(self, tables: list, columns: dict,
+                                 column_details: dict = None, foreign_keys: dict = None):
         """Push tables/columns to autocomplete as soon as they're fetched —
         ahead of the slower dbs/views/functions/server_version round-trips
         that _on_schema_loaded waits for (issue #16)."""
         self._column_cache = columns
+        self._column_details_cache = column_details or {}
+        self._foreign_keys_cache = foreign_keys or {}
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, SqlTab):
-                tab.set_schema(tables, columns)
+                tab.set_schema(tables, columns,
+                                column_details=self._column_details_cache,
+                                foreign_keys=self._foreign_keys_cache)
         # Issue #57: surface the table count on the loading indicator the
         # moment it's known, rather than leaving it a bare "Loading…" for
         # the remainder of the (slower) dbs/views/functions round-trips.
@@ -1131,12 +1140,16 @@ class ConnectionPanel(QWidget):
             self._server_version = result["server_version"]
             self.label_changed.emit(self, self.label)
 
-        tables    = result.get("tables", [])
-        columns   = result.get("columns", {})
-        views     = result.get("views", [])
-        functions = result.get("functions", [])
+        tables         = result.get("tables", [])
+        columns        = result.get("columns", {})
+        column_details = result.get("column_details", {})
+        foreign_keys   = result.get("foreign_keys", {})
+        views          = result.get("views", [])
+        functions      = result.get("functions", [])
 
         self._column_cache = columns
+        self._column_details_cache = column_details
+        self._foreign_keys_cache = foreign_keys
 
         # Populate the flat name/index state; _render_active_category()
         # below builds the visible tree from just the active category.
@@ -1164,7 +1177,9 @@ class ConnectionPanel(QWidget):
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, SqlTab):
-                tab.set_schema(tables, columns)
+                tab.set_schema(tables, columns,
+                                column_details=column_details, foreign_keys=foreign_keys,
+                                views=views, functions=functions)
 
         if getattr(self, "_notify_schema_refresh", False):
             self._notify_schema_refresh = False
@@ -1731,7 +1746,10 @@ class ConnectionPanel(QWidget):
         # Wire inline-edit commit: execute SQL with our db_service
         tab.commit_sql.connect(lambda sqls, t=tab: self._execute_commit_sql(sqls, t))
         # Push current schema so autocomplete works immediately
-        tab.set_schema(self.all_tables, self._column_cache)
+        tab.set_schema(self.all_tables, self._column_cache,
+                        column_details=self._column_details_cache,
+                        foreign_keys=self._foreign_keys_cache,
+                        views=self.all_views, functions=self.all_functions)
         tab.set_dialect(self._dialect_display_name())
         tab.set_connection_state(getattr(self, '_last_health', 'idle'))
         self._attach_close_btn(idx)
@@ -1840,7 +1858,14 @@ class ConnectionPanel(QWidget):
         self._finalize_query_connection(tab)
 
     def _on_query_multi_done(self, tab, results: list, elapsed: float):
-        """Multi-statement result handler — shows each SELECT in its own sub-tab."""
+        """Multi-statement result handler. Every statement gets its own
+        "Query N" sub-tab — a SELECT shows its rows, a write shows a
+        rows-affected summary, and a statement that errored shows its own
+        error when that tab is selected (tab.load_multi_results /
+        _on_multi_result_tab), rather than only SELECT-producing statements
+        being visible and everything else vanishing silently."""
+        import pandas as pd
+
         perf_metrics.record("sql_editor", "query_execute", elapsed * 1000)
         tab._query_running = False
         self._restore_run_btn(tab)
@@ -1848,32 +1873,37 @@ class ConnectionPanel(QWidget):
         if hasattr(tab, '_query_thread'):
             tab._query_thread.quit()
         query = getattr(tab, '_last_query', '')
-        select_results = [(lbl, obj) for lbl, obj in results
-                          if obj is not None and not isinstance(obj, Exception)]
-        error_results  = [(lbl, obj) for lbl, obj in results if isinstance(obj, Exception)]
+        select_results = [(lbl, obj) for lbl, obj in results if isinstance(obj, pd.DataFrame)]
 
         total_rows = sum(len(df) for _, df in select_results)
         self.query_history.add_query(query, self.config["name"], total_rows, elapsed)
         if self._sidebar_stack.currentIndex() == 2:
             self._reload_history_list(self._history_search.text())
 
-        if len(select_results) == 1:
-            # single result — display inline as normal
-            lbl, df = select_results[0]
-            tab.load_dataframe(df, self._extract_table_name(query))
-            tab.update_status(len(df), elapsed, truncated=df.attrs.get("truncated", False))
-        elif len(select_results) > 1:
-            # multiple results — hand off to tab's multi-result view
-            tab.load_multi_results(select_results, elapsed)
-        elif error_results:
-            lbl, ex = error_results[0]
-            tab.show_error(str(ex), query=lbl, elapsed=elapsed)
+        if len(results) == 1:
+            # single statement — display inline as normal (in practice this
+            # branch isn't reached: the worker only takes this multi-
+            # statement path for 2+ statements — kept as a defensive
+            # fallback rather than assumed unreachable).
+            label, obj = results[0]
+            if isinstance(obj, Exception):
+                tab.show_error(str(obj), query=label, elapsed=elapsed)
+            elif isinstance(obj, pd.DataFrame):
+                tab.load_dataframe(obj, self._extract_table_name(query))
+                tab.update_status(len(obj), elapsed, truncated=obj.attrs.get("truncated", False))
+            else:
+                tab.update_status(obj or 0, elapsed)
         else:
-            tab.update_status(0, elapsed)
-
-        if error_results and len(select_results) >= 0:
-            msgs = "\n".join(f"[{lbl}] {ex}" for lbl, ex in error_results)
-            tab.show_error(msgs, elapsed=elapsed)
+            # Every statement gets its own "Query N" tab. load_multi_results
+            # already renders a DataFrame or an Exception per tab — a write
+            # (an int affected-row count) gets wrapped in a one-row summary
+            # DataFrame so it reuses that same rendering with no UI changes.
+            display_results = [
+                (label, obj if isinstance(obj, (pd.DataFrame, Exception))
+                       else pd.DataFrame({"result": [f"{obj} row(s) affected"]}))
+                for label, obj in results
+            ]
+            tab.load_multi_results(display_results, elapsed)
 
         self._emit_health('idle')
         self._finalize_query_connection(tab)
@@ -1978,8 +2008,24 @@ class ConnectionPanel(QWidget):
         buttons) bypasses the editor content and the format/param-prompt
         steps below, but still goes through the same guard, connection
         handling, and worker dispatch as typed SQL — a single code path so
-        transaction control can't accidentally skip the write guard."""
-        query = override_query if override_query is not None else tab.get_query().strip()
+        transaction control can't accidentally skip the write guard.
+
+        With no text selected, Run always executes every statement in the
+        editor, not just the one under the cursor — a script with several
+        statements is expected to run all of them. Each one still runs
+        independently via DbService.execute_multi_query, so a statement
+        that fails doesn't stop the ones after it, and every statement's
+        own outcome shows up as its own "Query N" tab in the results
+        (_on_query_multi_done). To run just one statement manually, select
+        its text before hitting Run."""
+        if override_query is not None:
+            query = override_query
+        else:
+            cursor = tab.editor.textCursor()
+            if cursor.hasSelection():
+                query = cursor.selectedText().replace(' ', '\n').strip()
+            else:
+                query = tab.editor.toPlainText().strip()
         if not query:
             return
         if self._connecting:

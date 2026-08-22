@@ -599,8 +599,12 @@ class DbService:
 
     def execute_multi_query(self, script: str, max_rows=None) -> list[tuple[str, object]]:
         """Split *script* into statements, execute each. Returns list of
-        (label, DataFrame|None) tuples — one per result-producing stmt.
-        Non-SELECT statements produce (label, None).
+        (label, DataFrame|int|Exception) tuples, one per statement: a
+        SELECT produces its result DataFrame, a write produces the
+        affected-row count (int, possibly 0), and a statement that raised
+        produces the Exception — the caller (ConnectionPanel.
+        _on_query_multi_done) uses this to show every statement's own
+        outcome as its own result tab, not just the SELECTs.
 
         Routes each statement by its real classification (not a first-
         keyword guess), so a write hidden behind a leading comment or
@@ -614,8 +618,8 @@ class DbService:
             label = stmt[:40].replace("\n", " ").strip() + ("…" if len(stmt) > 40 else "")
             if query_classifier.classify(stmt).is_write:
                 try:
-                    self.execute_update(stmt)
-                    results.append((label, None))
+                    affected = self.execute_update(stmt)
+                    results.append((label, affected))
                 except Exception as ex:
                     results.append((label, ex))
             else:
@@ -1225,6 +1229,147 @@ class DbService:
                 for tbl in tables:
                     cursor.execute(f"PRAGMA table_info({self._q(tbl)})")
                     result[tbl] = [r[1] for r in cursor.fetchall()]
+                return result
+
+        except Exception:
+            pass
+        return {}
+
+    def get_all_column_details(self) -> dict:
+        """Return {table_name: [{name, type, nullable, default, key}, ...]}
+        for every table in one round-trip — the type/PK-aware sibling of
+        get_all_columns(), used to enrich SQL-editor autocomplete without
+        paying an N+1 SHOW COLUMNS/PRAGMA cost per table. `key` is "PRI" for
+        primary-key columns, "" otherwise (matching MySQL's own COLUMN_KEY
+        vocabulary, reused across dialects for a single downstream shape)."""
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE,
+                           COLUMN_DEFAULT, COLUMN_KEY
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    ORDER BY TABLE_NAME, ORDINAL_POSITION
+                """)
+                rows = cursor.fetchall()
+                result: dict = {}
+                for r in rows:
+                    r = dict(r)
+                    result.setdefault(r["TABLE_NAME"], []).append({
+                        "name": r["COLUMN_NAME"],
+                        "type": r["COLUMN_TYPE"],
+                        "nullable": r["IS_NULLABLE"] == "YES",
+                        "default": r["COLUMN_DEFAULT"],
+                        "key": "PRI" if r["COLUMN_KEY"] == "PRI" else "",
+                    })
+                return result
+
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT c.table_name, c.column_name, c.data_type,
+                           c.is_nullable, c.column_default,
+                           CASE WHEN pk.column_name IS NOT NULL THEN 'PRI' ELSE '' END
+                    FROM information_schema.columns c
+                    LEFT JOIN (
+                        SELECT kcu.table_name, kcu.column_name
+                        FROM information_schema.table_constraints tc
+                        JOIN information_schema.key_column_usage kcu
+                             ON tc.constraint_name = kcu.constraint_name
+                        WHERE tc.constraint_type = 'PRIMARY KEY'
+                    ) pk ON pk.table_name = c.table_name AND pk.column_name = c.column_name
+                    WHERE c.table_schema = 'public'
+                    ORDER BY c.table_name, c.ordinal_position
+                """)
+                rows = cursor.fetchall()
+                result = {}
+                for r in rows:
+                    result.setdefault(r[0], []).append({
+                        "name": r[1], "type": r[2], "nullable": r[3] == "YES",
+                        "default": r[4], "key": r[5],
+                    })
+                return result
+
+            elif self.db_type == "sqlite":
+                cursor = self.connection.cursor()
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+                tables = [r[0] for r in cursor.fetchall()]
+                result = {}
+                for tbl in tables:
+                    cursor.execute(f"PRAGMA table_info({self._q(tbl)})")
+                    result[tbl] = [{
+                        "name": r[1], "type": r[2], "nullable": not r[3],
+                        "default": r[4], "key": "PRI" if r[5] > 0 else "",
+                    } for r in cursor.fetchall()]
+                return result
+
+        except Exception:
+            pass
+        return {}
+
+    def get_all_foreign_keys(self) -> dict:
+        """Return {table_name: [{column, ref_table, ref_column}, ...]} for
+        every table in one round-trip — the bulk sibling of
+        get_foreign_keys(table_name), used to power FK-aware JOIN completion
+        without an N+1 query per table."""
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+                    FROM information_schema.KEY_COLUMN_USAGE
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND REFERENCED_TABLE_NAME IS NOT NULL
+                """)
+                rows = cursor.fetchall()
+                result: dict = {}
+                for r in rows:
+                    r = dict(r)
+                    result.setdefault(r["TABLE_NAME"], []).append({
+                        "column": r["COLUMN_NAME"],
+                        "ref_table": r["REFERENCED_TABLE_NAME"],
+                        "ref_column": r["REFERENCED_COLUMN_NAME"],
+                    })
+                return result
+
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT tc.table_name, kcu.column_name,
+                           ccu.table_name  AS ref_table,
+                           ccu.column_name AS ref_column
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                         ON tc.constraint_name = kcu.constraint_name
+                    JOIN information_schema.constraint_column_usage ccu
+                         ON ccu.constraint_name = tc.constraint_name
+                    WHERE tc.constraint_type = 'FOREIGN KEY'
+                """)
+                rows = cursor.fetchall()
+                result = {}
+                for r in rows:
+                    result.setdefault(r[0], []).append(
+                        {"column": r[1], "ref_table": r[2], "ref_column": r[3]})
+                return result
+
+            elif self.db_type == "sqlite":
+                cursor = self.connection.cursor()
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+                tables = [r[0] for r in cursor.fetchall()]
+                result = {}
+                for tbl in tables:
+                    cursor.execute(f"PRAGMA foreign_key_list({self._q(tbl)})")
+                    fks = [{"column": r[3], "ref_table": r[2], "ref_column": r[4]}
+                           for r in cursor.fetchall()]
+                    if fks:
+                        result[tbl] = fks
                 return result
 
         except Exception:

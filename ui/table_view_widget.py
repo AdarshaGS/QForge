@@ -19,6 +19,7 @@ from ui.advanced_filter_dialog import AdvancedFilterDialog
 from ui.theme_manager import ThemeManager
 
 from ui.sql_tab import SqlTab
+from ui.edit_error_dialog import show_save_errors
 from utils.logger import get_logger
 from utils import perf_metrics
 import pandas as pd
@@ -1000,7 +1001,7 @@ class TableViewWidget(QWidget):
                     success_count += 1
                     logger.info(f"✓ DELETE: {sql}")
                 except Exception as e:
-                    errors.append(f"DELETE: {str(e)}")
+                    errors.append({"kind": "DELETE", "sql": sql, "error": str(e)})
                     logger.error(f"✗ DELETE failed: {sql} - {str(e)}")
 
             # Then UPDATEs
@@ -1010,7 +1011,7 @@ class TableViewWidget(QWidget):
                     success_count += 1
                     logger.info(f"✓ UPDATE: {sql}")
                 except Exception as e:
-                    errors.append(f"UPDATE: {str(e)}")
+                    errors.append({"kind": "UPDATE", "sql": sql, "error": str(e)})
                     logger.error(f"✗ UPDATE failed: {sql} - {str(e)}")
 
             # Finally INSERTs
@@ -1020,17 +1021,14 @@ class TableViewWidget(QWidget):
                     success_count += 1
                     logger.info(f"✓ INSERT: {sql}")
                 except Exception as e:
-                    errors.append(f"INSERT: {str(e)}")
+                    errors.append({"kind": "INSERT", "sql": sql, "error": str(e)})
                     logger.error(f"✗ INSERT failed: {sql} - {str(e)}")
 
-            # Only show message if there are errors
+            # Only show a dialog if there are errors (issue #143: structured
+            # summary + per-failure classification instead of the raw
+            # exception text as the primary message)
             if errors:
-                QMessageBox.warning(
-                    self,
-                    "Save Errors",
-                    f"Saved {success_count} changes, but {len(errors)} failed:\\n\\n" +
-                    "\\n".join(errors[:3])
-                )
+                show_save_errors(self, success_count, errors)
             else:
                 # Success - log only, no popup
                 logger.info(f"✓✓✓ Saved {success_count} changes successfully")

@@ -38,68 +38,12 @@ from utils import perf_metrics
 from ui.column_filter_dialog import ColumnFilterDialog
 from ui.theme_manager import ThemeManager
 from ui.snippet_manager import SnippetManager
+from utils.sql_errors import sql_error_hint as _sql_error_hint, sql_error_title as _sql_error_title
 
 
-# ─── SQL error hint engine ────────────────────────────────────────────────────
+# ─── Error card: location lookup (title/hint now in utils/sql_errors.py,
+# shared with ui/edit_error_dialog.py's grid-save error dialog, issue #143) ──
 
-_ERROR_HINTS = [
-    # Syntax errors
-    (r"you have an error in your sql syntax",
-     "Check for missing commas, unmatched parentheses, or typos near the marked position."),
-    (r"syntax error at or near",
-     "Check for missing commas, unmatched parentheses, or incorrect keyword usage."),
-    # Unknown column / table
-    (r"unknown column '(.+?)'",
-     lambda m: f"Column '{m.group(1)}' doesn't exist — check the table schema or your alias."),
-    (r"table '(.+?)' doesn't exist",
-     lambda m: f"Table '{m.group(1)}' not found — verify the table name and active database."),
-    (r"relation \"(.+?)\" does not exist",
-     lambda m: f"Table '{m.group(1)}' not found — check spelling and current schema."),
-    # Access denied
-    (r"access denied",
-     "Permission denied — your user lacks privileges for this operation."),
-    (r"permission denied",
-     "Permission denied — your user lacks privileges for this operation."),
-    # Duplicate / constraint
-    (r"duplicate entry '(.+?)' for key '(.+?)'",
-     lambda m: f"Duplicate value '{m.group(1)}' on key '{m.group(2)}' — value must be unique."),
-    (r"unique constraint",
-     "A unique constraint was violated — the value already exists in that column."),
-    (r"foreign key constraint",
-     "Foreign key violation — the referenced row doesn't exist or a dependent row blocks deletion."),
-    (r"cannot be null|null value in column",
-     "A required (NOT NULL) column has no value — provide a value for all required fields."),
-    # Connection
-    (r"lost connection|server has gone away|broken pipe",
-     "The database connection dropped — try running the query again."),
-    (r"connection refused|could not connect",
-     "Cannot reach the database server — check host, port, and firewall settings."),
-    # Timeout / cancel
-    (r"query was cancelled|canceling statement",
-     "The query was cancelled by the user."),
-    (r"lock wait timeout|deadlock",
-     "A lock timeout or deadlock occurred — another process may be holding a lock on this table."),
-    # Disk / space
-    (r"disk full|no space left",
-     "The server disk is full — contact your DBA."),
-    # Data too long
-    (r"data too long for column '(.+?)'",
-     lambda m: f"The value for '{m.group(1)}' exceeds the column's maximum length."),
-]
-
-def _sql_error_hint(message: str, query: str = "") -> str:
-    """Return a short actionable hint for a SQL error message, or empty string."""
-    ml = message.lower()
-    for pattern, hint in _ERROR_HINTS:
-        m = _re.search(pattern, ml)
-        if m:
-            return hint(m) if callable(hint) else hint
-    return ""
-
-
-# ─── Error card: title + location (issue #178) ───────────────────────────────
-
-_MYSQL_CODE_RE = _re.compile(r"^\(?(\d{3,5}),")
 _ERROR_LINE_RE = _re.compile(r"at line (\d+)", _re.IGNORECASE)
 _ERROR_NEAR_RE = _re.compile(r"near ['\"](.+?)['\"]", _re.IGNORECASE)
 
@@ -110,37 +54,6 @@ _ERROR_NEAR_RE = _re.compile(r"near ['\"](.+?)['\"]", _re.IGNORECASE)
 # that a byte-size check alone wouldn't.
 _IMPORT_MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024  # 500 MiB
 _IMPORT_MAX_ROWS = 2_000_000
-
-
-def _sql_error_title(message: str) -> str:
-    """Best-effort short title for the error card header, e.g. 'SQL Syntax
-    Error (1064)'. Falls back to a generic title when nothing matches."""
-    ml = message.lower()
-    code_m = _MYSQL_CODE_RE.match(message.strip())
-    code_suffix = f" ({code_m.group(1)})" if code_m else ""
-
-    if "syntax" in ml:
-        return f"SQL Syntax Error{code_suffix}"
-    if "unknown column" in ml:
-        return "Unknown Column"
-    if "doesn't exist" in ml or "does not exist" in ml:
-        return "Table Not Found"
-    if "access denied" in ml or "permission denied" in ml:
-        return "Permission Denied"
-    if "duplicate entry" in ml:
-        return "Duplicate Entry"
-    if "constraint" in ml:
-        return "Constraint Violation"
-    if "lost connection" in ml or "gone away" in ml or "broken pipe" in ml \
-            or "connection refused" in ml or "could not connect" in ml:
-        return "Connection Error"
-    if "lock wait" in ml or "deadlock" in ml:
-        return "Lock Timeout"
-    if "cannot be null" in ml or "null value" in ml:
-        return "Missing Required Value"
-    if "cancelled" in ml or "canceling" in ml:
-        return "Query Cancelled"
-    return f"SQL Error{code_suffix}" if code_suffix else "Query Error"
 
 
 def _sql_error_location(message: str, query: str) -> tuple[int, int] | None:
@@ -232,6 +145,16 @@ class SqlTab(QWidget):
         
         # Apply autocomplete
         self.completer = SqlCompleter(self.editor)
+
+        # Schema validation (unknown table/column squiggly underline) —
+        # debounced off the same keystrokes that drive autocomplete, and
+        # reapplied whenever the cursor moves since CodeEditor's own
+        # cursorPositionChanged handler (_highlight_current_line) resets
+        # extraSelections to just the line highlight on every move.
+        self._validation_timer = None
+        self._validation_selections: list = []
+        self._find_selections: list = []
+        self.editor.cursorPositionChanged.connect(self._apply_extra_selections)
 
         # Snippets
         self.snippet_manager = SnippetManager()
@@ -960,7 +883,7 @@ class SqlTab(QWidget):
         from PySide6.QtGui import QShortcut, QKeySequence
         self.run_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
         self.run_shortcut.activated.connect(self.run_btn.click)
-        
+
         # Add keyboard shortcuts for SQL formatting
         self.beautify_shortcut = QShortcut(QKeySequence("Ctrl+I"), self)
         self.beautify_shortcut.activated.connect(self.format_sql)
@@ -1028,9 +951,155 @@ class SqlTab(QWidget):
     # AUTOCOMPLETE
     # ======================================
     
-    def set_schema(self, tables, columns_dict):
+    def set_schema(self, tables, columns_dict, column_details=None,
+                    foreign_keys=None, views=None, functions=None):
         """Update autocomplete with schema information"""
-        self.completer.set_schema(tables, columns_dict)
+        self.completer.set_schema(tables, columns_dict, column_details=column_details,
+                                   foreign_keys=foreign_keys, views=views, functions=functions)
+        self._schedule_schema_validation()
+
+    # ── Schema validation (unknown table/column squiggle) ────────────────
+
+    def _schedule_schema_validation(self):
+        """Debounce so a full-document regex pass doesn't run on every raw
+        keystroke — same interval class as autocomplete's own latency budget."""
+        if self._validation_timer is None:
+            from PySide6.QtCore import QTimer
+            self._validation_timer = QTimer(self)
+            self._validation_timer.setSingleShot(True)
+            self._validation_timer.setInterval(250)
+            self._validation_timer.timeout.connect(self._update_schema_validation)
+        self._validation_timer.start()
+
+    def _update_schema_validation(self):
+        """Squiggly-underline table/view names after FROM/JOIN/UPDATE/INTO
+        and alias.col / table.col references that don't resolve against the
+        active connection's schema. Conservative by design (see set_schema
+        callers / SqlCompleter): only flags identifiers in positions the
+        parser is already confident about, skips whatever's still being
+        typed at the cursor, and does nothing at all until a real schema
+        (not an empty/just-connecting one) has loaded."""
+        known_tables = self.completer.known_tables()
+        if not known_tables:
+            self._validation_selections = []
+            self._apply_extra_selections()
+            return
+
+        query = self.editor.toPlainText()
+        pos = self.editor.textCursor().position()
+        doc = self.editor.document()
+
+        fmt = QTextCharFormat()
+        fmt.setUnderlineStyle(QTextCharFormat.SpellCheckUnderline)
+        fmt.setUnderlineColor(QColor("#ff453a"))
+
+        selections = []
+
+        def flag(start: int, end: int):
+            c = QTextCursor(doc)
+            c.setPosition(start)
+            c.setPosition(end, QTextCursor.KeepAnchor)
+            es = QTextEdit.ExtraSelection()
+            es.cursor = c
+            es.format = fmt
+            selections.append(es)
+
+        # Unknown table/view names right after FROM/JOIN/UPDATE/INTO —
+        # only once the name is followed by a real boundary (not mid-typed).
+        for m in _re.finditer(
+                r'(?:FROM|JOIN|UPDATE|INTO)\s+[`"]?(\w+)[`"]?(?=[\s,;)]|$)',
+                query, _re.IGNORECASE):
+            name, end = m.group(1), m.end(1)
+            if end == pos:
+                continue
+            if name not in known_tables:
+                flag(m.start(1), end)
+
+        # Unknown columns in alias.col / table.col, only where the left side
+        # resolves to a known table/alias with known columns — an
+        # unresolved left side is ambiguous (could be a function, a JSON
+        # path, …) and is deliberately left alone.
+        for m in _re.finditer(r'\b(\w+)\.(\w+)\b', query):
+            obj, col, end = m.group(1), m.group(2), m.end(2)
+            if end == pos:
+                continue
+            table = self.completer.resolve_table(obj)
+            if not table:
+                continue
+            cols = self.completer.table_columns(table)
+            if not cols:
+                continue
+            if col not in cols and col.lower() not in (c.lower() for c in cols):
+                flag(m.start(2), end)
+
+        self._validation_selections = selections
+        self._apply_extra_selections()
+
+    def _show_schema_hover(self, event) -> bool:
+        """Resolve the identifier under the mouse against the completer's
+        schema (table.col / alias.col / bare table or column name) and show
+        a QToolTip with type/nullable/default/key — same source the
+        autocomplete badges use, no extra fetch."""
+        from PySide6.QtWidgets import QToolTip
+
+        cursor = self.editor.cursorForPosition(event.pos())
+        cursor.select(QTextCursor.WordUnderCursor)
+        word = cursor.selectedText()
+        if not word:
+            QToolTip.hideText()
+            return True
+
+        block_text = cursor.block().text()
+        col_in_block = cursor.positionInBlock()
+        word_start = block_text.rfind(word, 0, col_in_block)
+
+        # Dot-notation: is this word itself preceded by "<obj>." right before it?
+        table = None
+        if word_start > 0 and block_text[word_start - 1] == '.':
+            left = block_text[:word_start - 1]
+            m = _re.search(r'(\w+)$', left)
+            if m:
+                table = self.completer.resolve_table(m.group(1))
+
+        text = None
+        known_tables = self.completer.known_tables()
+        if table:
+            meta = self.completer.column_meta(table, word)
+            if meta:
+                bits = [meta.get("type", "") or "?"]
+                bits.append("NULL" if meta.get("nullable") else "NOT NULL")
+                if meta.get("key") == "PRI":
+                    bits.append("PRIMARY KEY")
+                else:
+                    fk = self.completer.foreign_key_for(table, word)
+                    if fk:
+                        bits.append(f"→ {fk['ref_table']}.{fk['ref_column']}")
+                if meta.get("default") is not None:
+                    bits.append(f"default {meta['default']}")
+                text = f"{table}.{word}  —  " + "  ·  ".join(bits)
+        elif word in known_tables:
+            n_cols = len(self.completer.table_columns(word))
+            kind = "view" if self.completer.is_view(word) else "table"
+            text = f"{word}  ({kind}, {n_cols} column{'s' if n_cols != 1 else ''})"
+        else:
+            alias_target = self.completer.alias_target(word)
+            if alias_target:
+                text = f"{word}  →  alias for {alias_target}"
+
+        if text:
+            QToolTip.showText(event.globalPos(), text, self.editor)
+        else:
+            QToolTip.hideText()
+        return True
+
+    def _apply_extra_selections(self):
+        """Merge CodeEditor's own current-line highlight (always index 0,
+        reset on every cursor move by its cursorPositionChanged handler)
+        with the find-match and schema-validation layers, each tracked in
+        its own list so neither clobbers the other."""
+        base = self.editor.extraSelections()[:1]
+        self.editor.setExtraSelections(
+            base + self._find_selections + self._validation_selections)
 
     def _open_snippet_editor(self):
         """Open the snippet management dialog."""
@@ -1071,6 +1140,13 @@ class SqlTab(QWidget):
                 and event.key() == Qt.Key_Escape and self.completer.popup_visible):
             event.accept()
             return True
+
+        # Schema-aware hover tooltip: type/nullable/default/key for a column,
+        # or row/column counts for a table — same metadata the autocomplete
+        # badges use, via QEvent.ToolTip (Qt's standard per-position-tooltip
+        # hook, delivered on hover-still without needing setMouseTracking).
+        if obj is self.editor and event.type() == event.Type.ToolTip:
+            return self._show_schema_hover(event)
 
         if obj != self.editor or event.type() != event.Type.KeyPress:
             return super().eventFilter(obj, event)
@@ -1130,6 +1206,7 @@ class SqlTab(QWidget):
             result = super().eventFilter(obj, event)
             if not getattr(self, '_completer_suppressed', False):
                 self.completer.update()
+            self._schedule_schema_validation()
             return result
 
         # 5. Printable word characters: process first, then update
@@ -1142,12 +1219,14 @@ class SqlTab(QWidget):
                 self.completer.update()
             else:
                 self.completer.hide_popup()
+            self._schedule_schema_validation()
             return result
 
         # 6. Any other key (Enter for new line, space, punctuation…): hide popup
         if key not in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt, Qt.Key_Meta,
                        Qt.Key_CapsLock, Qt.Key_NumLock):
             self.completer.hide_popup()
+            self._schedule_schema_validation()
 
         return super().eventFilter(obj, event)
 
@@ -1498,7 +1577,10 @@ class SqlTab(QWidget):
         # Show first result
         bar.setCurrentIndex(0)
         self._on_multi_result_tab(0)
-        self.update_status(sum(len(df) for _, df in results), elapsed)
+        # A failed statement's tab holds an Exception, not a DataFrame — it
+        # contributes no rows to this total rather than breaking len().
+        total_rows = sum(len(df) for _, df in results if not isinstance(df, Exception))
+        self.update_status(total_rows, elapsed)
 
     def _on_multi_result_tab(self, index: int):
         if not hasattr(self, '_multi_results') or index >= len(self._multi_results):
@@ -2355,7 +2437,8 @@ class SqlTab(QWidget):
         cur.select(QTextCursor.Document)
         cur.setCharFormat(fmt_clr)
         cur.clearSelection()
-        self.editor.setExtraSelections(self.editor.extraSelections()[:1])  # keep line hl
+        self._find_selections = []
+        self._apply_extra_selections()
 
     def _find_live_update(self, *_):
         """Re-run search on every keystroke or toggle change."""
@@ -2393,9 +2476,8 @@ class SqlTab(QWidget):
             es.format = fmt_hi
             cursors.append(es)
 
-        # Keep current-line highlight (index 0) and add match highlights
-        base = self.editor.extraSelections()[:1]
-        self.editor.setExtraSelections(base + cursors)
+        self._find_selections = cursors
+        self._apply_extra_selections()
 
         count = len(self._find_matches)
         self._prev_match_btn.setEnabled(count > 0)
