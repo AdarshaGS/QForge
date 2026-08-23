@@ -19,7 +19,9 @@ set -euo pipefail
 
 # ─── Configuration ──────────────────────────────────────────────
 GITHUB_USER="AdarshaGS"
-GITHUB_REPO="QForge"
+# Releases publish to this separate PUBLIC repo, not the (private) QForge
+# source repo — same reasoning as utils/updater.py's GITHUB_REPO constant.
+GITHUB_REPO="QForge-releases"
 DMG_NAME="QForge.dmg"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 DMG_PATH="$REPO_DIR/$DMG_NAME"

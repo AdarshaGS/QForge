@@ -2,10 +2,10 @@ cask "qforge" do
   version "1.0.4"
   sha256 "4cef901aa9371d7fe5c3af3d5a964e3d71ff0a35cbef2a5473adee0a31c9cdbb"
 
-  url "https://github.com/AdarshaGS/QForge/releases/download/v#{version}/QForge.dmg"
+  url "https://github.com/AdarshaGS/QForge-releases/releases/download/v#{version}/QForge.dmg"
   name "QForge"
   desc "Professional database client - free alternative to TablePlus"
-  homepage "https://github.com/AdarshaGS/QForge"
+  homepage "https://qforge-licensing-production.up.railway.app"
 
   livecheck do
     url :url
@@ -39,6 +39,6 @@ cask "qforge" do
       2. Click "+" to add a database connection
       3. Start managing your databases!
 
-    Documentation: https://github.com/AdarshaGS/QForge
+    Documentation: https://qforge-licensing-production.up.railway.app
   EOS
 end
