@@ -16,6 +16,7 @@ from services.db_service import DbService
 from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
 from services.entitlements import Edition, entitlements
+from ui.command_palette import show_command_palette
 from ui.connection_dialog import ConnectionDialog
 from ui.connection_panel import ConnectionPanel
 from ui.license_dialog import LicenseDialog
@@ -823,6 +824,10 @@ class MainWindow(QMainWindow):
         act.triggered.connect(
             lambda: self._current_panel() and self._current_panel().show_quick_search()
         )
+
+        act = view_menu.addAction("Command Palette")
+        act.setShortcut("Ctrl+Shift+P")
+        act.triggered.connect(lambda: show_command_palette(menubar, self))
 
         view_menu.addSeparator()
 
