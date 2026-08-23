@@ -44,6 +44,7 @@ from ui.column_selection_dialog import ColumnSelectionDialog
 from ui.theme_manager import ThemeManager
 from ui.erd_dialog import ErdDialog
 from ui.schema_compare_dialog import SchemaCompareDialog
+from ui.data_compare_dialog import DataCompareDialog
 from ui.mock_data_dialog import MockDataDialog
 from ui import query_guard_dialog
 from ui.upgrade_dialog import require_pro, require_under_limit
@@ -1601,6 +1602,17 @@ class ConnectionPanel(QWidget):
         if not require_pro(Feature.SCHEMA_COMPARE, "Schema Compare", self):
             return
         dlg = SchemaCompareDialog(
+            self.config.get("id", ""), is_dark=(self.current_theme == "dark"), parent=self)
+        dlg.exec_()
+
+    def open_data_compare(self):
+        """Open the read-only Data Compare dialog (issue #197/#204),
+        preselecting this connection as Source. Builds its own dedicated
+        connections for both sides (services/data_diff.py) — never touches
+        self.db_service."""
+        if not require_pro(Feature.DATA_COMPARE, "Data Compare", self):
+            return
+        dlg = DataCompareDialog(
             self.config.get("id", ""), is_dark=(self.current_theme == "dark"), parent=self)
         dlg.exec_()
 

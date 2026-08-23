@@ -1376,22 +1376,26 @@ class DbService:
             pass
         return {}
 
-    def get_databases(self):
+    # System schemas that aren't a user database, hidden from any picker
+    # that lists sibling databases on a MySQL host.
+    _MYSQL_SYSTEM_DBS = ("information_schema", "mysql", "performance_schema", "sys")
 
-        cursor = self.connection.cursor()
-
-        cursor.execute("SHOW DATABASES")
-
-        result = cursor.fetchall()
-
-        databases = []
-
-        for row in result:
-            databases.append(list(row.values())[0])
-
-        databases.sort()
-
-        return databases
+    def get_databases(self) -> list:
+        """Other databases reachable on this already-open connection's host
+        — used by database pickers (Schema Compare / Data Compare, issue
+        feedback: a saved connection profile is host-level and one host can
+        hold several databases, so comparing by profile alone isn't enough).
+        Empty for sqlite, where the connection *is* a single database file,
+        so there's nothing to list."""
+        if self.db_type == "mysql":
+            cursor = self.connection.cursor()
+            cursor.execute("SHOW DATABASES")
+            names = [list(row.values())[0] for row in cursor.fetchall()]
+            return sorted(n for n in names if n not in self._MYSQL_SYSTEM_DBS)
+        if self.db_type == "postgresql":
+            df = self.execute_query("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
+            return df["datname"].tolist()
+        return []
 
     def describe_table(self, table_name):
 

@@ -881,6 +881,11 @@ class MainWindow(QMainWindow):
             lambda: self._current_panel() and self._current_panel().open_schema_compare()
         )
 
+        self.data_compare_action = db_menu.addAction("Compare Data…")
+        self.data_compare_action.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().open_data_compare()
+        )
+
         db_menu.addSeparator()
 
         act = db_menu.addAction("Create Database…")

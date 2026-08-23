@@ -8,78 +8,72 @@ messages once committed — don't duplicate them here. Replace stale sections
 outright rather than appending to them. Do not record passwords, tokens,
 hostnames, customer data, or unredacted SQL.
 
-## Current state (as of 2026-08-19)
+## Current state (as of 2026-08-22)
 
-**Branch:** `master`. `git status` is the source of truth for exactly which
-files are dirty — this section is a summary, not a substitute.
+**Branch:** `master`, clean working tree, in sync with `origin/master`
+(`1431b94`). `git status` is the source of truth for exactly which files
+are dirty — this section is a summary, not a substitute.
 
-**Security VAPT #161–163 (this session)** — closed. Full hacker-style pass
-turned up three real findings, all fixed, tested, and commented+closed on
-GitHub: sandbox-escapable `eval()` in cell formulas (`ui/editable_table.py`,
-replaced with an AST-whitelisted `_safe_eval_arithmetic`, reachable via
-DB-sourced content through bulk-column-edit's `{value}` substitution);
-unescaped identifiers in exported `.sql` (`utils/df_export.py`
-`_quote_identifier` now doubles embedded backtick/quote); Zip Slip via
-unsanitized table names as zip entry paths (`ui/connection_panel.py`, new
-`_safe_zip_entry_name`). 10 new regression tests added; full suite is 323
-passing. **Not committed** — user chose not to commit yet this session.
-Found but not filed: `stream_table_rows()` (`services/db_service.py:715`)
-builds `SELECT * FROM {table_name}` unquoted across the file — not itself
-exploitable (breaks the query before reaching anything unsafe) but worth
-its own ticket if pursued; overlaps existing **#114** ("Audit
-Identifier/Value Escaping") scope.
+Everything the 2026-08-19 version of this file listed as "uncommitted"
+(security fixes #161–163, export dialog #156–160, licensing integration
+#81–88) landed on master in prior sessions — see `git log` (e.g. `e8bdedd`,
+`e14206f`, `42443b1`, `b11f939`, `2703baf`). Trust `git log`/`gh issue
+view --comments` over any stale summary here.
 
-**Licensing (Milestone #12, #81–#88)** — all done and, unusually, partly
-**committed**: the user has been approving narrow single-file commits
-rather than lifting the hold wholesale. Landed on `master`: `c7a9e3e`
-(`pricing_url` → the deployed `qforge-licensing` pricing page, closing
-#145) and `31e7b68` (rotated the license-verification public key to match
-the keypair Railway's signing key actually holds). Still uncommitted: rest
-of the licensing-integration layer (`main.py`,
-`services/entitlement_config.py`, `services/licensing_client.py`,
-entitlement/license test files). **Not yet verified**: a real activation
-against production with an actually-issued signed license (needs the
-private key, kept outside the repo).
+**Milestone #11 "Security — Post-Launch Hardening"** — this session's work.
+All 3 issues closed by the user (2026-08-22), milestone has 0 open issues
+but is **not yet closed as a milestone object** on GitHub — trivial next
+step if wanted.
+- **#141** (eval() in grid formula evaluator): already fixed on master
+  before this session (`_safe_eval_arithmetic`, AST-whitelisted, in
+  `ui/editable_table.py`). Verified this session with an adversarial
+  payload test — no code change needed.
+- **#120** (dependency CVE scanning in CI): added, this session
+  (`1431b94`) — `pip-audit` step in
+  `.github/workflows/tests.yml`, `pip-audit` pinned in
+  `requirements-dev.txt`. Clean run against current `requirements.txt`.
+- **#119** (keychain re-auth on ad-hoc → Developer ID signing migration):
+  documented, this session (`1431b94`) — new "macOS: one-time re-auth
+  after a signing change" section in `README.md`. `get_password`/
+  `set_password` (`utils/credential_store.py`) already handle it
+  gracefully; no code change needed, just verification + docs.
 
-**Export dialog** (#156–#160, closed prior session) — per-table S/C/D
-grid, format tabs, streaming backend, indexes/FKs in Structure export
-(SQLite/Postgres), perf fixes (`_sql_value_literal` reorder,
-`gzip` compresslevel=1). None of this committed yet.
+**Milestone #10 "Security — Pre-Launch VAPT (Critical)"** — 10/11 closed.
+Only **#113** open: harden `utils/self_updater.py` against a compromised
+GitHub release channel (verify code signature/Team ID, not just SHA256) —
+blocked on real Apple Developer ID signing being in place first.
 
-**Postgres/SQLite test coverage** — `_is_connection_error` doesn't match
-psycopg2's "connection already closed" message (only the realistic
-server-killed-session case). Found, not fixed.
+**Milestones #12 (Licensing — Entitlements) and #14 (Licensing — Purchase
+Flow)** — fully closed (0 open). Not verified this session whether a real
+production activation against an actually-issued signed license has ever
+been done — flagged as open in a prior flush, status not rechecked here.
+
+**Milestone #15 "Licensing — Website & Privacy"** — 7 open (#108, #109,
+#185–189): domain/DNS, analytics, legal review of privacy policy/terms,
+Cashfree production activation, Apple Developer account & code signing.
+Untouched this session.
 
 ## Open threads not yet started
 
-- Commit strategy for everything uncommitted (security fixes, export
-  perf/UI work, rest of licensing-integration layer) — user's call each
-  time; narrow per-file/per-epic commits have been the pattern.
-- A full activation against production with a real signed license (#88
-  follow-up) — needs the private signing key.
-- Pick a payment provider for `qforge-licensing`'s `/checkout`; wire
-  `/webhook/purchase`; flip `QFORGE_CHECKOUT_MODE` to `"payment"`.
-- **#144** — decide "Advanced schema tools" Pro-gate scope.
-- **#114, #115–118, #139, #140** — remaining open VAPT milestone (#10)
-  tickets, untouched this session.
-- **Production-safety Slices 5–6** (`ai/load-context.md`) — unchanged.
-- **#54, #75** — still on hold. **#61, #79, #66/#67** — still need a
-  status recheck.
-- The `_is_connection_error` gap (Postgres) — undecided whether worth
-  fixing.
+- Close milestone #11 itself on GitHub (all 3 issues done, milestone
+  object still shows open).
+- **#113** — auto-updater signature hardening; needs Developer ID signing
+  first (tracked under milestone #15/#189).
+- Milestone #15 (7 open items) — website/DNS/legal/payment-activation/
+  signing chores, none started.
+- **Production-safety Slices 5–6** (`ai/load-context.md`: query
+  limits/timeout/cancellation, audit trail) — unchanged, untouched.
+- Whether a real production license activation with an actually-issued
+  signed key has happened — status unconfirmed, needs a recheck rather
+  than assumed from an old note.
 
 ## Exact next step
 
-1. User's call on committing the accumulated uncommitted work (security
-   fixes + export + licensing) — ask before assuming scope.
-2. A full activation against production with a real signed license.
-3. Pick a payment provider for `qforge-licensing`'s `/checkout`.
-
-## Milestone status
-
-**#12**: #81–#88 done and verified; #144 still open. #145 closed.
-**Export epic (#156–#160)**: closed prior session. **Security VAPT (#10)**:
-#161–163 closed this session; #113–118, #139, #140 still open.
+1. If picking up security/hardening work: start with **#113** (needs
+   Developer ID signing landed first) or close out milestone #15's
+   remaining chores.
+2. Otherwise, ask the user what's next — no committed work is currently
+   in flight and no session left mid-task.
 
 ## Where the detail lives
 

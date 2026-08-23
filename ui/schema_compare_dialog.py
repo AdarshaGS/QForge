@@ -21,9 +21,13 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QFileDialog, QMenu,
 )
 
+from services.db_service import DbService
 from services.schema_diff import build_schema_diff
 from services.schema_migration import generate_migration_sql
 from ui.connection_dialog import ConnectionDialog
+from utils.logger import get_logger
+
+logger = get_logger()
 
 # (is_dark) -> {change -> color}. Chosen to stay legible against both a dark
 # (#1c1c1e-ish) and light (#ffffff-ish) tree background.
@@ -76,6 +80,7 @@ class SchemaCompareDialog(QDialog):
     _diff_load_error = Signal(str)
     _migration_ready = Signal(str)
     _migration_error = Signal(str)
+    _databases_loaded = Signal(object, dict, list, str)
 
     def __init__(self, current_connection_id: str = "", is_dark: bool = True, parent=None):
         super().__init__(parent)
@@ -93,8 +98,30 @@ class SchemaCompareDialog(QDialog):
         picker_row = QFormLayout()
         self.source_combo = QComboBox()
         self.target_combo = QComboBox()
-        picker_row.addRow("Source:", self.source_combo)
-        picker_row.addRow("Target:", self.target_combo)
+        # A saved connection profile is host-level and can hold several
+        # databases — this lets the same server be picked for both Source
+        # and Target (e.g. comparing a duplicated database against its
+        # original on one host) instead of being stuck with whichever
+        # single "database" happened to be saved on the profile. Left
+        # disabled/empty for sqlite, where the connection *is* a single
+        # database file (same distinction ConnectionPanel's own
+        # DbSwitcherDialog already makes).
+        self.source_db_combo = QComboBox()
+        self.source_db_combo.setEnabled(False)
+        self.target_db_combo = QComboBox()
+        self.target_db_combo.setEnabled(False)
+
+        source_row = QHBoxLayout()
+        source_row.addWidget(self.source_combo, 1)
+        source_row.addWidget(QLabel("DB:"))
+        source_row.addWidget(self.source_db_combo, 1)
+        picker_row.addRow("Source:", source_row)
+
+        target_row = QHBoxLayout()
+        target_row.addWidget(self.target_combo, 1)
+        target_row.addWidget(QLabel("DB:"))
+        target_row.addWidget(self.target_db_combo, 1)
+        picker_row.addRow("Target:", target_row)
         layout.addLayout(picker_row)
 
         self._profiles = _load_connection_profiles()
@@ -135,6 +162,14 @@ class SchemaCompareDialog(QDialog):
         self._diff_load_error.connect(self._on_diff_error)
         self._migration_ready.connect(self._on_migration_ready)
         self._migration_error.connect(self._on_migration_error)
+        self._databases_loaded.connect(self._on_databases_loaded)
+
+        self.source_combo.currentIndexChanged.connect(
+            lambda: self._load_databases(self.source_combo, self.source_db_combo))
+        self.target_combo.currentIndexChanged.connect(
+            lambda: self._load_databases(self.target_combo, self.target_db_combo))
+        self._load_databases(self.source_combo, self.source_db_combo)
+        self._load_databases(self.target_combo, self.target_db_combo)
 
     # ── connection pickers ───────────────────────────────────────────
 
@@ -154,12 +189,60 @@ class SchemaCompareDialog(QDialog):
             return None
         return ConnectionDialog.load_connection_by_id(conn_id)
 
+    def _effective_config(self, conn_combo: QComboBox, db_combo: QComboBox):
+        """*conn_combo*'s resolved config, with "database" overridden to
+        whatever *db_combo* has selected — lets the same host be picked for
+        both Source and Target (e.g. a duplicated database vs. its original
+        on one server) instead of being stuck with the profile's own saved
+        database."""
+        config = self._resolve_config(conn_combo)
+        if config is None:
+            return None
+        db_name = db_combo.currentText().strip()
+        return dict(config, database=db_name) if db_name else config
+
+    def _load_databases(self, conn_combo: QComboBox, db_combo: QComboBox):
+        db_combo.clear()
+        db_combo.setEnabled(False)
+        config = self._resolve_config(conn_combo)
+        if config is None or config.get("type") == "sqlite":
+            return
+
+        sig = self._databases_loaded
+
+        def _worker():
+            names, err = [], ""
+            db = DbService()
+            try:
+                db.connect(config)
+                names = db.get_databases()
+            except Exception as ex:
+                err = str(ex)
+                logger.warning(f"Schema Compare: failed to list databases: {ex}")
+            finally:
+                db.disconnect()
+            sig.emit(db_combo, config, names, err)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_databases_loaded(self, db_combo: QComboBox, config: dict, names: list, err: str):
+        db_combo.blockSignals(True)
+        db_combo.clear()
+        db_combo.addItems(names)
+        current_db = config.get("database", "")
+        if current_db and current_db in names:
+            db_combo.setCurrentText(current_db)
+        db_combo.setEnabled(bool(names))
+        db_combo.blockSignals(False)
+        if err:
+            self.status_label.setText(f"⚠ Failed to load databases: {err}")
+
     # ── diffing (background thread — same pattern as
     # ErdDialog._reload) ────────────────────────────────────────────
 
     def _run_compare(self):
-        source_config = self._resolve_config(self.source_combo)
-        target_config = self._resolve_config(self.target_combo)
+        source_config = self._effective_config(self.source_combo, self.source_db_combo)
+        target_config = self._effective_config(self.target_combo, self.target_db_combo)
         if source_config is None or target_config is None:
             QMessageBox.information(self, "Schema Compare", "Choose both a source and a target connection.")
             return
