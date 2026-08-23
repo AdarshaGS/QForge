@@ -186,6 +186,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Update Homebrew tap cask
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -z "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]; then
             echo "::warning::HOMEBREW_TAP_TOKEN secret not set — skipping Homebrew tap update. Update Casks/qforge.rb in adarshags/homebrew-qforge manually (see deploy.sh)."
@@ -193,7 +195,15 @@ jobs:
           fi
 
           VERSION="${GITHUB_REF_NAME#v}"
-          DMG_SHA256=$(curl -sL "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/SHA256SUMS.txt" | awk '/QForge\.dmg$/ {print $1}')
+          # This repo is private, so a plain curl against the release
+          # asset's browser_download_url 404s unauthenticated — and
+          # authenticating the raw curl is fragile too (GitHub 302s it to a
+          # signed objects.githubusercontent.com URL, which rejects our
+          # Authorization header if curl resends it on the redirect).
+          # `gh release download` goes through the API instead, so the
+          # job's own GITHUB_TOKEN (read access to this repo) just works.
+          gh release download "${GITHUB_REF_NAME}" --repo "${{ github.repository }}" --pattern "SHA256SUMS.txt" --output SHA256SUMS.txt --clobber
+          DMG_SHA256=$(awk '/QForge\.dmg$/ {print $1}' SHA256SUMS.txt)
           if [ -z "$DMG_SHA256" ]; then
             echo "::error::Could not determine QForge.dmg sha256 from the release's SHA256SUMS.txt"
             exit 1
