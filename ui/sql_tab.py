@@ -1,3 +1,4 @@
+import difflib
 import os
 import re as _re
 import time
@@ -153,6 +154,7 @@ class SqlTab(QWidget):
         # extraSelections to just the line highlight on every move.
         self._validation_timer = None
         self._validation_selections: list = []
+        self._validation_issues: list = []
         self._find_selections: list = []
         self.editor.cursorPositionChanged.connect(self._apply_extra_selections)
 
@@ -162,6 +164,9 @@ class SqlTab(QWidget):
 
         # Install event filter for better control
         self.editor.installEventFilter(self)
+
+        # Ctrl/Cmd-click go-to-definition (issue #206)
+        self.editor.identifier_clicked.connect(self._go_to_definition)
         
         # ==================================
         # BUTTONS TOOLBAR (after editor)
@@ -982,6 +987,7 @@ class SqlTab(QWidget):
         known_tables = self.completer.known_tables()
         if not known_tables:
             self._validation_selections = []
+            self._validation_issues = []
             self._apply_extra_selections()
             return
 
@@ -994,8 +1000,9 @@ class SqlTab(QWidget):
         fmt.setUnderlineColor(QColor("#ff453a"))
 
         selections = []
+        issues = []   # [{"start", "end", "text", "candidates"}] — feeds quick-fixes (#207)
 
-        def flag(start: int, end: int):
+        def flag(start: int, end: int, candidates: list[str]):
             c = QTextCursor(doc)
             c.setPosition(start)
             c.setPosition(end, QTextCursor.KeepAnchor)
@@ -1003,6 +1010,8 @@ class SqlTab(QWidget):
             es.cursor = c
             es.format = fmt
             selections.append(es)
+            issues.append({"start": start, "end": end,
+                            "text": query[start:end], "candidates": candidates})
 
         # Unknown table/view names right after FROM/JOIN/UPDATE/INTO —
         # only once the name is followed by a real boundary (not mid-typed).
@@ -1013,7 +1022,7 @@ class SqlTab(QWidget):
             if end == pos:
                 continue
             if name not in known_tables:
-                flag(m.start(1), end)
+                flag(m.start(1), end, sorted(known_tables))
 
         # Unknown columns in alias.col / table.col, only where the left side
         # resolves to a known table/alias with known columns — an
@@ -1030,10 +1039,107 @@ class SqlTab(QWidget):
             if not cols:
                 continue
             if col not in cols and col.lower() not in (c.lower() for c in cols):
-                flag(m.start(2), end)
+                flag(m.start(2), end, cols)
 
         self._validation_selections = selections
+        self._validation_issues = issues
         self._apply_extra_selections()
+
+    def _resolve_word_at(self, position: int) -> tuple[str, str | None]:
+        """Word under `position` plus, for a dot-notation reference
+        (alias.col / table.col), the table its left side resolves to.
+        Shared by the hover tooltip and go-to-definition — both need the
+        same "what identifier is this and what table (if any) qualifies
+        it" resolution."""
+        cursor = QTextCursor(self.editor.document())
+        cursor.setPosition(position)
+        cursor.select(QTextCursor.WordUnderCursor)
+        word = cursor.selectedText()
+        if not word:
+            return "", None
+
+        block_text = cursor.block().text()
+        col_in_block = cursor.positionInBlock()
+        word_start = block_text.rfind(word, 0, col_in_block)
+
+        table = None
+        if word_start > 0 and block_text[word_start - 1] == '.':
+            left = block_text[:word_start - 1]
+            m = _re.search(r'(\w+)$', left)
+            if m:
+                table = self.completer.resolve_table(m.group(1))
+        return word, table
+
+    def _resolve_definition_target(self, word: str, table: str | None) -> str | None:
+        """The table/view whose structure `word` should navigate to, or
+        None if it doesn't resolve to anything the schema knows about."""
+        if not word:
+            return None
+        if table:
+            cols = self.completer.table_columns(table)
+            if word in cols or word.lower() in (c.lower() for c in cols):
+                return table
+            return None
+        if word in self.completer.known_tables():
+            return word
+        return self.completer.alias_target(word)
+
+    def _go_to_definition(self, position: int):
+        """Ctrl/Cmd-click handler (CodeEditor.identifier_clicked): jump to
+        the clicked table/column's structure view."""
+        word, table = self._resolve_word_at(position)
+        target = self._resolve_definition_target(word, table)
+        if target:
+            self._on_result_show_structure(target)
+
+    def _quick_fix_at(self, position: int) -> dict | None:
+        """The validation issue (see _update_schema_validation) covering
+        `position`, if any — the span, bad text, and its candidate pool
+        (known tables/views, or the owning table's columns)."""
+        for issue in self._validation_issues:
+            if issue["start"] <= position <= issue["end"]:
+                return issue
+        return None
+
+    def _apply_quick_fix(self, start: int, end: int, replacement: str):
+        c = QTextCursor(self.editor.document())
+        c.setPosition(start)
+        c.setPosition(end, QTextCursor.KeepAnchor)
+        c.insertText(replacement)
+        self._update_schema_validation()
+
+    def _show_editor_context_menu(self, event) -> bool:
+        """Standard edit menu plus a "Go to Definition" entry when the
+        right-clicked identifier resolves against the active schema, and
+        "Did you mean …?" quick-fixes when it's sitting on a
+        schema-validation squiggle (#207)."""
+        cursor = self.editor.cursorForPosition(event.pos())
+        click_pos = cursor.position()
+        word, table = self._resolve_word_at(click_pos)
+        target = self._resolve_definition_target(word, table)
+        issue = self._quick_fix_at(click_pos)
+
+        menu = self.editor.createStandardContextMenu()
+
+        if issue:
+            matches = difflib.get_close_matches(
+                issue["text"], issue["candidates"], n=3, cutoff=0.6)
+            if matches:
+                menu.addSeparator()
+                for suggestion in matches:
+                    action = menu.addAction(f"Did you mean “{suggestion}”?")
+                    action.triggered.connect(
+                        lambda checked=False, s=issue["start"], e=issue["end"], r=suggestion:
+                            self._apply_quick_fix(s, e, r))
+
+        if target:
+            menu.addSeparator()
+            action = menu.addAction(f"Go to Definition — {target}")
+            action.triggered.connect(
+                lambda: self._on_result_show_structure(target))
+
+        menu.exec(event.globalPos())
+        return True
 
     def _show_schema_hover(self, event) -> bool:
         """Resolve the identifier under the mouse against the completer's
@@ -1043,23 +1149,10 @@ class SqlTab(QWidget):
         from PySide6.QtWidgets import QToolTip
 
         cursor = self.editor.cursorForPosition(event.pos())
-        cursor.select(QTextCursor.WordUnderCursor)
-        word = cursor.selectedText()
+        word, table = self._resolve_word_at(cursor.position())
         if not word:
             QToolTip.hideText()
             return True
-
-        block_text = cursor.block().text()
-        col_in_block = cursor.positionInBlock()
-        word_start = block_text.rfind(word, 0, col_in_block)
-
-        # Dot-notation: is this word itself preceded by "<obj>." right before it?
-        table = None
-        if word_start > 0 and block_text[word_start - 1] == '.':
-            left = block_text[:word_start - 1]
-            m = _re.search(r'(\w+)$', left)
-            if m:
-                table = self.completer.resolve_table(m.group(1))
 
         text = None
         known_tables = self.completer.known_tables()
@@ -1093,11 +1186,12 @@ class SqlTab(QWidget):
         return True
 
     def _apply_extra_selections(self):
-        """Merge CodeEditor's own current-line highlight (always index 0,
-        reset on every cursor move by its cursorPositionChanged handler)
-        with the find-match and schema-validation layers, each tracked in
-        its own list so neither clobbers the other."""
-        base = self.editor.extraSelections()[:1]
+        """Merge CodeEditor's own selections (current-line highlight +
+        matching-bracket highlight, reset on every cursor move by its
+        cursorPositionChanged handler) with the find-match and
+        schema-validation layers, each tracked in its own list so neither
+        clobbers the other."""
+        base = self.editor.own_extra_selections()
         self.editor.setExtraSelections(
             base + self._find_selections + self._validation_selections)
 
@@ -1147,6 +1241,10 @@ class SqlTab(QWidget):
         # hook, delivered on hover-still without needing setMouseTracking).
         if obj is self.editor and event.type() == event.Type.ToolTip:
             return self._show_schema_hover(event)
+
+        # Go-to-Definition context-menu entry (issue #206)
+        if obj is self.editor and event.type() == event.Type.ContextMenu:
+            return self._show_editor_context_menu(event)
 
         if obj != self.editor or event.type() != event.Type.KeyPress:
             return super().eventFilter(obj, event)

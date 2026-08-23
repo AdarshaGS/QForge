@@ -38,8 +38,11 @@ class CodeEditor(QPlainTextEdit):
     QPlainTextEdit with:
       • Line-number gutter (auto-width, dim colour)
       • Current-line highlight (subtle tint)
-      • Matching-bracket underline
+      • Matching-bracket highlight (green when paired, red when unmatched)
+      • Ctrl/Cmd-click go-to-definition hook (identifier_clicked signal)
     """
+
+    identifier_clicked = Signal(int)   # document position of a Ctrl/Cmd-click
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -62,13 +65,16 @@ class CodeEditor(QPlainTextEdit):
         self.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.setTabStopDistance(QFontMetrics(font).horizontalAdvance(" ") * 4)
 
+        self._bracket_match_color   = QColor("#4a6b4a")
+        self._bracket_nomatch_color = QColor("#6b4a4a")
+
         # Signals
         self.blockCountChanged.connect(self._update_gutter_width)
         self.updateRequest.connect(self._update_gutter)
-        self.cursorPositionChanged.connect(self._highlight_current_line)
+        self.cursorPositionChanged.connect(self._update_extra_selections)
 
         self._update_gutter_width(0)
-        self._highlight_current_line()
+        self._update_extra_selections()
 
     # ── API expected by sql_tab (originally QTextEdit) ───────────────────────
 
@@ -148,9 +154,14 @@ class CodeEditor(QPlainTextEdit):
 
         painter.end()
 
-    # ── Current-line highlight ────────────────────────────────────────────────
+    # ── Current-line highlight + matching-bracket underline ──────────────────
 
-    def _highlight_current_line(self):
+    _OPEN_BRACKETS  = "([{"
+    _CLOSE_BRACKETS = ")]}"
+    _BRACKET_PAIRS  = dict(zip("([{", ")]}"))
+    _BRACKET_PAIRS.update({v: k for k, v in dict(zip("([{", ")]}")).items()})
+
+    def _update_extra_selections(self):
         extras = []
         if not self.isReadOnly():
             sel = QTextEdit.ExtraSelection()
@@ -159,7 +170,139 @@ class CodeEditor(QPlainTextEdit):
             sel.cursor = self.textCursor()
             sel.cursor.clearSelection()
             extras.append(sel)
+        extras.extend(self._bracket_match_selections())
+        self._own_extra_selections = extras
         self.setExtraSelections(extras)
+
+    def own_extra_selections(self) -> list:
+        """The line-highlight + bracket-match selections this editor owns,
+        as last computed. Callers layering their own selections on top
+        (e.g. sql_tab's schema-validation squiggles) should rebuild from
+        this rather than slicing extraSelections(), since the count here
+        varies (0-3) with bracket-match state."""
+        return list(getattr(self, "_own_extra_selections", []))
+
+    def _code_mask(self, text: str) -> list[bool]:
+        """Per-character mask: True where the character is plain SQL code,
+        False inside string literals, quoted identifiers, or comments."""
+        mask = [True] * len(text)
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch in ("'", '"', "`"):
+                quote = ch
+                mask[i] = False
+                i += 1
+                while i < n:
+                    mask[i] = False
+                    if text[i] == quote:
+                        if i + 1 < n and text[i + 1] == quote:  # doubled-quote escape
+                            mask[i + 1] = False
+                            i += 2
+                            continue
+                        i += 1
+                        break
+                    i += 1
+                continue
+            if ch == "-" and i + 1 < n and text[i + 1] == "-":
+                while i < n and text[i] != "\n":
+                    mask[i] = False
+                    i += 1
+                continue
+            if ch == "/" and i + 1 < n and text[i + 1] == "*":
+                mask[i] = mask[i + 1] = False
+                i += 2
+                while i < n:
+                    mask[i] = False
+                    if text[i] == "*" and i + 1 < n and text[i + 1] == "/":
+                        mask[i + 1] = False
+                        i += 2
+                        break
+                    i += 1
+                continue
+            i += 1
+        return mask
+
+    def _find_matching_bracket(self, text: str, mask: list[bool], pos: int) -> tuple[int, int] | None:
+        """Given a bracket at `pos`, return (pos, match_pos) or (pos, -1) if unmatched."""
+        ch = text[pos]
+        other = self._BRACKET_PAIRS[ch]
+        if ch in self._OPEN_BRACKETS:
+            depth = 0
+            for j in range(pos, len(text)):
+                if not mask[j]:
+                    continue
+                if text[j] == ch:
+                    depth += 1
+                elif text[j] == other:
+                    depth -= 1
+                    if depth == 0:
+                        return (pos, j)
+            return (pos, -1)
+        else:
+            depth = 0
+            for j in range(pos, -1, -1):
+                if not mask[j]:
+                    continue
+                if text[j] == ch:
+                    depth += 1
+                elif text[j] == other:
+                    depth -= 1
+                    if depth == 0:
+                        return (pos, j)
+            return (pos, -1)
+
+    def _bracket_match_selections(self) -> list:
+        text = self.toPlainText()
+        pos = self.textCursor().position()
+
+        candidates = []
+        if pos < len(text) and (text[pos] in self._OPEN_BRACKETS or text[pos] in self._CLOSE_BRACKETS):
+            candidates.append(pos)
+        if pos - 1 >= 0 and (text[pos - 1] in self._OPEN_BRACKETS or text[pos - 1] in self._CLOSE_BRACKETS):
+            candidates.append(pos - 1)
+        if not candidates:
+            return []
+
+        mask = self._code_mask(text)
+        bracket_pos = None
+        for c in candidates:
+            if mask[c]:
+                bracket_pos = c
+                break
+        if bracket_pos is None:
+            return []
+
+        found = self._find_matching_bracket(text, mask, bracket_pos)
+        if found is None:
+            return []
+        first, second = found
+
+        def _selection_at(index: int, matched: bool) -> QTextEdit.ExtraSelection:
+            sel = QTextEdit.ExtraSelection()
+            sel.format.setBackground(
+                self._bracket_match_color if matched else self._bracket_nomatch_color)
+            cursor = QTextCursor(self.document())
+            cursor.setPosition(index)
+            cursor.setPosition(index + 1, QTextCursor.KeepAnchor)
+            sel.cursor = cursor
+            return sel
+
+        matched = second != -1
+        selections = [_selection_at(first, matched)]
+        if matched:
+            selections.append(_selection_at(second, matched))
+        return selections
+
+    # ── Go-to-definition hook ─────────────────────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if (event.button() == Qt.LeftButton
+                and event.modifiers() & Qt.ControlModifier):
+            cursor = self.cursorForPosition(event.pos())
+            self.identifier_clicked.emit(cursor.position())
+            return   # don't let the modifier-click also start a text selection
+        super().mousePressEvent(event)
 
     # ── Resize: keep gutter in sync ───────────────────────────────────────────
 
@@ -184,17 +327,21 @@ class CodeEditor(QPlainTextEdit):
     # ── Theme update ─────────────────────────────────────────────────────────
 
     def apply_dark_palette(self):
-        self._current_line_color = QColor("#282828")
-        self._gutter_fg          = QColor("#4a4a4a")
-        self._gutter_bg          = QColor("#1a1a1a")
-        self._gutter_active_fg   = QColor("#858585")
-        self._highlight_current_line()
+        self._current_line_color   = QColor("#282828")
+        self._gutter_fg            = QColor("#4a4a4a")
+        self._gutter_bg            = QColor("#1a1a1a")
+        self._gutter_active_fg     = QColor("#858585")
+        self._bracket_match_color  = QColor("#4a6b4a")
+        self._bracket_nomatch_color = QColor("#6b4a4a")
+        self._update_extra_selections()
         self._gutter.update()
 
     def apply_light_palette(self):
-        self._current_line_color = QColor("#f0f0f0")
-        self._gutter_fg          = QColor("#aaaaaa")
-        self._gutter_bg          = QColor("#f5f5f5")
-        self._gutter_active_fg   = QColor("#333333")
-        self._highlight_current_line()
+        self._current_line_color   = QColor("#f0f0f0")
+        self._gutter_fg            = QColor("#aaaaaa")
+        self._gutter_bg            = QColor("#f5f5f5")
+        self._gutter_active_fg     = QColor("#333333")
+        self._bracket_match_color  = QColor("#c9e6c9")
+        self._bracket_nomatch_color = QColor("#f0c9c9")
+        self._update_extra_selections()
         self._gutter.update()
