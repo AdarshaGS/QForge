@@ -1260,7 +1260,14 @@ class ConnectionPanel(QWidget):
         dialog.move(self.db_pill.mapToGlobal(
             self.db_pill.rect().bottomLeft()))
         dialog.db_selected.connect(self._switch_database)
-        dialog.exec()
+        # Issue #234: Qt.Popup (set in DbSwitcherDialog itself, for real
+        # click-outside-to-close) is shown via .show(), not .exec() — an
+        # app-modal .exec() loop blocks the very outside clicks this popup
+        # needs to see. .show() returns immediately, so this reference has
+        # to outlive the call or Python would garbage-collect the dialog
+        # out from under its own still-open window.
+        self._db_switcher_dialog = dialog
+        dialog.show()
 
     def _switch_database(self, new_db: str):
         if new_db == self.config.get("database", ""):
