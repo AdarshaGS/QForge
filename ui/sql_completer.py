@@ -559,6 +559,15 @@ class SqlCompleter:
         return next((fk for fk in self._foreign_keys.get(table, [])
                      if fk.get("column", "").lower() == column.lower()), None)
 
+    def primary_key_columns(self, table: str) -> list[str]:
+        """Column name(s) of `table` marked primary key in the bulk-fetched
+        column_details metadata (the same source column_meta() reads) —
+        empty if unknown (no column_details for this table, e.g. schema
+        still loading, or the table genuinely has no PK)."""
+        meta = self._column_meta.get(table, {})
+        return [c for c in self._columns.get(table, [])
+                if meta.get(c.lower(), {}).get("key") == "PRI"]
+
     def _ensure_popup(self) -> SqlCompletePopup:
         """Construct the popup on first real use — see __init__ for why."""
         if self._popup is None:

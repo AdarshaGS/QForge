@@ -122,3 +122,14 @@ def test_public_accessors_resolve_alias_and_column_meta():
     assert meta["key"] == "PRI"
     assert completer.is_view("active_users") is True
     assert completer.known_tables() == {"users", "orders", "active_users"}
+
+
+def test_primary_key_columns_reads_key_field_from_column_details():
+    completer, _ = _make_completer("SELECT * FROM users")
+    assert completer.primary_key_columns("users") == ["id"]
+    assert completer.primary_key_columns("orders") == ["id"]
+
+
+def test_primary_key_columns_empty_for_unknown_table():
+    completer, _ = _make_completer("SELECT * FROM users")
+    assert completer.primary_key_columns("no_such_table") == []

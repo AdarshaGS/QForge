@@ -110,6 +110,7 @@ class TableViewWidget(QWidget):
         self.table_name = table_name
         self.current_filter = ""
         self.columns = []
+        self._primary_keys = None   # lazily fetched once — see load_table_data()
         self.sort_column = None
         self.sort_order = None  # 'DESC' or 'ASC'
         self.filter_conditions = []  # List of (column, operator, value) tuples
@@ -547,6 +548,13 @@ class TableViewWidget(QWidget):
                 df = pd.DataFrame(columns=self.columns)
             
             self.data_table.load_data(df, table_name=self.table_name)
+            if self._primary_keys is None:
+                try:
+                    self._primary_keys = self.db_service.get_primary_keys(self.table_name)
+                except Exception as ex:
+                    logger.debug(f"get_primary_keys failed for {self.table_name}: {ex}")
+                    self._primary_keys = []
+            self.data_table.set_primary_key_columns(self._primary_keys)
             _page_load_ms = (time.perf_counter() - _page_load_t0) * 1000
             # issue #174: a page load spanning a detected system
             # suspend/sleep isn't a real measurement of this operation's

@@ -1712,6 +1712,17 @@ class SqlTab(QWidget):
 
     # ── Pagination helpers for SQL result table ───────────────────────────
 
+    def _apply_result_primary_keys(self):
+        """Tell result_table the real primary-key column(s) of
+        current_table_name (from the already-loaded schema metadata, no
+        extra fetch) so get_changes() can build a WHERE clause that
+        actually identifies one row instead of assuming column 0 is the
+        key. Empty/unknown table name or no cached PK info both fall back
+        to result_table's own "match every column" default."""
+        pk = (self.completer.primary_key_columns(self.current_table_name)
+              if self.current_table_name else [])
+        self.result_table.set_primary_key_columns(pk)
+
     def _refresh_result_view(self):
         """Display the current page of _result_view_df in result_table.
 
@@ -1721,6 +1732,7 @@ class SqlTab(QWidget):
         df = self._result_view_df
         if df is None or df.empty:
             self.result_table.load_data(df, self.current_table_name)
+            self._apply_result_primary_keys()
             self._pagination_bar.hide()
             return
 
@@ -1734,6 +1746,7 @@ class SqlTab(QWidget):
         page_df = df.iloc[start:end].reset_index(drop=True)
 
         self.result_table.load_data(page_df, self.current_table_name)
+        self._apply_result_primary_keys()
         self.result_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
 
         # Re-apply sort arrow/highlight so it survives load_data's reset —
