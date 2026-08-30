@@ -68,7 +68,14 @@ class SchemaDiff:
     tables_added: list = field(default_factory=list)      # list[str]
     tables_removed: list = field(default_factory=list)    # list[str]
     tables_modified: list = field(default_factory=list)   # list[TableDiff]
-    tables_unchanged: int = 0
+    tables_unchanged_names: list = field(default_factory=list)  # list[str]
+
+    @property
+    def tables_unchanged(self) -> int:
+        """Count only — kept for existing callers/tests. The names
+        themselves are what the UI needs to actually list them, hence
+        tables_unchanged_names above."""
+        return len(self.tables_unchanged_names)
 
 
 def build_schema_diff(source_config: dict, target_config: dict, table_names: list = None) -> SchemaDiff:
@@ -95,7 +102,7 @@ def build_schema_diff(source_config: dict, target_config: dict, table_names: lis
             if table_diff.has_changes:
                 diff.tables_modified.append(table_diff)
             else:
-                diff.tables_unchanged += 1
+                diff.tables_unchanged_names.append(name)
 
     return diff
 
