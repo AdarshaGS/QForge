@@ -19,6 +19,7 @@ from ui.advanced_filter_dialog import AdvancedFilterDialog
 from ui.theme_manager import ThemeManager
 
 from ui.sql_tab import SqlTab
+from ui.edit_error_dialog import show_save_errors
 from utils.logger import get_logger
 from utils import perf_metrics
 import pandas as pd
@@ -109,6 +110,7 @@ class TableViewWidget(QWidget):
         self.table_name = table_name
         self.current_filter = ""
         self.columns = []
+        self._primary_keys = None   # lazily fetched once — see load_table_data()
         self.sort_column = None
         self.sort_order = None  # 'DESC' or 'ASC'
         self.filter_conditions = []  # List of (column, operator, value) tuples
@@ -480,7 +482,7 @@ class TableViewWidget(QWidget):
             # already paid this cost, so this just makes MySQL consistent.
             try:
                 where_clause = f" WHERE {self.current_filter}" if self.current_filter else ""
-                count_query = f"SELECT COUNT(*) as total FROM {self.table_name}{where_clause}"
+                count_query = f"SELECT COUNT(*) as total FROM {self.table_name}{where_clause}"  # nosec B608
                 count_df = self.db_service.execute_query(count_query)
                 self.total_rows = int(count_df.iloc[0]['total'])
             except Exception as ex:
@@ -546,6 +548,13 @@ class TableViewWidget(QWidget):
                 df = pd.DataFrame(columns=self.columns)
             
             self.data_table.load_data(df, table_name=self.table_name)
+            if self._primary_keys is None:
+                try:
+                    self._primary_keys = self.db_service.get_primary_keys(self.table_name)
+                except Exception as ex:
+                    logger.debug(f"get_primary_keys failed for {self.table_name}: {ex}")
+                    self._primary_keys = []
+            self.data_table.set_primary_key_columns(self._primary_keys)
             _page_load_ms = (time.perf_counter() - _page_load_t0) * 1000
             # issue #174: a page load spanning a detected system
             # suspend/sleep isn't a real measurement of this operation's
@@ -1000,7 +1009,7 @@ class TableViewWidget(QWidget):
                     success_count += 1
                     logger.info(f"✓ DELETE: {sql}")
                 except Exception as e:
-                    errors.append(f"DELETE: {str(e)}")
+                    errors.append({"kind": "DELETE", "sql": sql, "error": str(e)})
                     logger.error(f"✗ DELETE failed: {sql} - {str(e)}")
 
             # Then UPDATEs
@@ -1010,7 +1019,7 @@ class TableViewWidget(QWidget):
                     success_count += 1
                     logger.info(f"✓ UPDATE: {sql}")
                 except Exception as e:
-                    errors.append(f"UPDATE: {str(e)}")
+                    errors.append({"kind": "UPDATE", "sql": sql, "error": str(e)})
                     logger.error(f"✗ UPDATE failed: {sql} - {str(e)}")
 
             # Finally INSERTs
@@ -1020,17 +1029,14 @@ class TableViewWidget(QWidget):
                     success_count += 1
                     logger.info(f"✓ INSERT: {sql}")
                 except Exception as e:
-                    errors.append(f"INSERT: {str(e)}")
+                    errors.append({"kind": "INSERT", "sql": sql, "error": str(e)})
                     logger.error(f"✗ INSERT failed: {sql} - {str(e)}")
 
-            # Only show message if there are errors
+            # Only show a dialog if there are errors (issue #143: structured
+            # summary + per-failure classification instead of the raw
+            # exception text as the primary message)
             if errors:
-                QMessageBox.warning(
-                    self,
-                    "Save Errors",
-                    f"Saved {success_count} changes, but {len(errors)} failed:\\n\\n" +
-                    "\\n".join(errors[:3])
-                )
+                show_save_errors(self, success_count, errors)
             else:
                 # Success - log only, no popup
                 logger.info(f"✓✓✓ Saved {success_count} changes successfully")

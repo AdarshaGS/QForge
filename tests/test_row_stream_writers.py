@@ -33,6 +33,29 @@ def test_csv_writer_decodes_blobs_when_hex_disabled():
     assert "hello" in buf.getvalue()
 
 
+def test_csv_writer_neutralizes_leading_formula_characters():
+    """Issue #115: a cell value starting with =, +, -, or @ is read as a
+    formula by Excel/Numbers/Sheets when the exported CSV is later opened
+    there — a leading apostrophe forces literal-text interpretation."""
+    buf = io.StringIO()
+    w = CsvRowStreamWriter(buf, ["id", "note"])
+    w.write_rows([
+        (1, "=cmd(calc)"),
+        (2, "+1+1"),
+        (3, "-1+1"),
+        (4, "@SUM(A1:A2)"),
+        (5, "plain text"),
+    ])
+    lines = buf.getvalue().splitlines()[1:]
+    assert lines == [
+        "1,'=cmd(calc)",
+        "2,'+1+1",
+        "3,'-1+1",
+        "4,'@SUM(A1:A2)",
+        "5,plain text",
+    ]
+
+
 def test_xml_writer_wraps_rows_in_table_root():
     buf = io.StringIO()
     w = XmlRowStreamWriter(buf, ["id", "name"], "users")

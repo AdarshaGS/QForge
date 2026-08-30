@@ -15,12 +15,15 @@ Feature .value) and the same parse_remote_override() validator below, so
 there is exactly one schema to keep in sync, not two.
 """
 
-# Raw JSON file in the QForge repo itself — no separate hosting needed.
-# Reuses the same GITHUB_USER/GITHUB_REPO identity utils/updater.py already
-# has. Point this at a Gist or another host instead if that's ever preferred;
-# it's the only line that needs to change.
+# Raw JSON file — hosted in AdarshaGS/QForge-releases (public), NOT the
+# "QForge" source repo (private) — this is fetched unauthenticated by every
+# installed copy at startup, same reasoning as utils/updater.py's
+# GITHUB_REPO. Edit and push the file there directly to change a limit or
+# the price for every installed copy without shipping a new release. Point
+# this at a Gist or another host instead if that's ever preferred; it's the
+# only line that needs to change.
 ENTITLEMENT_CONFIG_URL = (
-    "https://raw.githubusercontent.com/AdarshaGS/QForge/master/entitlements-config.json"
+    "https://raw.githubusercontent.com/AdarshaGS/QForge-releases/main/entitlements-config.json"
 )
 
 # ── Bundled defaults (offline fallback) ─────────────────────────────────────
@@ -44,7 +47,7 @@ PRO_LIMITS = {
     "query_history": 100,
 }
 
-PRO_ONLY_FEATURES = {"schema_compare", "advanced_erd", "query_verifier"}
+PRO_ONLY_FEATURES = {"schema_compare", "advanced_erd", "query_verifier", "data_compare"}
 
 PRICING_URL = "https://qforge-licensing-production.up.railway.app/#pricing"
 PRICE_LABEL = "$49/lifetime"
@@ -56,6 +59,7 @@ PRO_BENEFITS = [
     "Full ER diagrams",
     "Schema Compare",
     "Query Verifier",
+    "Data Compare",
     "Priority support",
 ]
 

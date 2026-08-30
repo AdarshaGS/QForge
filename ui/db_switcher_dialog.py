@@ -59,7 +59,14 @@ class DbSwitcherDialog(QDialog):
 
     def __init__(self, databases: list[str], current_db: str = "", parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        # Issue #234: this needs to close on a click anywhere outside it,
+        # including clicks on QForge's own main window right behind it.
+        # `.exec()` (application-modal) blocks those clicks before they can
+        # even generate a WindowDeactivate — a click-elsewhere-in-this-app
+        # is invisible to a modal dialog by design. Qt.Popup is the real
+        # fix: the same window type QMenu itself uses, with click-outside-
+        # to-close built in natively rather than hand-rolled.
+        self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setStyleSheet(self.STYLE)
         self.setFixedWidth(420)

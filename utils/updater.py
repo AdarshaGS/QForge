@@ -9,8 +9,13 @@ from PySide6.QtCore import QThread, Signal
 
 # ── App identity ──────────────────────────────────────────────────────────────
 GITHUB_USER = "AdarshaGS"
-GITHUB_REPO = "QForge"
-APP_VERSION  = "1.3.0"        # bump this, commit, then tag as v<APP_VERSION> to release
+# Deliberately NOT the "QForge" source repo — that's private (source stays
+# confidential), and this URL (plus self_updater.py's, which imports these
+# same two constants) is hit unauthenticated by every installed copy of the
+# app. Releases are published to this separate public repo instead — see
+# .github/workflows/build-release.yml's "release" job.
+GITHUB_REPO = "QForge-releases"
+APP_VERSION  = "1.4.1"        # bump this, commit, then tag as v<APP_VERSION> to release
 
 
 def _vtuple(tag: str) -> tuple:

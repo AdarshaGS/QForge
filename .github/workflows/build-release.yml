@@ -162,15 +162,31 @@ jobs:
           open("SHA256SUMS.txt.sig", "w").write(signature)
           PY
 
+      # Published to AdarshaGS/QForge-releases, a separate PUBLIC repo, not
+      # this one — this repo (the actual source) is private, and every
+      # unauthenticated consumer of a release (the in-app update checker/
+      # self-updater, the Homebrew tap, anyone using the release page
+      # directly) has no way to authenticate against a private repo's
+      # assets. Needs a RELEASES_REPO_TOKEN repo secret (a fine-grained PAT
+      # scoped to Contents: Read and write on AdarshaGS/QForge-releases
+      # only) — unlike HOMEBREW_TAP_TOKEN below, this one is required: a
+      # release can't be published at all without it, so this fails loudly
+      # rather than warning and skipping. --generate-notes is deliberately
+      # not used here: it diffs against the target repo's own tag history,
+      # which is meaningless in a binaries-only repo with no real commit
+      # history of its own.
       - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::RELEASES_REPO_TOKEN secret not set — cannot publish to AdarshaGS/QForge-releases. See .github/workflows/build-release.yml for setup."
+            exit 1
+          fi
           gh release create "${GITHUB_REF_NAME}" \
-            --repo "${{ github.repository }}" \
+            --repo "AdarshaGS/QForge-releases" \
             --title "QForge ${GITHUB_REF_NAME}" \
-            --notes "Automated release built from commit ${{ github.sha }}. Verify downloads against SHA256SUMS.txt." \
-            --generate-notes \
+            --notes "Built from AdarshaGS/QForge@${{ github.sha }}. Verify downloads against SHA256SUMS.txt." \
             artifacts/*
 
   # Bumps adarshags/homebrew-qforge's Casks/qforge.rb to this tag's version
@@ -186,6 +202,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Update Homebrew tap cask
+        env:
+          # gh needs *some* valid token to be considered "logged in" even
+          # to read a public repo — github.token (scoped to this repo
+          # only) satisfies that; public-repo reads don't need it to have
+          # any actual access to AdarshaGS/QForge-releases.
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -z "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]; then
             echo "::warning::HOMEBREW_TAP_TOKEN secret not set — skipping Homebrew tap update. Update Casks/qforge.rb in adarshags/homebrew-qforge manually (see deploy.sh)."
@@ -193,7 +215,12 @@ jobs:
           fi
 
           VERSION="${GITHUB_REF_NAME#v}"
-          DMG_SHA256=$(curl -sL "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/SHA256SUMS.txt" | awk '/QForge\.dmg$/ {print $1}')
+          # AdarshaGS/QForge-releases (where the "release" job above
+          # publishes) is public, so this needs no auth at all — using `gh
+          # release download` over a raw curl anyway since it goes through
+          # the API rather than the browser_download_url redirect chain.
+          gh release download "${GITHUB_REF_NAME}" --repo "AdarshaGS/QForge-releases" --pattern "SHA256SUMS.txt" --output SHA256SUMS.txt --clobber
+          DMG_SHA256=$(awk '/QForge\.dmg$/ {print $1}' SHA256SUMS.txt)
           if [ -z "$DMG_SHA256" ]; then
             echo "::error::Could not determine QForge.dmg sha256 from the release's SHA256SUMS.txt"
             exit 1

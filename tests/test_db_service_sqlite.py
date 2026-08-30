@@ -91,6 +91,35 @@ def test_get_all_columns_maps_table_to_columns(db):
     assert "name" in mapping["users"]
 
 
+def test_get_all_column_details_reports_type_nullable_and_pk(db):
+    details = db.get_all_column_details()
+    cols = {c["name"]: c for c in details["users"]}
+    assert cols["id"]["key"] == "PRI"
+    assert cols["name"]["nullable"] is False
+    assert cols["name"]["key"] == ""
+
+
+def test_get_all_column_details_empty_for_table_with_no_rows_matches_get_columns(db):
+    db.execute_update("CREATE TABLE empty_table (note TEXT)")
+    details = db.get_all_column_details()
+    assert [c["name"] for c in details["empty_table"]] == ["note"]
+    assert details["empty_table"][0]["key"] == ""
+
+
+def test_get_all_foreign_keys_maps_table_to_its_fk_list(db):
+    db.execute_update(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, "
+        "user_id INTEGER REFERENCES users(id))"
+    )
+    fks = db.get_all_foreign_keys()
+    assert fks["orders"] == [{"column": "user_id", "ref_table": "users", "ref_column": "id"}]
+    assert "users" not in fks  # users has no outgoing FK, so it's simply absent
+
+
+def test_get_all_foreign_keys_empty_dict_when_no_fks_anywhere(db):
+    assert db.get_all_foreign_keys() == {}
+
+
 # ─── Transaction controls (Slice 4, ai/load-context.md) ────────────────────
 
 
@@ -377,9 +406,9 @@ def test_execute_multi_query_runs_all_statements(db):
     results = db.execute_multi_query(script)
     assert len(results) == 2
     _, df1 = results[0]
-    _, df2 = results[1]
+    _, affected = results[1]
     assert list(df1["name"]) == ["Alice", "Bob"]
-    assert df2 is None  # UPDATE has no result set
+    assert affected == 1  # UPDATE affected 1 row, no result set
     assert db.execute_query("SELECT name FROM users WHERE id = 1").iloc[0]["name"] == "Zed"
 
 
@@ -420,3 +449,60 @@ def test_connect_missing_database_path_raises():
     service = DbService()
     with pytest.raises(Exception):
         service.connect({"type": "sqlite", "name": "t"})
+
+
+# ─── Adversarial identifiers (issue #114) ────────────────────────────────
+# A table/column name containing an embedded double-quote — achievable via
+# a quoted identifier, as any real SQLite CREATE TABLE can use — must not
+# break out of the identifier context in QForge's own generated metadata
+# queries (SHOW/PRAGMA-equivalents, content export, table browsing).
+
+_EVIL_TABLE = 'e"vil'
+_EVIL_COLUMN = 'na"me'
+
+
+@pytest.fixture
+def evil_db(db_path):
+    service = DbService()
+    service.connect({"type": "sqlite", "name": "test", "database": db_path})
+    service.execute_update(
+        'CREATE TABLE "e""vil" (id INTEGER PRIMARY KEY, "na""me" TEXT)'
+    )
+    service.execute_update('INSERT INTO "e""vil" (id, "na""me") VALUES (1, \'x\')')
+    yield service
+    service.disconnect()
+
+
+def test_get_columns_survives_quote_in_table_name(evil_db):
+    cols = evil_db.get_columns(_EVIL_TABLE)
+    assert [c["Field"] for c in cols] == ["id", _EVIL_COLUMN]
+
+
+def test_get_primary_keys_survives_quote_in_table_name(evil_db):
+    assert evil_db.get_primary_keys(_EVIL_TABLE) == ["id"]
+
+
+def test_get_indexes_survives_quote_in_table_name(evil_db):
+    evil_db.execute_update('CREATE INDEX "idx_evil" ON "e""vil" ("na""me")')
+    names = [idx["name"] for idx in evil_db.get_indexes(_EVIL_TABLE)]
+    assert "idx_evil" in names
+
+
+def test_content_select_list_quotes_columns(db_path):
+    service = DbService()
+    service.connect({"type": "sqlite", "name": "test", "database": db_path})
+    service.execute_update(
+        'CREATE TABLE "e""vil" (id INTEGER PRIMARY KEY, "na""me" TEXT, '
+        "total INTEGER GENERATED ALWAYS AS (id * 2) STORED)"
+    )
+    service.execute_update('INSERT INTO "e""vil" (id, "na""me") VALUES (1, \'x\')')
+    select_list = service.content_select_list(_EVIL_TABLE)
+    df = service.execute_query(f"SELECT {select_list} FROM {service._q(_EVIL_TABLE)}")
+    assert list(df.columns) == ["id", _EVIL_COLUMN]
+    service.disconnect()
+
+
+def test_stream_table_rows_survives_quote_in_table_name(evil_db):
+    columns, rows = next(evil_db.stream_table_rows(_EVIL_TABLE))
+    assert columns == ["id", _EVIL_COLUMN]
+    assert rows == [(1, "x")]

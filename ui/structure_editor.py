@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
+from utils.df_export import _quote_identifier as _quote
+
 
 class StructureEditorDialog(QDialog):
     """Dialog for creating/editing table structure"""
@@ -259,7 +261,7 @@ class StructureEditorDialog(QDialog):
             default = self.columns_table.item(row, 6).text()
             
             # Build column definition
-            col_def = f"`{name}` {col_type}"
+            col_def = f"{_quote(name, self.db_type)} {col_type}"
             
             if length:
                 col_def += f"({length})"
@@ -274,16 +276,16 @@ class StructureEditorDialog(QDialog):
                 if default.upper() in ["NULL", "CURRENT_TIMESTAMP"]:
                     col_def += f" DEFAULT {default.upper()}"
                 else:
-                    col_def += f" DEFAULT '{default}'"
-            
+                    col_def += f" DEFAULT '{default.replace(chr(39), chr(39) * 2)}'"
+
             columns.append(col_def)
-            
+
             if primary == "YES":
-                primary_keys.append(f"`{name}`")
-        
-        sql = f"CREATE TABLE `{table_name}` (\n  "
+                primary_keys.append(_quote(name, self.db_type))
+
+        sql = f"CREATE TABLE {_quote(table_name, self.db_type)} (\n  "
         sql += ",\n  ".join(columns)
-        
+
         if primary_keys:
             sql += f",\n  PRIMARY KEY ({', '.join(primary_keys)})"
         
@@ -324,9 +326,18 @@ class StructureEditorDialog(QDialog):
             self.columns_table.setItem(row, 6, QTableWidgetItem(default))
 
     def generate_alter_sql(self):
-        """Generate ALTER TABLE SQL by diffing existing vs new column list."""
+        """Generate ALTER TABLE SQL by diffing existing vs new column list.
+
+        Identifiers are quoted with utils.df_export._quote_identifier
+        rather than bare {quote}{name}{quote} (issue #114): old_cols below
+        is seeded from self.existing_columns, read from the connected
+        database's own schema metadata, which a crafted/compromised
+        database could otherwise use to inject through an untouched
+        pre-filled row."""
         table = self.table_name
-        quote = '`' if self.db_type == 'mysql' else '"'
+
+        def q(name):
+            return _quote(name, self.db_type)
 
         # Build dict of existing columns: name -> dict
         old_cols = {}
@@ -355,7 +366,7 @@ class StructureEditorDialog(QDialog):
             raise ValueError("At least one column is required")
 
         def col_def(name, col_type, length, nullable, auto_inc, default):
-            defn = f"{quote}{name}{quote} {col_type}"
+            defn = f"{q(name)} {col_type}"
             if length:
                 defn += f"({length})"
             if nullable == "NO":
@@ -367,7 +378,7 @@ class StructureEditorDialog(QDialog):
                 if up in ("NULL", "CURRENT_TIMESTAMP"):
                     defn += f" DEFAULT {up}"
                 else:
-                    defn += f" DEFAULT '{default}'"
+                    defn += f" DEFAULT '{default.replace(chr(39), chr(39) * 2)}'"
             return defn
 
         statements = []
@@ -375,14 +386,14 @@ class StructureEditorDialog(QDialog):
         # DROP columns that were removed
         for name in list(old_cols.keys()):
             if name not in new_cols:
-                statements.append(f"ALTER TABLE {quote}{table}{quote} DROP COLUMN {quote}{name}{quote};")
+                statements.append(f"ALTER TABLE {q(table)} DROP COLUMN {q(name)};")
 
         # ADD or MODIFY columns
         for name in new_order:
             col_type, length, nullable, primary, auto_inc, default = new_cols[name]
             defn = col_def(name, col_type, length, nullable, auto_inc, default)
             if name not in old_cols:
-                statements.append(f"ALTER TABLE {quote}{table}{quote} ADD COLUMN {defn};")
+                statements.append(f"ALTER TABLE {q(table)} ADD COLUMN {defn};")
             else:
                 # Check if anything changed — always emit MODIFY to be safe
                 old = old_cols[name]
@@ -391,12 +402,12 @@ class StructureEditorDialog(QDialog):
                 old_nullable = "YES" if str(old.get('Null', 'YES')).upper() in ('YES', 'TRUE', '1') else "NO"
                 if new_type_full.upper() != old_type or nullable != old_nullable:
                     if self.db_type == 'mysql':
-                        statements.append(f"ALTER TABLE {quote}{table}{quote} MODIFY COLUMN {defn};")
+                        statements.append(f"ALTER TABLE {q(table)} MODIFY COLUMN {defn};")
                     else:
                         # PostgreSQL uses separate clauses
-                        statements.append(f"ALTER TABLE {quote}{table}{quote} ALTER COLUMN {quote}{name}{quote} TYPE {col_type}{f'({length})' if length else ''};")
+                        statements.append(f"ALTER TABLE {q(table)} ALTER COLUMN {q(name)} TYPE {col_type}{f'({length})' if length else ''};")
                         null_clause = "DROP NOT NULL" if nullable == "YES" else "SET NOT NULL"
-                        statements.append(f"ALTER TABLE {quote}{table}{quote} ALTER COLUMN {quote}{name}{quote} {null_clause};")
+                        statements.append(f"ALTER TABLE {q(table)} ALTER COLUMN {q(name)} {null_clause};")
 
         if not statements:
             return f"-- No changes detected for table {table}"

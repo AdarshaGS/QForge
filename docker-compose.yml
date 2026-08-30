@@ -1,0 +1,48 @@
+# Dev-only fixture environment for adversarial-input testing against real
+# MySQL/PostgreSQL engine quirks (issue #139) — quoting rules, identifier
+# length limits, encoding edge cases — that SQLite (far more permissive)
+# can't exercise. Never part of the shipped app; not referenced by
+# build.sh/QForge.spec/build-release.yml.
+#
+# Usage:
+#   docker compose up -d
+#   pytest tests/                 # MySQL/Postgres suites auto-skip if unreachable
+#   docker compose down -v        # tear down, drop the throwaway data volumes
+#
+# See tests/README.md for the full setup/credentials reference.
+
+services:
+  qforge-test-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: qforge_test
+      POSTGRES_PASSWORD: qforge_test_pw
+      POSTGRES_DB: qforge_test
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./tests/fixtures/postgres_seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qforge_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qforge-test-mysql:
+    image: mysql:8
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: qforge_test_root_pw
+      MYSQL_DATABASE: qforge_test
+      MYSQL_USER: qforge_test
+      MYSQL_PASSWORD: qforge_test_pw
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./tests/fixtures/mysql_seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "qforge_test", "-pqforge_test_pw"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

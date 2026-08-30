@@ -307,9 +307,9 @@ def test_execute_multi_query_runs_all_statements(db):
     results = db.execute_multi_query(script)
     assert len(results) == 2
     label1, df1 = results[0]
-    label2, df2 = results[1]
+    label2, affected = results[1]
     assert list(df1["name"]) == ["Alice", "Bob"]
-    assert df2 is None  # UPDATE has no result set
+    assert affected == 1  # UPDATE affected 1 row, no result set
     assert db.execute_query("SELECT name FROM users WHERE id = 1").iloc[0]["name"] == "Zed"
 
 

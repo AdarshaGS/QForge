@@ -57,6 +57,12 @@ class LicenseDialog(QDialog):
         old_layout = self.layout()
         if old_layout is not None:
             QWidget().setLayout(old_layout)  # detach & discard old widgets
+        # The widgets above are gone now — drop any references to them too,
+        # or a stale hasattr() check in _set_busy() touches a deleted C++
+        # object on the next view (e.g. Pro -> Deactivate -> Free -> Activate).
+        for attr in ("activate_btn", "key_input", "error_label", "deactivate_btn"):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)

@@ -117,11 +117,18 @@ class QuickSearchDialog(QDialog):
         """Handle arrow key navigation from search input"""
         if obj == self.search_input and event.type() == event.Type.KeyPress:
             if event.key() == Qt.Key_Down:
-                # Move focus to results list and select first item
+                # filter_items() already selects row 0 as soon as there's a
+                # match, so this first Down press should land on row 1, not
+                # "confirm" row 0 a second time (issue: it previously took
+                # two presses to reach the second result).
                 if self.results_list.count() > 0:
                     self.results_list.setFocus()
-                    if self.results_list.currentRow() < 0:
+                    current = self.results_list.currentRow()
+                    if current < 0:
                         self.results_list.setCurrentRow(0)
+                    else:
+                        next_row = min(current + 1, self.results_list.count() - 1)
+                        self.results_list.setCurrentRow(next_row)
                 return True
             elif event.key() == Qt.Key_Up:
                 # Move focus to results list and select last item

@@ -276,7 +276,12 @@ class EditableTableWidget(QTableWidget):
         self._sort_asc = True
 
         self.table_name = None
-        self.primary_key_column = None
+        # Real primary-key column name(s) for self.table_name, set via
+        # set_primary_key_columns() by whoever loaded the data (they're the
+        # ones who know the table and can ask db_service). Empty means
+        # "unknown" — get_changes() then falls back to matching on every
+        # column rather than silently guessing one.
+        self.primary_key_columns: list[str] = []
 
         # Issue #125: freeze/pin leading columns. QTableWidget is item-based
         # (no QAbstractTableModel of its own to split into a model/view
@@ -454,6 +459,7 @@ class EditableTableWidget(QTableWidget):
         self.original_data = dataframe.copy() if dataframe is not None else None
         self.filtered_data = dataframe.copy() if dataframe is not None else None
         self.table_name = table_name
+        self.primary_key_columns = []   # caller sets via set_primary_key_columns()
         self.modified_rows.clear()
         self.modified_cells.clear()
         self.new_rows.clear()
@@ -464,7 +470,14 @@ class EditableTableWidget(QTableWidget):
         self.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
         
         self._display_data(dataframe)
-    
+
+    def set_primary_key_columns(self, columns: list[str]):
+        """The real primary-key column name(s) of self.table_name (from
+        db_service.get_primary_keys()), used by get_changes() to build a
+        WHERE clause that actually identifies one row. Call after load_data()
+        once the caller has looked them up."""
+        self.primary_key_columns = list(columns or [])
+
     def _display_data(self, dataframe):
         """Display dataframe in the table"""
         # Re-entrancy guard: if we're already rebuilding the table (e.g. a
@@ -1070,6 +1083,34 @@ class EditableTableWidget(QTableWidget):
         if self.original_data is not None:
             self.load_data(self.original_data, self.table_name)
     
+    def _key_column_indices(self) -> list[int]:
+        """Column indices an UPDATE/DELETE WHERE clause should match on.
+        Prefers the table's real primary-key column(s) (set via
+        set_primary_key_columns() — composite keys included); when those
+        aren't known (no PK, or the grid doesn't show one of them — e.g. a
+        hand-written SELECT that left a PK column out), falls back to every
+        column rather than guessing column 0. Column 0 is very often the
+        PK by convention but is not the PK by definition, and treating it
+        as one silently produced a WHERE clause that could match zero rows
+        (edit appears to do nothing) or more than one (edit lands on the
+        wrong row) whenever that convention didn't hold."""
+        if self.primary_key_columns:
+            name_to_idx = {
+                self.horizontalHeaderItem(c).text().lower(): c
+                for c in range(self.columnCount())
+            }
+            idxs = [name_to_idx[name.lower()] for name in self.primary_key_columns
+                    if name.lower() in name_to_idx]
+            if idxs:
+                return idxs
+        return list(range(self.columnCount()))
+
+    @staticmethod
+    def _sql_literal(value) -> str:
+        if pd.isna(value):
+            return "NULL"
+        return f"'{str(value).replace(chr(39), chr(39) * 2)}'"
+
     def get_changes(self):
         """
         Get all changes as SQL statements
@@ -1077,42 +1118,45 @@ class EditableTableWidget(QTableWidget):
         """
         if not self.table_name:
             return None
-        
+
         changes = {
             'updates': [],
             'inserts': [],
             'deletes': []
         }
-        
+
+        key_cols = self._key_column_indices()
+
         # Generate UPDATE statements for modified rows
         for row in self.modified_rows:
             if row in self.deleted_rows or row in self.new_rows:
                 continue
-            
+
             set_parts = []
             where_parts = []
-            
+
             for col in range(self.columnCount()):
                 col_name = self.horizontalHeaderItem(col).text()
                 item = self.item(row, col)
                 new_value = item.text()
-                
+
                 # Escape and quote string values
                 if new_value == "":
                     new_value = "NULL"
                 else:
                     new_value = f"'{new_value.replace(chr(39), chr(39)+chr(39))}'"
-                
+
                 set_parts.append(f"{col_name} = {new_value}")
-                
-                # Use original value for WHERE clause
-                if col == 0:  # Assume first column is primary key
+
+                # Use the original (pre-edit) value of each key column for
+                # the WHERE clause, so editing a key column's own value still
+                # matches the row it used to be.
+                if col in key_cols:
                     original_value = item.data(Qt.UserRole)
-                    if pd.isna(original_value):
-                        where_parts.append(f"{col_name} IS NULL")
-                    else:
-                        where_parts.append(f"{col_name} = '{original_value}'")
-            
+                    where_parts.append(f"{col_name} = {self._sql_literal(original_value)}"
+                                        if not pd.isna(original_value)
+                                        else f"{col_name} IS NULL")
+
             if set_parts and where_parts:
                 sql = f"UPDATE {self.table_name} SET {', '.join(set_parts)} WHERE {' AND '.join(where_parts)};"  # nosec B608
                 changes['updates'].append(sql)
@@ -1144,19 +1188,14 @@ class EditableTableWidget(QTableWidget):
                 continue
             
             where_parts = []
-            for col in range(self.columnCount()):
+            for col in key_cols:
                 col_name = self.horizontalHeaderItem(col).text()
                 item = self.item(row, col)
                 original_value = item.data(Qt.UserRole)
-                
-                if pd.isna(original_value):
-                    where_parts.append(f"{col_name} IS NULL")
-                else:
-                    where_parts.append(f"{col_name} = '{original_value}'")
-                
-                if col == 0:  # Only use first column (primary key)
-                    break
-            
+                where_parts.append(f"{col_name} = {self._sql_literal(original_value)}"
+                                    if not pd.isna(original_value)
+                                    else f"{col_name} IS NULL")
+
             if where_parts:
                 sql = f"DELETE FROM {self.table_name} WHERE {' AND '.join(where_parts)};"  # nosec B608
                 changes['deletes'].append(sql)

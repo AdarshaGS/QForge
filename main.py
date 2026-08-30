@@ -4,19 +4,20 @@ import json
 import signal
 import time
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSize
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabBar, QStackedWidget, QPushButton, QMessageBox, QProgressDialog,
-    QMenu, QDialog, QDialogButtonBox, QTextBrowser,
+    QMenu, QDialog, QDialogButtonBox, QTextBrowser, QLabel,
 )
-from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon
+from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon, QAction
 
 from services.db_service import DbService
 from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
 from services.entitlements import Edition, entitlements
 from services.license_manager import license_manager
+from ui.command_palette import show_command_palette
 from ui.connection_dialog import ConnectionDialog
 from ui.connection_panel import ConnectionPanel
 from ui.license_dialog import LicenseActionWorker, LicenseDialog
@@ -818,6 +819,10 @@ class MainWindow(QMainWindow):
         act = file_menu.addAction("Quit")
         act.setShortcut("Ctrl+Q")
         act.triggered.connect(self.close)
+        # Explicit rather than relying on Qt's text-heuristic role matching
+        # (which happens to catch "Quit" today) — this keeps app-menu
+        # placement guaranteed even if the label is ever reworded.
+        act.setMenuRole(QAction.MenuRole.QuitRole)
 
         # View
         view_menu = menubar.addMenu("View")
@@ -835,6 +840,10 @@ class MainWindow(QMainWindow):
         act.triggered.connect(
             lambda: self._current_panel() and self._current_panel().show_quick_search()
         )
+
+        act = view_menu.addAction("Command Palette")
+        act.setShortcut("Ctrl+Shift+P")
+        act.triggered.connect(lambda: show_command_palette(menubar, self))
 
         view_menu.addSeparator()
 
@@ -888,6 +897,11 @@ class MainWindow(QMainWindow):
             lambda: self._current_panel() and self._current_panel().open_schema_compare()
         )
 
+        self.data_compare_action = db_menu.addAction("Compare Data…")
+        self.data_compare_action.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().open_data_compare()
+        )
+
         db_menu.addSeparator()
 
         act = db_menu.addAction("Create Database…")
@@ -920,6 +934,16 @@ class MainWindow(QMainWindow):
 
         # Help
         help_menu = menubar.addMenu("Help")
+
+        act = help_menu.addAction("About QForge")
+        act.triggered.connect(self._show_about)
+        # AboutRole (rather than relying on Qt's text-heuristic matching)
+        # guarantees this lands in the QForge app menu on macOS regardless
+        # of which QMenu it's added to here.
+        act.setMenuRole(QAction.MenuRole.AboutRole)
+
+        help_menu.addSeparator()
+
         act = help_menu.addAction("Keyboard Shortcuts")
         act.triggered.connect(self._show_shortcuts)
 
@@ -1030,6 +1054,35 @@ class MainWindow(QMainWindow):
                                     "Open a query tab to import data.")
 
     # ─── Help ────────────────────────────────────────────────────────────────
+
+    def _show_about(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("About QForge")
+        layout = QVBoxLayout(dlg)
+
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(QIcon(_asset_path("logo.png")).pixmap(QSize(64, 64)))
+        icon_lbl.setAlignment(Qt.AlignHCenter)
+        layout.addWidget(icon_lbl)
+
+        browser = QTextBrowser(dlg)
+        browser.setOpenExternalLinks(False)
+        browser.setFrameStyle(0)
+        browser.setHtml(
+            '<div style="text-align:center;">'
+            f'<h2 style="margin-bottom:2px;">QForge</h2>'
+            f'<p style="margin-top:0;color:#8e8e93;">Version {APP_VERSION}</p>'
+            '<p>A native macOS SQL client.</p>'
+            '</div>'
+        )
+        browser.setMaximumHeight(140)
+        layout.addWidget(browser)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok, parent=dlg)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.resize(320, 260)
+        dlg.exec()
 
     def _show_shortcuts(self):
         sections = [

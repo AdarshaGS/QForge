@@ -44,6 +44,8 @@ from ui.column_selection_dialog import ColumnSelectionDialog
 from ui.theme_manager import ThemeManager
 from ui.erd_dialog import ErdDialog
 from ui.schema_compare_dialog import SchemaCompareDialog
+from ui.data_compare_dialog import DataCompareDialog
+from ui.mock_data_dialog import MockDataDialog
 from ui import query_guard_dialog
 from ui.upgrade_dialog import require_pro, require_under_limit
 from services.entitlements import Feature, Limit, entitlements
@@ -55,6 +57,7 @@ from utils.df_export import (
     export_dataframe, _to_sql_inserts, drop_table_statement,
     SqlInsertStreamWriter, CsvRowStreamWriter, XmlRowStreamWriter,
     strip_auto_increment_value, strip_generated_column_clauses,
+    _quote_identifier,
 )
 from services import query_classifier
 from services import table_organization
@@ -67,6 +70,14 @@ logger = get_logger()
 # where a reliable row-count estimate is available" — a CSV import's
 # DataFrame length is exactly that).
 MASS_WRITE_ROW_THRESHOLD = 5000
+
+# Issue #115: guardrails on CSV/TSV import — a crafted or accidentally huge
+# file (zip bomb-adjacent: a small file that decompresses/parses into an
+# enormous row count isn't possible for plain-text CSV the way it is for
+# .xlsx, but an ordinary multi-GB file is still an easy way to hang the app
+# or exhaust memory) fails with a clear message instead of an unbounded read.
+IMPORT_MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024  # 500 MiB
+IMPORT_MAX_ROWS = 2_000_000
 
 
 # ── Background query worker (must be a top-level class for PySide6) ──────────
@@ -465,7 +476,7 @@ class ConnectionPanel(QWidget):
     # Bridge signals for background schema load
     _schema_done   = Signal(object)   # (schema_data dict)
     _schema_error  = Signal(str)      # error message
-    _schema_fast   = Signal(list, dict)   # (tables, columns) — arrives ahead of _schema_done
+    _schema_fast   = Signal(list, dict, dict, dict)   # (tables, columns, column_details, foreign_keys) — arrives ahead of _schema_done
     # Bridge signal for the optimistic-open background connect (issue: lag on
     # previously-visited remote/SSH connections despite a warm schema cache)
     _bg_connect_done = Signal(str)    # error message, "" on success
@@ -542,6 +553,8 @@ class ConnectionPanel(QWidget):
         self._export_cancelled_sig.connect(self._on_export_cancelled, Qt.QueuedConnection)
         self.health_changed.connect(self._update_tab_status_bars, Qt.QueuedConnection)
         self._column_cache: dict = {}   # {table: [col, ...]} for autocomplete
+        self._column_details_cache: dict = {}   # {table: [{name,type,nullable,default,key}, ...]}
+        self._foreign_keys_cache: dict = {}     # {table: [{column, ref_table, ref_column}, ...]}
 
         self._build_ui()
         self.load_schema()
@@ -977,7 +990,9 @@ class ConnectionPanel(QWidget):
         (_on_schema_loaded) rebuilds the tree with current data."""
         if not cached:
             return False
-        self._on_schema_tables_ready(cached.get("tables", []), cached.get("columns", {}))
+        self._on_schema_tables_ready(
+            cached.get("tables", []), cached.get("columns", {}),
+            cached.get("column_details", {}), cached.get("foreign_keys", {}))
         self._on_schema_loaded(cached)
         if schema_cache.is_stale(cached):
             stale_item = QTreeWidgetItem(["⏱ Cached schema (stale) — refreshing…"])
@@ -1029,7 +1044,7 @@ class ConnectionPanel(QWidget):
             perf_metrics.task_started("schema_fetch")
             try:
                 sig_done.emit(fetch_schema_snapshot(
-                    conf, on_tables_ready=lambda t, c: sig_fast.emit(t, c)))
+                    conf, on_tables_ready=lambda t, c, cd, fk: sig_fast.emit(t, c, cd, fk)))
             except Exception as ex:
                 # Suppress silent "not connected" errors (e.g. (0, '') on startup)
                 msg = str(ex)
@@ -1080,15 +1095,20 @@ class ConnectionPanel(QWidget):
             # its own. Now that db_service is genuinely live, retry those.
             self._reload_errored_table_tabs()
 
-    def _on_schema_tables_ready(self, tables: list, columns: dict):
+    def _on_schema_tables_ready(self, tables: list, columns: dict,
+                                 column_details: dict = None, foreign_keys: dict = None):
         """Push tables/columns to autocomplete as soon as they're fetched —
         ahead of the slower dbs/views/functions/server_version round-trips
         that _on_schema_loaded waits for (issue #16)."""
         self._column_cache = columns
+        self._column_details_cache = column_details or {}
+        self._foreign_keys_cache = foreign_keys or {}
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, SqlTab):
-                tab.set_schema(tables, columns)
+                tab.set_schema(tables, columns,
+                                column_details=self._column_details_cache,
+                                foreign_keys=self._foreign_keys_cache)
         # Issue #57: surface the table count on the loading indicator the
         # moment it's known, rather than leaving it a bare "Loading…" for
         # the remainder of the (slower) dbs/views/functions round-trips.
@@ -1121,12 +1141,16 @@ class ConnectionPanel(QWidget):
             self._server_version = result["server_version"]
             self.label_changed.emit(self, self.label)
 
-        tables    = result.get("tables", [])
-        columns   = result.get("columns", {})
-        views     = result.get("views", [])
-        functions = result.get("functions", [])
+        tables         = result.get("tables", [])
+        columns        = result.get("columns", {})
+        column_details = result.get("column_details", {})
+        foreign_keys   = result.get("foreign_keys", {})
+        views          = result.get("views", [])
+        functions      = result.get("functions", [])
 
         self._column_cache = columns
+        self._column_details_cache = column_details
+        self._foreign_keys_cache = foreign_keys
 
         # Populate the flat name/index state; _render_active_category()
         # below builds the visible tree from just the active category.
@@ -1154,7 +1178,9 @@ class ConnectionPanel(QWidget):
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, SqlTab):
-                tab.set_schema(tables, columns)
+                tab.set_schema(tables, columns,
+                                column_details=column_details, foreign_keys=foreign_keys,
+                                views=views, functions=functions)
 
         if getattr(self, "_notify_schema_refresh", False):
             self._notify_schema_refresh = False
@@ -1234,7 +1260,14 @@ class ConnectionPanel(QWidget):
         dialog.move(self.db_pill.mapToGlobal(
             self.db_pill.rect().bottomLeft()))
         dialog.db_selected.connect(self._switch_database)
-        dialog.exec()
+        # Issue #234: Qt.Popup (set in DbSwitcherDialog itself, for real
+        # click-outside-to-close) is shown via .show(), not .exec() — an
+        # app-modal .exec() loop blocks the very outside clicks this popup
+        # needs to see. .show() returns immediately, so this reference has
+        # to outlive the call or Python would garbage-collect the dialog
+        # out from under its own still-open window.
+        self._db_switcher_dialog = dialog
+        dialog.show()
 
     def _switch_database(self, new_db: str):
         if new_db == self.config.get("database", ""):
@@ -1493,8 +1526,10 @@ class ConnectionPanel(QWidget):
         # ── Table operations ────────────────────────────────────────────
         clone_action = None
         truncate_action = None
+        mock_data_action = None
         if not is_view:
             clone_action = menu.addAction("Clone")
+            mock_data_action = menu.addAction("🧪 Generate Mock Data…")
         refresh_action = menu.addAction("🔄 Refresh Schema")
         refresh_action.setShortcut(QKeySequence("Ctrl+Shift+R"))  # mirrors the real global binding below
         menu.addSeparator()
@@ -1541,6 +1576,8 @@ class ConnectionPanel(QWidget):
             self._copy_insert_script(table_name)
         elif clone_action is not None and action == clone_action:
             self._clone_table(table_name)
+        elif mock_data_action is not None and action == mock_data_action:
+            self.show_mock_data_generator(table_name)
         elif action == refresh_action:
             self.load_schema(notify=True)
         elif truncate_action is not None and action == truncate_action:
@@ -1572,6 +1609,17 @@ class ConnectionPanel(QWidget):
         if not require_pro(Feature.SCHEMA_COMPARE, "Schema Compare", self):
             return
         dlg = SchemaCompareDialog(
+            self.config.get("id", ""), is_dark=(self.current_theme == "dark"), parent=self)
+        dlg.exec_()
+
+    def open_data_compare(self):
+        """Open the read-only Data Compare dialog (issue #197/#204),
+        preselecting this connection as Source. Builds its own dedicated
+        connections for both sides (services/data_diff.py) — never touches
+        self.db_service."""
+        if not require_pro(Feature.DATA_COMPARE, "Data Compare", self):
+            return
+        dlg = DataCompareDialog(
             self.config.get("id", ""), is_dark=(self.current_theme == "dark"), parent=self)
         dlg.exec_()
 
@@ -1717,7 +1765,10 @@ class ConnectionPanel(QWidget):
         # Wire inline-edit commit: execute SQL with our db_service
         tab.commit_sql.connect(lambda sqls, t=tab: self._execute_commit_sql(sqls, t))
         # Push current schema so autocomplete works immediately
-        tab.set_schema(self.all_tables, self._column_cache)
+        tab.set_schema(self.all_tables, self._column_cache,
+                        column_details=self._column_details_cache,
+                        foreign_keys=self._foreign_keys_cache,
+                        views=self.all_views, functions=self.all_functions)
         tab.set_dialect(self._dialect_display_name())
         tab.set_connection_state(getattr(self, '_last_health', 'idle'))
         self._attach_close_btn(idx)
@@ -1826,7 +1877,14 @@ class ConnectionPanel(QWidget):
         self._finalize_query_connection(tab)
 
     def _on_query_multi_done(self, tab, results: list, elapsed: float):
-        """Multi-statement result handler — shows each SELECT in its own sub-tab."""
+        """Multi-statement result handler. Every statement gets its own
+        "Query N" sub-tab — a SELECT shows its rows, a write shows a
+        rows-affected summary, and a statement that errored shows its own
+        error when that tab is selected (tab.load_multi_results /
+        _on_multi_result_tab), rather than only SELECT-producing statements
+        being visible and everything else vanishing silently."""
+        import pandas as pd
+
         perf_metrics.record("sql_editor", "query_execute", elapsed * 1000)
         tab._query_running = False
         self._restore_run_btn(tab)
@@ -1834,32 +1892,37 @@ class ConnectionPanel(QWidget):
         if hasattr(tab, '_query_thread'):
             tab._query_thread.quit()
         query = getattr(tab, '_last_query', '')
-        select_results = [(lbl, obj) for lbl, obj in results
-                          if obj is not None and not isinstance(obj, Exception)]
-        error_results  = [(lbl, obj) for lbl, obj in results if isinstance(obj, Exception)]
+        select_results = [(lbl, obj) for lbl, obj in results if isinstance(obj, pd.DataFrame)]
 
         total_rows = sum(len(df) for _, df in select_results)
         self.query_history.add_query(query, self.config["name"], total_rows, elapsed)
         if self._sidebar_stack.currentIndex() == 2:
             self._reload_history_list(self._history_search.text())
 
-        if len(select_results) == 1:
-            # single result — display inline as normal
-            lbl, df = select_results[0]
-            tab.load_dataframe(df, self._extract_table_name(query))
-            tab.update_status(len(df), elapsed, truncated=df.attrs.get("truncated", False))
-        elif len(select_results) > 1:
-            # multiple results — hand off to tab's multi-result view
-            tab.load_multi_results(select_results, elapsed)
-        elif error_results:
-            lbl, ex = error_results[0]
-            tab.show_error(str(ex), query=lbl, elapsed=elapsed)
+        if len(results) == 1:
+            # single statement — display inline as normal (in practice this
+            # branch isn't reached: the worker only takes this multi-
+            # statement path for 2+ statements — kept as a defensive
+            # fallback rather than assumed unreachable).
+            label, obj = results[0]
+            if isinstance(obj, Exception):
+                tab.show_error(str(obj), query=label, elapsed=elapsed)
+            elif isinstance(obj, pd.DataFrame):
+                tab.load_dataframe(obj, self._extract_table_name(query))
+                tab.update_status(len(obj), elapsed, truncated=obj.attrs.get("truncated", False))
+            else:
+                tab.update_status(obj or 0, elapsed)
         else:
-            tab.update_status(0, elapsed)
-
-        if error_results and len(select_results) >= 0:
-            msgs = "\n".join(f"[{lbl}] {ex}" for lbl, ex in error_results)
-            tab.show_error(msgs, elapsed=elapsed)
+            # Every statement gets its own "Query N" tab. load_multi_results
+            # already renders a DataFrame or an Exception per tab — a write
+            # (an int affected-row count) gets wrapped in a one-row summary
+            # DataFrame so it reuses that same rendering with no UI changes.
+            display_results = [
+                (label, obj if isinstance(obj, (pd.DataFrame, Exception))
+                       else pd.DataFrame({"result": [f"{obj} row(s) affected"]}))
+                for label, obj in results
+            ]
+            tab.load_multi_results(display_results, elapsed)
 
         self._emit_health('idle')
         self._finalize_query_connection(tab)
@@ -1964,8 +2027,24 @@ class ConnectionPanel(QWidget):
         buttons) bypasses the editor content and the format/param-prompt
         steps below, but still goes through the same guard, connection
         handling, and worker dispatch as typed SQL — a single code path so
-        transaction control can't accidentally skip the write guard."""
-        query = override_query if override_query is not None else tab.get_query().strip()
+        transaction control can't accidentally skip the write guard.
+
+        With no text selected, Run always executes every statement in the
+        editor, not just the one under the cursor — a script with several
+        statements is expected to run all of them. Each one still runs
+        independently via DbService.execute_multi_query, so a statement
+        that fails doesn't stop the ones after it, and every statement's
+        own outcome shows up as its own "Query N" tab in the results
+        (_on_query_multi_done). To run just one statement manually, select
+        its text before hitting Run."""
+        if override_query is not None:
+            query = override_query
+        else:
+            cursor = tab.editor.textCursor()
+            if cursor.hasSelection():
+                query = cursor.selectedText().replace(' ', '\n').strip()
+            else:
+                query = tab.editor.toPlainText().strip()
         if not query:
             return
         if self._connecting:
@@ -2267,6 +2346,80 @@ class ConnectionPanel(QWidget):
             except Exception as ex:
                 QMessageBox.critical(self, "Error", str(ex))
 
+    def _sample_fk_values(self, ref_table: str, ref_column: str, limit: int = 200) -> list:
+        """Read-only sample of existing values for a foreign-key target
+        (issue #77's "Foreign-key references" generator) — a SELECT, so it
+        works even on a read-only connection. Never raises; MockDataDialog
+        treats a failed/empty sample as "no valid FK values available" and
+        warns instead of blocking generation entirely."""
+        db_type = self.db_service.db_type
+        table_sql = _quote_identifier(ref_table, db_type)
+        col_sql = _quote_identifier(ref_column, db_type)
+        df = self.db_service.execute_query(
+            f"SELECT DISTINCT {col_sql} FROM {table_sql} LIMIT {int(limit)}",  # nosec B608
+            max_rows=limit,
+        )
+        return df.iloc[:, 0].dropna().tolist()
+
+    def show_mock_data_generator(self, table_name: str):
+        """Opens the Mock Data Generator (issue #77). Environment/read-only
+        safety gating happens up front, before the dialog even opens —
+        Production is blocked outright and Read-only connections are
+        blocked outright, matching the issue's Environment/Read-Only
+        Protection tables; Staging requires an explicit confirmation first.
+        _guard_write below is the existing backstop (mainly re-covers
+        read-only if state changed mid-flow) — no extra_reason is passed to
+        it so Staging isn't asked to confirm a second time."""
+        connection_name = self.config.get("name", "Connection")
+        env = environment.normalize(self.config.get("environment"))
+        read_only = bool(self.config.get("read_only"))
+        if not query_guard_dialog.mock_data_generation_allowed(self, connection_name, env, read_only):
+            return
+
+        try:
+            columns = self.db_service.get_columns(table_name)
+            primary_keys = self.db_service.get_primary_keys(table_name)
+            foreign_keys = self.db_service.get_foreign_keys(table_name)
+            generated_columns = self.db_service.get_generated_columns(table_name)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Could not load schema for {table_name}:\n{ex}")
+            return
+
+        dialog = MockDataDialog(
+            table_name, columns, primary_keys, foreign_keys, generated_columns,
+            dialect=self.db_service.db_type, fk_sampler=self._sample_fk_values, parent=self,
+        )
+        if not dialog.exec():
+            return
+
+        sql = dialog.get_sql()
+        if not sql.strip():
+            QMessageBox.information(self, "No Data", "No columns were selected to insert.")
+            return
+
+        try:
+            if not self._guard_write(sql):
+                return
+            reply = QMessageBox.question(
+                self, "Insert Mock Data",
+                f"Execute the following SQL?\n\n{sql[:2000]}" + ("\n…" if len(sql) > 2000 else ""),
+                QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            for stmt in query_classifier.split_statements(sql):
+                self.db_service.execute_update(stmt)
+            QMessageBox.information(self, "Success", f"Mock data inserted into {table_name}.")
+
+            for i in range(self.tabs.count()):
+                w = self.tabs.widget(i)
+                if isinstance(w, TableViewWidget) and w.table_name == table_name:
+                    w._warn_and_discard_changes()
+                    w.current_page = 1
+                    w.load_table_data()
+                    break
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
     # ─── CSV Import ──────────────────────────────────────────────────────────
 
     def export_database(self):
@@ -2473,10 +2626,31 @@ class ConnectionPanel(QWidget):
             return
 
         try:
+            file_size = os.path.getsize(file_path)
+        except OSError as ex:
+            QMessageBox.critical(self, "Import Error", f"Could not read file:\n{ex}")
+            return
+        if file_size > IMPORT_MAX_FILE_SIZE_BYTES:
+            QMessageBox.critical(
+                self, "Import Error",
+                f"File is {file_size / (1024 * 1024):,.0f} MiB, over the "
+                f"{IMPORT_MAX_FILE_SIZE_BYTES // (1024 * 1024):,} MiB import limit.")
+            return
+
+        try:
             sep = "\t" if file_path.endswith((".tsv", ".txt")) else ","
-            df = pd.read_csv(file_path, sep=sep, keep_default_na=False)
+            df = pd.read_csv(
+                file_path, sep=sep, keep_default_na=False,
+                nrows=IMPORT_MAX_ROWS + 1,
+            )
         except Exception as ex:
             QMessageBox.critical(self, "Import Error", f"Could not read file:\n{ex}")
+            return
+
+        if len(df) > IMPORT_MAX_ROWS:
+            QMessageBox.critical(
+                self, "Import Error",
+                f"File has more than {IMPORT_MAX_ROWS:,} rows — over the import limit.")
             return
 
         if df.empty:
@@ -2500,15 +2674,15 @@ class ConnectionPanel(QWidget):
         if db_type == "sqlite":
             ph = "?"
 
-        cols_sql = ", ".join(
-            f"`{c}`" if db_type == "mysql" else f'"{c}"'
-            for c in df.columns
-        )
+        # Issue #114/#115: column names come straight from the imported
+        # file's header row — untrusted input — so they're quoted and
+        # escaped the same way _quote_identifier already handles exported
+        # SQL, not just wrapped in bare backticks/quotes.
+        cols_sql = ", ".join(_quote_identifier(c, db_type) for c in df.columns)
         placeholders = ", ".join([ph] * len(df.columns))
         insert_sql = (
-            f"INSERT INTO `{table_name}` ({cols_sql}) VALUES ({placeholders})"  # nosec B608
-            if db_type == "mysql"
-            else f'INSERT INTO "{table_name}" ({cols_sql}) VALUES ({placeholders})'  # nosec B608
+            f"INSERT INTO {_quote_identifier(table_name, db_type)} "
+            f"({cols_sql}) VALUES ({placeholders})"  # nosec B608 -- identifiers quoted/escaped via _quote_identifier(), values parameterized
         )
 
         mass_write_reason = (

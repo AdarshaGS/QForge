@@ -2,7 +2,7 @@
 install (issue #79) — the command is a fixed argv list (cask name is the
 module constant, never user input), so there's no shell/injection surface."""
 
-import subprocess
+import subprocess  # nosec B404 -- list-form argv only, never shell=True
 
 from PySide6.QtCore import QThread, Signal
 
@@ -25,7 +25,7 @@ class HomebrewUpdateInstaller(QThread):
             result = subprocess.run(
                 [self.brew_path, "upgrade", "--cask", CASK_NAME],
                 capture_output=True, text=True, timeout=300,
-            )
+            )  # nosec B603 -- brew_path traces to install_source.brew_path(), CASK_NAME is a module constant
         except Exception as ex:
             logger.error(f"Homebrew upgrade failed to run: {ex}")
             self.failed.emit(str(ex))

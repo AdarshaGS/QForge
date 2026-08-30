@@ -146,6 +146,7 @@ class SuggestionItem:
     __slots__ = ("text", "kind", "score", "extra")
 
     TABLE   = "TABLE"
+    VIEW    = "VIEW"
     COLUMN  = "COLUMN"
     KEYWORD = "KEYWORD"
     FUNC    = "FUNC"
@@ -172,11 +173,16 @@ class SuggestionDelegate(QStyledItemDelegate):
     # badge colours (bg, fg)
     _BADGE = {
         SuggestionItem.TABLE:   (QColor("#1e4a3a"), QColor("#4ec9b0")),
+        SuggestionItem.VIEW:    (QColor("#1e3a4a"), QColor("#6ab7ff")),
         SuggestionItem.COLUMN:  (QColor("#1e3a4a"), QColor("#9cdcfe")),
         SuggestionItem.KEYWORD: (QColor("#3a1e4a"), QColor("#c586c0")),
         SuggestionItem.FUNC:    (QColor("#4a3a1e"), QColor("#dcdcaa")),
         SuggestionItem.SNIPPET: (QColor("#1a3a1a"), QColor("#89d185")),
     }
+
+    # PK/FK key-glyph colours, drawn immediately left of the badge.
+    _KEY_GLYPH = {"PRI": ("\U0001F511", QColor("#e5c07b")),   # 🔑 primary key
+                  "FK":  ("→",      QColor("#7aa2f7"))}  # → foreign key
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -192,8 +198,9 @@ class SuggestionDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
         painter.save()
 
-        text = index.data(Qt.UserRole + 1) or ""
-        kind = index.data(Qt.UserRole + 2) or SuggestionItem.KEYWORD
+        text  = index.data(Qt.UserRole + 1) or ""
+        kind  = index.data(Qt.UserRole + 2) or SuggestionItem.KEYWORD
+        extra = index.data(Qt.UserRole + 5) or {}
 
         # Background
         from PySide6.QtWidgets import QStyle
@@ -210,7 +217,7 @@ class SuggestionDelegate(QStyledItemDelegate):
         painter.setFont(badge_font)
         bfm = QFontMetrics(badge_font)
 
-        badge_text  = kind
+        badge_text  = extra.get("badge") or kind
         badge_text_w = bfm.horizontalAdvance(badge_text)
         badge_total_w = badge_text_w + self.BADGE_W_PAD * 2
         badge_x = rect.right() - badge_total_w - 6
@@ -224,11 +231,23 @@ class SuggestionDelegate(QStyledItemDelegate):
         painter.setPen(fg_c)
         painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
 
+        # ── Key glyph (PK/FK columns) — drawn just left of the badge ─────
+        key_right = badge_x
+        key = extra.get("key")
+        glyph_spec = self._KEY_GLYPH.get(key)
+        if glyph_spec:
+            glyph, glyph_c = glyph_spec
+            glyph_w = bfm.horizontalAdvance(glyph) + 4
+            glyph_rect = QRect(badge_x - glyph_w, badge_y, glyph_w, self.BADGE_H)
+            painter.setPen(glyph_c)
+            painter.drawText(glyph_rect, Qt.AlignCenter, glyph)
+            key_right = glyph_rect.left()
+
         # ── Text (left side, prefix highlighted) ─────────────────────────
         text_area = QRect(
             rect.left() + self.LEFT_PAD,
             rect.top(),
-            badge_x - rect.left() - self.LEFT_PAD - 6,
+            key_right - rect.left() - self.LEFT_PAD - 6,
             rect.height(),
         )
         base_font = QFont(option.font)
@@ -362,6 +381,7 @@ class SqlCompletePopup(QFrame):
             lw.setData(Qt.UserRole + 2, item.kind)           # badge kind
             lw.setData(Qt.UserRole + 3, item.extra.get("body", ""))  # snippet body
             lw.setData(Qt.UserRole + 4, item.extra.get("name", ""))  # snippet name
+            lw.setData(Qt.UserRole + 5, item.extra)                  # raw extra (badge/key)
             lw.setText(item.text)
             self.list_widget.addItem(lw)
 
@@ -453,7 +473,12 @@ class SqlCompleter:
         self._popup   = None
 
         self._tables:   list[str]            = []
+        self._views:    list[str]            = []
+        self._user_functions: list[str]      = []
         self._columns:  dict[str, list[str]] = {}   # {table: [col, ...]}
+        self._column_meta: dict[str, dict[str, dict]] = {}   # {table: {col_lower: {type,nullable,default,key}}}
+        self._foreign_keys: dict[str, list[dict]]     = {}   # {table: [{column, ref_table, ref_column}, ...]}
+        self._fk_columns:   dict[str, set[str]]        = {}   # {table: {col_lower that is an FK source}}
         self._aliases:  dict[str, str]       = {}   # {alias_lower: table}
         self._snippets: dict[str, dict]      = {}   # {trigger: {name, body, ...}}
 
@@ -463,9 +488,19 @@ class SqlCompleter:
         """Replace the snippet cache (called after SnippetManager is updated)."""
         self._snippets = dict(snippets)
 
-    def set_schema(self, tables: list[str], columns_dict: dict):
-        """Refresh schema cache (called on connect / db switch)."""
+    def set_schema(self, tables: list[str], columns_dict: dict, column_details: dict = None,
+                   foreign_keys: dict = None, views: list[str] = None, functions: list[str] = None):
+        """Refresh schema cache (called on connect / db switch).
+
+        `column_details`/`foreign_keys` are optional bulk metadata from
+        db_service.get_all_column_details()/get_all_foreign_keys() (same
+        shape schema_snapshot.fetch_schema_snapshot() returns) — when
+        omitted, type/PK/FK badges and FK-aware JOIN completion simply don't
+        activate, everything else behaves as before.
+        """
         self._tables = list(tables or [])
+        self._views = list(views or [])
+        self._user_functions = [f for f in (functions or []) if f]
         self._columns = {}
         for table, cols in (columns_dict or {}).items():
             if not isinstance(cols, list) or not cols:
@@ -475,6 +510,63 @@ class SqlCompleter:
                 self._columns[table] = [c.get("Field", "") for c in cols if c.get("Field")]
             else:
                 self._columns[table] = [c for c in cols if c]
+
+        self._column_meta = {}
+        for table, cols in (column_details or {}).items():
+            meta: dict[str, dict] = {}
+            for c in cols:
+                name = c.get("name")
+                if name:
+                    meta[name.lower()] = c
+            if meta:
+                self._column_meta[table] = meta
+
+        self._foreign_keys = dict(foreign_keys or {})
+        self._fk_columns = {
+            table: {fk["column"].lower() for fk in fks if fk.get("column")}
+            for table, fks in self._foreign_keys.items()
+        }
+
+    # ── Public schema accessors (read-only views for callers like SqlTab's
+    #    hover tooltip / inline-validation, so they don't reach into the
+    #    scoring internals above) ──────────────────────────────────────────
+
+    def known_tables(self) -> set[str]:
+        """Every table and view name the active connection reported."""
+        return set(self._tables) | set(self._views)
+
+    def is_view(self, name: str) -> bool:
+        return name in self._views
+
+    def resolve_table(self, name_or_alias: str) -> Optional[str]:
+        """A bare table/view name, or an alias already used in the current
+        query (via update()'s _extract_aliases), to its real table name."""
+        table = self._aliases.get(name_or_alias.lower())
+        if table:
+            return table
+        return name_or_alias if name_or_alias in self._tables or name_or_alias in self._views else None
+
+    def alias_target(self, alias: str) -> Optional[str]:
+        return self._aliases.get(alias.lower())
+
+    def table_columns(self, table: str) -> list[str]:
+        return list(self._columns.get(table, []))
+
+    def column_meta(self, table: str, column: str) -> Optional[dict]:
+        return self._column_meta.get(table, {}).get(column.lower())
+
+    def foreign_key_for(self, table: str, column: str) -> Optional[dict]:
+        return next((fk for fk in self._foreign_keys.get(table, [])
+                     if fk.get("column", "").lower() == column.lower()), None)
+
+    def primary_key_columns(self, table: str) -> list[str]:
+        """Column name(s) of `table` marked primary key in the bulk-fetched
+        column_details metadata (the same source column_meta() reads) —
+        empty if unknown (no column_details for this table, e.g. schema
+        still loading, or the table genuinely has no PK)."""
+        meta = self._column_meta.get(table, {})
+        return [c for c in self._columns.get(table, [])
+                if meta.get(c.lower(), {}).get("key") == "PRI"]
 
     def _ensure_popup(self) -> SqlCompletePopup:
         """Construct the popup on first real use — see __init__ for why."""
@@ -533,7 +625,7 @@ class SqlCompleter:
 
         context = self._parse_context(query, pos)
         _t0 = perf_counter()
-        items   = self._build_suggestions(prefix, context, query)
+        items   = self._build_suggestions(prefix, context, query, pos)
         perf_metrics.record("sql_editor", "autocomplete_latency", (perf_counter() - _t0) * 1000)
 
         if not items:
@@ -592,15 +684,20 @@ class SqlCompleter:
         """Build {alias_lower: real_table_name} from the query."""
         aliases: dict[str, str] = {}
         for m in re.finditer(
-                r'(?:FROM|JOIN|UPDATE)\s+[`"]?(\w+)[`"]?'
-                r'(?:\s+(?:AS\s+)?[`"]?(\w+)[`"]?)?',
+                r'(?:FROM|JOIN|UPDATE)\s+[`"]?(\w+)[`"]?',
                 query, re.IGNORECASE):
             table = m.group(1)
-            alias = m.group(2)
-            if table in self._tables:
-                aliases[table.lower()] = table
-                if alias and alias.upper() not in SQL_KEYWORDS:
-                    aliases[alias.lower()] = table
+            if table not in self._tables and table not in self._views:
+                continue
+            aliases[table.lower()] = table
+            # Matched as a *separate* lookahead (re.match on the tail, not
+            # part of the finditer pattern above) so an unaliased table
+            # (e.g. bare "FROM t JOIN ...", no alias on t) never lets this
+            # optional-alias check swallow the next JOIN keyword — which
+            # would hide that second table from this same finditer scan.
+            am = re.match(r'\s+(?:AS\s+)?[`"]?(\w+)[`"]?', query[m.end():], re.IGNORECASE)
+            if am and am.group(1).upper() not in SQL_KEYWORDS:
+                aliases[am.group(1).lower()] = table
         return aliases
 
     # ── Tables mentioned in the query ────────────────────────────────────────
@@ -613,7 +710,7 @@ class SqlCompleter:
                 r'(?:FROM|JOIN|UPDATE|INTO)\s+[`"]?(\w+)[`"]?',
                 query, re.IGNORECASE):
             tbl = m.group(1)
-            if tbl in self._tables and tbl not in seen:
+            if (tbl in self._tables or tbl in self._views) and tbl not in seen:
                 seen.add(tbl)
                 found.append(tbl)
         # Also include tables behind known aliases
@@ -623,21 +720,49 @@ class SqlCompleter:
                 found.append(alias_tbl)
         return found
 
-    def _columns_for_tables(self, tables: list[str]) -> list[str]:
-        """Return deduplicated column names for the given tables."""
-        seen: set[str]  = set()
-        cols: list[str] = []
+    def _column_badge_extra(self, table: str, col_lower: str) -> dict:
+        """Type/PK/FK badge info for one column, from set_schema()'s optional
+        column_details/foreign_keys metadata — empty dict when unavailable."""
+        extra: dict = {}
+        meta = self._column_meta.get(table, {}).get(col_lower)
+        if meta and meta.get("type"):
+            extra["badge"] = str(meta["type"]).split("(")[0].upper()[:12]
+        if meta and meta.get("key") == "PRI":
+            extra["key"] = "PRI"
+        elif col_lower in self._fk_columns.get(table, ()):
+            extra["key"] = "FK"
+        return extra
+
+    def _score_columns(self, prefix: str, tables: list[str], base: int) -> list[SuggestionItem]:
+        """Like _score() but for real table columns — attaches the type/PK/FK
+        badge info _score() has no per-item source for."""
+        pl = prefix.lower()
+        seen: set[str] = set()
+        out: list[SuggestionItem] = []
         for tbl in tables:
             for col in self._columns.get(tbl, []):
-                if col and col not in seen:
-                    seen.add(col)
-                    cols.append(col)
-        return cols
+                cl = col.lower()
+                if cl in seen:
+                    continue
+                if not pl:
+                    s = base
+                elif cl == pl:
+                    s = base + 200
+                elif cl.startswith(pl):
+                    s = base + max(0, 50 - len(col))
+                elif pl in cl:
+                    s = base - 300
+                else:
+                    continue
+                seen.add(cl)
+                out.append(SuggestionItem(col, SuggestionItem.COLUMN, s,
+                                          extra=self._column_badge_extra(tbl, cl)))
+        return out
 
     # ── Suggestion building ───────────────────────────────────────────────────
 
     def _build_suggestions(self, prefix: str, context: str,
-                           query: str) -> list[SuggestionItem]:
+                           query: str, pos: int = 0) -> list[SuggestionItem]:
 
         # Dot notation (alias.col or table.col)
         if '.' in prefix:
@@ -648,27 +773,32 @@ class SqlCompleter:
 
         # Columns only for tables already written in the query
         query_tables  = self._tables_in_query(query)
-        query_columns = self._columns_for_tables(query_tables)
 
         results: list[SuggestionItem] = []
 
         if context in ("AFTER_FROM", "AFTER_JOIN"):
-            # Tables first, then all keywords (so WHERE/ON/LIMIT/JOIN always reachable)
+            # Tables/views first, then all keywords (so WHERE/ON/LIMIT/JOIN always reachable)
             results += self._score(pl, self._tables,   SuggestionItem.TABLE,   1000, fuzzy=True)
+            results += self._score(pl, self._views,    SuggestionItem.VIEW,     990, fuzzy=True)
             results += self._score(pl, SQL_KEYWORDS,   SuggestionItem.KEYWORD,  600)
+            if context == "AFTER_JOIN":
+                results += self._fk_join_on_suggestion(pl, query, pos)
 
         elif context == "AFTER_SELECT":
             # Columns from query tables first, then functions, then tables (for subquery)
-            results += self._score(pl, query_columns,  SuggestionItem.COLUMN,  1000)
+            results += self._score_columns(pl, query_tables, 1000)
             results += self._alias_col_items(pl)
             results += self._score(pl, SQL_FUNCTIONS,  SuggestionItem.FUNC,     850)
+            results += self._score(pl, self._user_functions, SuggestionItem.FUNC, 855)
             results += self._score(pl, self._tables,   SuggestionItem.TABLE,    780, fuzzy=True)
+            results += self._score(pl, self._views,    SuggestionItem.VIEW,     770, fuzzy=True)
             results += self._score(pl, SQL_KEYWORDS,   SuggestionItem.KEYWORD,  700)
 
         elif context in ("AFTER_WHERE", "AFTER_ON", "AFTER_HAVING"):
-            results += self._score(pl, query_columns, SuggestionItem.COLUMN,  1000)
+            results += self._score_columns(pl, query_tables, 1000)
             results += self._alias_col_items(pl)
             results += self._score(pl, SQL_FUNCTIONS, SuggestionItem.FUNC,     900)
+            results += self._score(pl, self._user_functions, SuggestionItem.FUNC, 905)
             results += self._score(pl,
                 ["AND", "OR", "NOT", "IN", "NOT IN", "LIKE", "NOT LIKE",
                  "ILIKE", "BETWEEN", "NOT BETWEEN",
@@ -679,7 +809,7 @@ class SqlCompleter:
             results += self._score(pl, SQL_KEYWORDS, SuggestionItem.KEYWORD, 650)
 
         elif context == "AFTER_ORDER_BY":
-            results += self._score(pl, query_columns,          SuggestionItem.COLUMN,  1000)
+            results += self._score_columns(pl, query_tables, 1000)
             results += self._alias_col_items(pl)
             results += self._score(pl, ["ASC", "DESC", "NULLS FIRST", "NULLS LAST",
                                         "LIMIT"],
@@ -687,7 +817,7 @@ class SqlCompleter:
             results += self._score(pl, SQL_KEYWORDS,           SuggestionItem.KEYWORD,  650)
 
         elif context == "AFTER_GROUP_BY":
-            results += self._score(pl, query_columns, SuggestionItem.COLUMN,  1000)
+            results += self._score_columns(pl, query_tables, 1000)
             results += self._alias_col_items(pl)
             results += self._score(pl,
                 ["HAVING", "ORDER BY", "LIMIT", "WITH ROLLUP"],
@@ -695,8 +825,9 @@ class SqlCompleter:
             results += self._score(pl, SQL_KEYWORDS, SuggestionItem.KEYWORD, 650)
 
         elif context == "AFTER_SET":
-            results += self._score(pl, query_columns, SuggestionItem.COLUMN,  1000)
+            results += self._score_columns(pl, query_tables, 1000)
             results += self._score(pl, SQL_FUNCTIONS, SuggestionItem.FUNC,     850)
+            results += self._score(pl, self._user_functions, SuggestionItem.FUNC, 855)
             results += self._score(pl, SQL_KEYWORDS,  SuggestionItem.KEYWORD,  650)
 
         elif context == "AFTER_EXPLAIN":
@@ -707,6 +838,7 @@ class SqlCompleter:
                  "ANALYZE"],
                 SuggestionItem.KEYWORD, 1000)
             results += self._score(pl, self._tables, SuggestionItem.TABLE, 900, fuzzy=True)
+            results += self._score(pl, self._views,  SuggestionItem.VIEW,  890, fuzzy=True)
 
         elif context == "AFTER_INSERT":
             # After INSERT INTO, suggest table names
@@ -727,10 +859,12 @@ class SqlCompleter:
             # Keywords first — user is most likely typing SELECT/EXPLAIN/INSERT/…
             results += self._score(pl, SQL_KEYWORDS,  SuggestionItem.KEYWORD, 1000)
             results += self._score(pl, self._tables,  SuggestionItem.TABLE,    900, fuzzy=True)
+            results += self._score(pl, self._views,   SuggestionItem.VIEW,     890, fuzzy=True)
             results += self._score(pl, SQL_FUNCTIONS, SuggestionItem.FUNC,     800)
+            results += self._score(pl, self._user_functions, SuggestionItem.FUNC, 805)
             # Only show columns if the query already references some tables
             if query_tables:
-                results += self._score(pl, query_columns, SuggestionItem.COLUMN, 850)
+                results += self._score_columns(pl, query_tables, 850)
 
         # Snippets — shown in every context when the prefix matches a trigger
         results += self._score_snippets(pl)
@@ -749,7 +883,7 @@ class SqlCompleter:
 
     def _dot_suggestions(self, obj: str, partial: str) -> list[SuggestionItem]:
         table = self._aliases.get(obj.lower())
-        if not table and obj in self._tables:
+        if not table and (obj in self._tables or obj in self._views):
             table = obj
         if not table or table not in self._columns:
             return []
@@ -766,7 +900,8 @@ class SqlCompleter:
                 score = 900
             else:
                 continue
-            out.append(SuggestionItem(f"{obj}.{col}", SuggestionItem.COLUMN, score))
+            out.append(SuggestionItem(f"{obj}.{col}", SuggestionItem.COLUMN, score,
+                                      extra=self._column_badge_extra(table, cl)))
 
         out.sort(key=lambda x: (-x.score, x.text.lower()))
         return out[:40]
@@ -821,8 +956,56 @@ class SqlCompleter:
                 continue
             for col in self._columns.get(table, []):
                 out.append(SuggestionItem(
-                    f"{alias}.{col}", SuggestionItem.COLUMN, 870))
+                    f"{alias}.{col}", SuggestionItem.COLUMN, 870,
+                    extra=self._column_badge_extra(table, col.lower())))
         return out
+
+    def _fk_join_on_suggestion(self, prefix: str, query: str, pos: int) -> list[SuggestionItem]:
+        """When the table/view right after the most recent JOIN is already
+        fully typed, offer the whole ON clause built from a known FK
+        relationship between it and an earlier table in the query — e.g.
+        typing 'FROM users JOIN orders ' + 'o' suggests
+        'ON users.id = orders.user_id'. Gated on the typed prefix actually
+        being a candidate for "ON" so it doesn't appear while typing
+        something unrelated."""
+        if prefix and not "on".startswith(prefix):
+            return []
+        before = query[:pos]
+        joined = None
+        for m in re.finditer(r'\bJOIN\s+[`"]?(\w+)[`"]?\s', before, re.IGNORECASE):
+            joined = m.group(1)
+        if not joined or (joined not in self._tables and joined not in self._views):
+            return []
+
+        query_tables = self._tables_in_query(query)
+        if joined not in query_tables:
+            return []
+        earlier = [t for t in query_tables if t != joined]
+        if not earlier:
+            return []
+        prev = earlier[-1]
+
+        fk = next((f for f in self._foreign_keys.get(joined, [])
+                   if f.get("ref_table") == prev), None)
+        if fk:
+            left_col, right_col = fk["ref_column"], fk["column"]
+        else:
+            fk = next((f for f in self._foreign_keys.get(prev, [])
+                       if f.get("ref_table") == joined), None)
+            if not fk:
+                return []
+            left_col, right_col = fk["column"], fk["ref_column"]
+
+        def display_name(table: str) -> str:
+            for alias, tbl in self._aliases.items():
+                if tbl == table and alias != table.lower():
+                    return alias
+            return table
+
+        left, right = display_name(prev), display_name(joined)
+        clause = f"ON {left}.{left_col} = {right}.{right_col}"
+        return [SuggestionItem("ON", SuggestionItem.KEYWORD, 1300,
+                               extra={"body": clause})]
 
     def _score_snippets(self, prefix: str) -> list[SuggestionItem]:
         """Return snippet SuggestionItems whose trigger matches prefix."""
