@@ -440,8 +440,9 @@ class TableViewWidget(QWidget):
             self.sort_column = column_name
             self.sort_order = "ASC"
 
-        # Reset and reload with new sort settings
-        self.reset_and_load_first_page()
+        # Reset and reload with new sort settings — sort doesn't change
+        # which rows match, so skip the recount.
+        self.reset_and_load_first_page(keep_count=True)
 
     def _warn_and_discard_changes(self):
         """Every reload path (refresh, page change, sort, filter) overwrites
@@ -461,11 +462,14 @@ class TableViewWidget(QWidget):
             icon="⚠", kind="warning",
         )
 
-    def reset_and_load_first_page(self):
-        """Reset to the first page and load it"""
+    def reset_and_load_first_page(self, keep_count: bool = False):
+        """Reset to the first page and load it. *keep_count* skips the
+        total_rows reset for callers (e.g. sort) that don't change which
+        rows match, only their order — avoiding a needless recount."""
         self._warn_and_discard_changes()
         self.current_page = 1
-        self.total_rows = None
+        if not keep_count:
+            self.total_rows = None
         self.load_table_data()
 
     def load_table_data(self):
@@ -473,21 +477,41 @@ class TableViewWidget(QWidget):
         _page_load_t0 = time.perf_counter()
         _page_load_wall_start = time.time()
         try:
-            # A real COUNT(*) — MySQL's INFORMATION_SCHEMA.TABLES.TABLE_ROWS
-            # looked appealingly fast, but it's only an approximate
-            # statistic that goes stale by any margin after inserts/deletes
-            # since the last ANALYZE TABLE, which silently capped
-            # pagination or hid real rows outright. A real count costs a
-            # bit more but is the only accurate answer, and Postgres/SQLite
-            # already paid this cost, so this just makes MySQL consistent.
-            try:
-                where_clause = f" WHERE {self.current_filter}" if self.current_filter else ""
-                count_query = f"SELECT COUNT(*) as total FROM {self.table_name}{where_clause}"  # nosec B608
-                count_df = self.db_service.execute_query(count_query)
-                self.total_rows = int(count_df.iloc[0]['total'])
-            except Exception as ex:
-                logger.debug(f"Row count failed for {self.table_name}: {ex}")
-                self.total_rows = 1000000
+            # Cached across page turns and sort changes — those don't alter
+            # the row count, so re-running a count on every next/prev click
+            # was pure waste. Only filter changes, refresh, and save reset
+            # total_rows to None to force a recount.
+            #
+            # For an unfiltered table, prefer the catalog's stats-based row
+            # estimate over a real COUNT(*): on a huge table (hundreds of
+            # GB) a real COUNT(*) is a full scan that can block the UI for
+            # minutes just to open the table. The estimate can be stale, but
+            # it can't hide real data — the "bump up if a full page came
+            # back" logic below already corrects any undercount, so the only
+            # downside of a stale estimate is a wrong-looking "of N rows"
+            # label, never missing rows. A WHERE clause has no such catalog
+            # stat, so filtered loads still pay for a real COUNT(*).
+            if self.total_rows is None:
+                estimate = None
+                if not self.current_filter:
+                    get_estimate = getattr(self.db_service, "get_estimated_row_count", None)
+                    if get_estimate:
+                        try:
+                            estimate = get_estimate(self.table_name)
+                        except Exception as ex:
+                            logger.debug(f"Row count estimate failed for {self.table_name}: {ex}")
+
+                if estimate is not None:
+                    self.total_rows = estimate
+                else:
+                    try:
+                        where_clause = f" WHERE {self.current_filter}" if self.current_filter else ""
+                        count_query = f"SELECT COUNT(*) as total FROM {self.table_name}{where_clause}"  # nosec B608
+                        count_df = self.db_service.execute_query(count_query)
+                        self.total_rows = int(count_df.iloc[0]['total'])
+                    except Exception as ex:
+                        logger.debug(f"Row count failed for {self.table_name}: {ex}")
+                        self.total_rows = 1000000
             
             # Calculate offset
             offset = (self.current_page - 1) * self.page_size

@@ -757,6 +757,34 @@ class DbService:
             pass
         return []
 
+    def get_estimated_row_count(self, table_name: str) -> int | None:
+        """Fast, stats-based row-count estimate — reads catalog metadata
+        instead of scanning the table, so it stays instant on tables too
+        big for a real COUNT(*) to be worth blocking on. None if this
+        dialect has no such stat (caller should fall back to COUNT(*))."""
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT TABLE_ROWS FROM information_schema.TABLES
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s
+                """, (table_name,))
+                row = cursor.fetchone()
+                cursor.close()
+                if row is not None:
+                    val = row["TABLE_ROWS"] if isinstance(row, dict) else row[0]
+                    return int(val) if val is not None else None
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute("SELECT reltuples::bigint FROM pg_class WHERE oid = %s::regclass", (table_name,))
+                row = cursor.fetchone()
+                cursor.close()
+                if row is not None and row[0] is not None:
+                    return max(0, int(row[0]))
+        except Exception:
+            pass
+        return None
+
     def get_generated_columns(self, table_name: str) -> list[str]:
         """Column names that are computed (`GENERATED ALWAYS AS`/STORED or
         VIRTUAL) and therefore can't appear in an INSERT column list (issue
