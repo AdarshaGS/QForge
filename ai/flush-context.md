@@ -8,72 +8,68 @@ messages once committed — don't duplicate them here. Replace stale sections
 outright rather than appending to them. Do not record passwords, tokens,
 hostnames, customer data, or unredacted SQL.
 
-## Current state (as of 2026-08-22)
+## Current state (as of 2026-08-30)
 
-**Branch:** `master`, clean working tree, in sync with `origin/master`
-(`1431b94`). `git status` is the source of truth for exactly which files
-are dirty — this section is a summary, not a substitute.
+**Branch:** `master`, just merged `origin/master` (16 commits, tags
+v1.4.0/v1.4.1 — Data Compare, Command Palette, SQL editor go-to-def/quick-
+fixes, schema-aware completer, a security-audit pass on identifier
+escaping, mock data generator) together with a local-only commit
+(`4669554`, offline license grace period) that had never been pushed. One
+real conflict, in `main.py` (two independent new imports at the same
+line) — resolved by keeping both. `git status` is the source of truth for
+exactly which files are dirty — this section is a summary, not a
+substitute.
 
-Everything the 2026-08-19 version of this file listed as "uncommitted"
-(security fixes #161–163, export dialog #156–160, licensing integration
-#81–88) landed on master in prior sessions — see `git log` (e.g. `e8bdedd`,
-`e14206f`, `42443b1`, `b11f939`, `2703baf`). Trust `git log`/`gh issue
-view --comments` over any stale summary here.
+**This session's work** — MySQL BLOB/decode safety, reconciled against an
+independently-landed fix for the *same* bug found upstream mid-session:
+- Two real MySQL decode bugs (not just cell values — `_read_row_from_packet`,
+  already patched pre-session for issue #150 — but also column/table
+  *names*, `FieldDescriptorPacket._parse_field_descriptor`, unpatched
+  until now) in `services/db_service.py`.
+- A raw BLOB column (e.g. a stored encryption key) crashed the whole grid
+  load (`pandas.astype(str)` decode-crashes on real bytes) and, separately,
+  got resent as garbage text in every UPDATE's `SET` clause even when a
+  completely different column was edited — fixed in `ui/editable_table.py`
+  by restricting `SET` to `self.modified_cells` and displaying BLOB cells
+  as hex (matching TablePlus/DBeaver) via a new `_cell_display_text()`.
+  Same backslash-escaping gap (MySQL treats `\` as an escape char in
+  `'...'` by default) fixed in the SQL-literal builders here and in
+  `utils/df_export.py`.
+- **Merge conflict**: origin's `253bcac` independently fixed the same
+  "WHERE clause assumed column 0 was the primary key" bug this session
+  also fixed, with a different API (`set_primary_key_columns()` +
+  `_key_column_indices()`, also wired into `SqlTab`'s query-result grid,
+  which this session's fix didn't cover). Kept upstream's PK-lookup API as
+  the base; layered this session's `modified_cells` restriction and
+  backslash-escaping on top, since upstream's fix had neither. Deleted the
+  now-redundant duplicate helpers (`_where_clause_columns`, the plain
+  `_sql_literal` static method) that the merge left standing.
 
-**Milestone #11 "Security — Post-Launch Hardening"** — this session's work.
-All 3 issues closed by the user (2026-08-22), milestone has 0 open issues
-but is **not yet closed as a milestone object** on GitHub — trivial next
-step if wanted.
-- **#141** (eval() in grid formula evaluator): already fixed on master
-  before this session (`_safe_eval_arithmetic`, AST-whitelisted, in
-  `ui/editable_table.py`). Verified this session with an adversarial
-  payload test — no code change needed.
-- **#120** (dependency CVE scanning in CI): added, this session
-  (`1431b94`) — `pip-audit` step in
-  `.github/workflows/tests.yml`, `pip-audit` pinned in
-  `requirements-dev.txt`. Clean run against current `requirements.txt`.
-- **#119** (keychain re-auth on ad-hoc → Developer ID signing migration):
-  documented, this session (`1431b94`) — new "macOS: one-time re-auth
-  after a signing change" section in `README.md`. `get_password`/
-  `set_password` (`utils/credential_store.py`) already handle it
-  gracefully; no code change needed, just verification + docs.
-
-**Milestone #10 "Security — Pre-Launch VAPT (Critical)"** — 10/11 closed.
-Only **#113** open: harden `utils/self_updater.py` against a compromised
-GitHub release channel (verify code signature/Team ID, not just SHA256) —
-blocked on real Apple Developer ID signing being in place first.
-
-**Milestones #12 (Licensing — Entitlements) and #14 (Licensing — Purchase
-Flow)** — fully closed (0 open). Not verified this session whether a real
-production activation against an actually-issued signed license has ever
-been done — flagged as open in a prior flush, status not rechecked here.
-
-**Milestone #15 "Licensing — Website & Privacy"** — 7 open (#108, #109,
-#185–189): domain/DNS, analytics, legal review of privacy policy/terms,
-Cashfree production activation, Apple Developer account & code signing.
-Untouched this session.
+**Still uncommitted, pre-dating this session** (unrelated, appeared mid-
+prior-session):
+- `ui/connection_panel.py` — in-progress fix for #179 ("Open in New Tab"
+  throws TypeError): `force_new` param on `open_table_view()`.
+  Unfinished/untested as of this note.
+- `tests/test_tab_cap.py` — untracked test file for #154 (already
+  closed); unclear if still needed or superseded.
+- `benchmarks/results/history.jsonl` — modified; a benign byproduct of
+  running the local benchmark suite.
 
 ## Open threads not yet started
 
-- Close milestone #11 itself on GitHub (all 3 issues done, milestone
-  object still shows open).
-- **#113** — auto-updater signature hardening; needs Developer ID signing
-  first (tracked under milestone #15/#189).
-- Milestone #15 (7 open items) — website/DNS/legal/payment-activation/
-  signing chores, none started.
-- **Production-safety Slices 5–6** (`ai/load-context.md`: query
-  limits/timeout/cancellation, audit trail) — unchanged, untouched.
+- Verdict needed on committing this session's decode/BLOB-safety fixes,
+  and on finishing/testing/committing the pre-existing #179 fix.
+- Remaining VAPT milestone tickets (#113–118, #139–141) — still open,
+  untouched, status not rechecked this session.
 - Whether a real production license activation with an actually-issued
-  signed key has happened — status unconfirmed, needs a recheck rather
-  than assumed from an old note.
+  signed key has happened — still unconfirmed as of the last few flushes.
 
 ## Exact next step
 
-1. If picking up security/hardening work: start with **#113** (needs
-   Developer ID signing landed first) or close out milestone #15's
-   remaining chores.
-2. Otherwise, ask the user what's next — no committed work is currently
-   in flight and no session left mid-task.
+1. Run the full test suite post-merge, then ask the user whether to
+   commit (a) this session's BLOB/decode fixes and (b) the pre-existing
+   #179 fix, separately or together.
+2. Otherwise, ask what's next — no other session work is mid-task.
 
 ## Where the detail lives
 

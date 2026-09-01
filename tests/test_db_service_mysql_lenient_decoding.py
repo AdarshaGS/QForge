@@ -9,13 +9,24 @@ tests exercise that exact function directly with a real invalid-UTF-8
 byte sequence (0xd3 alone — the exact example from the issue), rather than
 trying to coerce a live MySQL server into storing invalid bytes in a
 column it validates on write (it does, defensively, in every mode tried).
+
+Also covers the same failure mode found later in a sibling method: #150
+only patched row *values* — a non-UTF-8-clean column/table *name*
+(FieldDescriptorPacket._parse_field_descriptor) aborted the query before a
+single row was even read, with no data shown at all.
 """
+import struct
+
 import pytest
 
 pytest.importorskip("pymysql")
 import pymysql.connections as pymysql_connections
 
-from services.db_service import _ensure_lenient_mysql_decoding, _lenient_read_row_from_packet
+from services.db_service import (
+    _ensure_lenient_mysql_decoding,
+    _ensure_lenient_mysql_field_decoding,
+    _lenient_read_row_from_packet,
+)
 
 
 class _FakePacket:
@@ -76,3 +87,38 @@ def test_ensure_lenient_mysql_decoding_patches_the_real_pymysql_class():
     packet = _FakePacket([_BAD_BYTES])
     row = pymysql_connections.MySQLResult._read_row_from_packet(result, packet)
     assert row == ("�",)
+
+
+def _field_descriptor_packet(name_bytes: bytes) -> bytes:
+    """Build the raw bytes of one MySQL field-descriptor packet with the
+    given column name, matching FieldDescriptorPacket._parse_field_descriptor's
+    exact read order."""
+    def lenenc(s: bytes) -> bytes:
+        return bytes([len(s)]) + s
+
+    return (
+        lenenc(b"def")          # catalog
+        + lenenc(b"testdb")     # db
+        + lenenc(b"tenants")    # table_name
+        + lenenc(b"tenants")    # org_table
+        + lenenc(name_bytes)    # name
+        + lenenc(name_bytes)    # org_name
+        + struct.pack("<xHIBHBxx", 45, 10, 253, 0, 0)
+    )
+
+
+def test_original_field_descriptor_raises_on_bad_column_name_bytes():
+    """Sanity check — reproduces the exact reported error message."""
+    data = _field_descriptor_packet(_BAD_BYTES)
+    with pytest.raises(UnicodeDecodeError):
+        pymysql_connections.FieldDescriptorPacket(data, "utf8")
+
+
+def test_ensure_lenient_mysql_field_decoding_patches_the_real_pymysql_class():
+    _ensure_lenient_mysql_field_decoding()
+    data = _field_descriptor_packet(_BAD_BYTES)
+
+    field = pymysql_connections.FieldDescriptorPacket(data, "utf8")
+
+    assert field.name == "�"
+    assert field.table_name == "tenants"

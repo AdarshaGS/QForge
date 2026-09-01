@@ -2341,7 +2341,7 @@ class SqlTab(QWidget):
             
             # Apply filter based on operator
             try:
-                col_s = filtered_df[column].astype(str)
+                col_s = filtered_df[column].map(str)
                 if operator in ("=", "=="):
                     filtered_df = filtered_df[col_s == value]
                 elif operator in ("<>", "!="):

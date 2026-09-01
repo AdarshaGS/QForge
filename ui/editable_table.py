@@ -130,6 +130,29 @@ def _shift_row(row: int, at_row: int, delta: int) -> int:
     return row + delta if row > at_row else row  # a row was removed at at_row
 
 
+def _cell_display_text(value) -> str:
+    """Text shown for one grid cell, and compared against to detect an
+    edit. Bytes (a BLOB column — e.g. a stored encryption key) are shown
+    as an uppercase hex string, matching what TablePlus/DBeaver show for
+    the same column, instead of Python's raw bytes repr (b'\\x04\\x8f...'),
+    which isn't just harder to read — comparing it against the same value
+    shown as hex elsewhere looks like a mismatch when the underlying bytes
+    are actually identical."""
+    if isinstance(value, (bytes, bytearray)):
+        return value.hex().upper()
+    return str(value)
+
+
+def _sql_string_literal(text: str) -> str:
+    """Quote *text* as a MySQL string literal. Escapes backslash as well as
+    the quote char — MySQL treats backslash as an escape character inside
+    '...' by default (unless NO_BACKSLASH_ESCAPES is set), so an unescaped
+    backslash silently eats the next character instead of raising: saving
+    'C:\\Users\\test' actually stores 'C:Users\\test' with no error at all."""
+    escaped = text.replace("\\", "\\\\").replace("'", "''")
+    return f"'{escaped}'"
+
+
 class _CellEditCommand:
     """One cell's text changed from old_text to new_text."""
     __slots__ = ("row", "col", "old_text", "new_text")
@@ -535,13 +558,12 @@ class EditableTableWidget(QTableWidget):
                 for col in range(len(dataframe.columns)):
                     value = dataframe.iloc[row, col]
 
-                    if pd.isna(value):
-                        value = ""
+                    display_text = "" if pd.isna(value) else _cell_display_text(value)
 
-                    item = QTableWidgetItem(str(value))
+                    item = QTableWidgetItem(display_text)
                     item.setData(Qt.UserRole, dataframe.iloc[row, col])  # Store original value
                     self.setItem(row, col, item)
-                    self._cell_snapshot[(row, col)] = str(value)
+                    self._cell_snapshot[(row, col)] = display_text
 
         hdr = self.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.Interactive)
@@ -734,8 +756,13 @@ class EditableTableWidget(QTableWidget):
         for col_idx, col_name in enumerate(dataframe.columns):
             # Header text width
             header_w = fm.horizontalAdvance(str(col_name)) + 24  # padding
-            # Sample up to 50 rows
-            sample = dataframe.iloc[:50, col_idx].fillna('').astype(str)
+            # Sample up to 50 rows. .map(str) (not .astype(str)): a raw
+            # BLOB column holds real bytes (e.g. a binary encryption key,
+            # left undecoded on purpose since it's not text), and pandas'
+            # astype(str) casts via numpy's string dtype, which tries to
+            # UTF-8-decode bytes and crashes the entire page load on the
+            # first non-UTF-8 byte. Python's own str() just reprs it.
+            sample = dataframe.iloc[:50, col_idx].fillna('').map(str)
             content_w = sample.map(lambda s: fm.horizontalAdvance(str(s))).max() if not sample.empty else 0
             content_w += 20  # cell padding
             best = max(header_w, content_w, self._COL_WIDTH_DEF)
@@ -816,7 +843,7 @@ class EditableTableWidget(QTableWidget):
             if col_idx < len(filtered.columns):
                 col_name = filtered.columns[col_idx]
                 filtered = filtered[
-                    filtered[col_name].astype(str).str.lower().str.contains(filter_text, na=False)
+                    filtered[col_name].map(str).str.lower().str.contains(filter_text, na=False)
                 ]
         
         self.filtered_data = filtered
@@ -864,7 +891,7 @@ class EditableTableWidget(QTableWidget):
         original_value = item.data(Qt.UserRole)
         current_value = item.text()
         unchanged = (current_value == "" and pd.isna(original_value)) or \
-            str(original_value) == current_value
+            _cell_display_text(original_value) == current_value
 
         if unchanged:
             self.modified_cells.discard((row, col))
@@ -1105,12 +1132,6 @@ class EditableTableWidget(QTableWidget):
                 return idxs
         return list(range(self.columnCount()))
 
-    @staticmethod
-    def _sql_literal(value) -> str:
-        if pd.isna(value):
-            return "NULL"
-        return f"'{str(value).replace(chr(39), chr(39) * 2)}'"
-
     def get_changes(self):
         """
         Get all changes as SQL statements
@@ -1125,7 +1146,13 @@ class EditableTableWidget(QTableWidget):
             'deletes': []
         }
 
-        key_cols = self._key_column_indices()
+        # Columns that uniquely identify a row for UPDATE/DELETE WHERE
+        # clauses: the table's real primary key when known, else every
+        # column. Column 0 is NOT reliably the primary key (SELECT * order
+        # isn't guaranteed to put it first) — using it unconditionally
+        # built a WHERE clause that matched zero rows on tables where it
+        # wasn't, silently discarding the edit.
+        where_cols = self._key_column_indices()
 
         # Generate UPDATE statements for modified rows
         for row in self.modified_rows:
@@ -1133,9 +1160,17 @@ class EditableTableWidget(QTableWidget):
                 continue
 
             set_parts = []
-            where_parts = []
 
+            # Only columns actually edited (self.modified_cells) — not
+            # every column in the row. A row containing an untouched BLOB
+            # (e.g. a binary key) previously got that column's display
+            # text — Python's str(bytes) repr, not the real value —
+            # re-sent as a plain string SET on every edit to *any* other
+            # column in the same row, corrupting it (or breaking the SQL
+            # outright, since that repr text is full of backslashes).
             for col in range(self.columnCount()):
+                if (row, col) not in self.modified_cells:
+                    continue
                 col_name = self.horizontalHeaderItem(col).text()
                 item = self.item(row, col)
                 new_value = item.text()
@@ -1144,18 +1179,14 @@ class EditableTableWidget(QTableWidget):
                 if new_value == "":
                     new_value = "NULL"
                 else:
-                    new_value = f"'{new_value.replace(chr(39), chr(39)+chr(39))}'"
+                    new_value = _sql_string_literal(new_value)
 
                 set_parts.append(f"{col_name} = {new_value}")
 
-                # Use the original (pre-edit) value of each key column for
-                # the WHERE clause, so editing a key column's own value still
-                # matches the row it used to be.
-                if col in key_cols:
-                    original_value = item.data(Qt.UserRole)
-                    where_parts.append(f"{col_name} = {self._sql_literal(original_value)}"
-                                        if not pd.isna(original_value)
-                                        else f"{col_name} IS NULL")
+            # Use the original (pre-edit) value of each key column for the
+            # WHERE clause, so editing a key column's own value still
+            # matches the row it used to be.
+            where_parts = self._where_parts_for_row(row, where_cols)
 
             if set_parts and where_parts:
                 sql = f"UPDATE {self.table_name} SET {', '.join(set_parts)} WHERE {' AND '.join(where_parts)};"  # nosec B608
@@ -1176,7 +1207,7 @@ class EditableTableWidget(QTableWidget):
                 
                 if value != "":
                     columns.append(col_name)
-                    values.append(f"'{value.replace(chr(39), chr(39)+chr(39))}'")
+                    values.append(_sql_string_literal(value))
             
             if columns:
                 sql = f"INSERT INTO {self.table_name} ({', '.join(columns)}) VALUES ({', '.join(values)});"  # nosec B608
@@ -1186,21 +1217,31 @@ class EditableTableWidget(QTableWidget):
         for row in self.deleted_rows:
             if row in self.new_rows:
                 continue
-            
-            where_parts = []
-            for col in key_cols:
-                col_name = self.horizontalHeaderItem(col).text()
-                item = self.item(row, col)
-                original_value = item.data(Qt.UserRole)
-                where_parts.append(f"{col_name} = {self._sql_literal(original_value)}"
-                                    if not pd.isna(original_value)
-                                    else f"{col_name} IS NULL")
+
+            where_parts = self._where_parts_for_row(row, where_cols)
 
             if where_parts:
                 sql = f"DELETE FROM {self.table_name} WHERE {' AND '.join(where_parts)};"  # nosec B608
                 changes['deletes'].append(sql)
-        
+
         return changes
+
+    def _where_parts_for_row(self, row, where_cols):
+        where_parts = []
+        for col in where_cols:
+            col_name = self.horizontalHeaderItem(col).text()
+            item = self.item(row, col)
+            original_value = item.data(Qt.UserRole)
+            if pd.isna(original_value):
+                where_parts.append(f"{col_name} IS NULL")
+            elif isinstance(original_value, (bytes, bytearray)):
+                # A BLOB column's raw value needs a binary literal (X'...')
+                # to match — a quoted string of its hex/repr text would
+                # never equal the column's actual binary content.
+                where_parts.append(f"{col_name} = X'{original_value.hex()}'")
+            else:
+                where_parts.append(f"{col_name} = {_sql_string_literal(str(original_value))}")
+        return where_parts
     
     def _apply_sort_header_labels(self):
         """Draw the active sort column/direction directly into the header
@@ -1486,7 +1527,7 @@ class EditableTableWidget(QTableWidget):
             stmts = []
             for row in rows:
                 vals = ", ".join(
-                    "NULL" if v == "" else f"'{v.replace(chr(39), chr(39)*2)}'"
+                    "NULL" if v == "" else _sql_string_literal(v)
                     for v in row
                 )
                 stmts.append(f"INSERT INTO `{tbl}` ({col_list}) VALUES ({vals});")  # nosec B608
@@ -1507,7 +1548,7 @@ class EditableTableWidget(QTableWidget):
             for row in rows:
                 filt_vals = [v for i, v in enumerate(row) if i not in skip]
                 vals = ", ".join(
-                    "NULL" if v == "" else f"'{v.replace(chr(39), chr(39)*2)}'"
+                    "NULL" if v == "" else _sql_string_literal(v)
                     for v in filt_vals
                 )
                 stmts.append(f"INSERT INTO `{tbl}` ({col_list}) VALUES ({vals});")  # nosec B608
@@ -1645,7 +1686,7 @@ class EditableTableWidget(QTableWidget):
         if current:
             original = current.data(Qt.UserRole)
             if original is not None:
-                current.setText(str(original))
+                current.setText(_cell_display_text(original))
     
     def duplicate_selected_rows(self):
         """Duplicate all selected rows (Cmd+D)"""

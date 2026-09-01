@@ -517,7 +517,7 @@ class TableViewWidget(QWidget):
                         self.columns = [col.get('Field', '') for col in cols]
                     except Exception:
                         pass
-                
+
                 if self.columns:
                     # Update all filter row column combos
                     for i in range(self.filter_rows_layout.count()):
@@ -598,7 +598,7 @@ class TableViewWidget(QWidget):
             logger.info(f"Loaded page {self.current_page} ({len(df)} rows) from {self.table_name}")
             self._load_failed = False
         except Exception as ex:
-            logger.error(f"Failed to load table data: {str(ex)}")
+            logger.error(f"Failed to load table data: {str(ex)}", exc_info=True)
             self.limit_label.setText(f"Error: {str(ex)}")
             self._load_failed = True
 
@@ -1005,7 +1005,9 @@ class TableViewWidget(QWidget):
             # Execute DELETEs first
             for sql in changes['deletes']:
                 try:
-                    self.db_service.execute_update(sql)
+                    affected = self.db_service.execute_update(sql)
+                    if affected == 0:
+                        raise Exception("matched 0 rows — the row may have already changed or its key no longer matches")
                     success_count += 1
                     logger.info(f"✓ DELETE: {sql}")
                 except Exception as e:
@@ -1015,7 +1017,9 @@ class TableViewWidget(QWidget):
             # Then UPDATEs
             for sql in changes['updates']:
                 try:
-                    self.db_service.execute_update(sql)
+                    affected = self.db_service.execute_update(sql)
+                    if affected == 0:
+                        raise Exception("matched 0 rows — the row may have already changed or its key no longer matches")
                     success_count += 1
                     logger.info(f"✓ UPDATE: {sql}")
                 except Exception as e:

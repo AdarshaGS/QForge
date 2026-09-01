@@ -1623,15 +1623,18 @@ class ConnectionPanel(QWidget):
             self.config.get("id", ""), is_dark=(self.current_theme == "dark"), parent=self)
         dlg.exec_()
 
-    def open_table_view(self, table_name: str, silent: bool = False):
+    def open_table_view(self, table_name: str, silent: bool = False, force_new: bool = False):
         """Open a table view; re-focus if already open. *silent* suppresses
         the Free-tier tab-cap prompt for callers restoring a saved session
-        rather than acting on a click (issue #154)."""
-        for i in range(self.tabs.count()):
-            w = self.tabs.widget(i)
-            if isinstance(w, TableViewWidget) and w.table_name == table_name:
-                self.tabs.setCurrentIndex(i)
-                return
+        rather than acting on a click (issue #154). *force_new* skips the
+        re-focus check so "Open in New Tab" always creates a fresh tab
+        instead of jumping to an existing one for the same table (issue #179)."""
+        if not force_new:
+            for i in range(self.tabs.count()):
+                w = self.tabs.widget(i)
+                if isinstance(w, TableViewWidget) and w.table_name == table_name:
+                    self.tabs.setCurrentIndex(i)
+                    return
 
         if not self._under_tab_limit(silent):
             return

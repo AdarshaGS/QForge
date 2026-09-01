@@ -326,6 +326,13 @@ class ConnectionDialog(QDialog):
         self.test_btn = QPushButton("🔧 Test")
         self.connect_btn = QPushButton("✓ Connect")
 
+        # Buttons in a QDialog default to autoDefault=True, which makes
+        # whichever one has focus grow a native default-button bezel under
+        # the QSS rounded-rect styling — its square corner pokes out past
+        # the rounded corner. None of these should carry that chrome.
+        for b in (self.save_btn, self.delete_btn, self.test_btn, self.connect_btn):
+            b.setAutoDefault(False)
+
         btn_layout.addWidget(self.save_btn)
         btn_layout.addWidget(self.delete_btn)
         btn_layout.addWidget(self.test_btn)

@@ -155,6 +155,13 @@ def _sql_value_literal(val, dialect: str = "mysql", blob_as_hex: bool = True) ->
         return f"E'\\\\x{hexstr}'" if dialect == "postgresql" else f"X'{hexstr}'"
     if isinstance(val, str):
         escaped = val.replace("'", "''")
+        # MySQL (not Postgres, under the modern standard_conforming_strings
+        # default) treats backslash as an escape character inside '...' —
+        # an unescaped one silently eats the next character instead of
+        # erroring: re-importing 'C:\Users\test' would store 'C:Users\test'
+        # with no error at all.
+        if dialect == "mysql":
+            escaped = escaped.replace("\\", "\\\\")
         return f"'{escaped}'"
     if pd.isna(val):
         return "NULL"

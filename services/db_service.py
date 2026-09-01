@@ -95,6 +95,51 @@ def _ensure_lenient_mysql_decoding():
         logger.warning(f"Could not patch pymysql for lenient decoding: {ex}")
 
 
+def _lenient_parse_field_descriptor(self, encoding):
+    """Drop-in replacement for pymysql.connections.FieldDescriptorPacket's
+    own column-metadata parser (copied from pymysql/connections.py, MIT
+    licensed), with one change: a table/column identifier that fails strict
+    decoding under the connection's negotiated charset falls back to
+    errors='replace' instead of raising. This is the same failure mode as
+    issue #150 (a legacy-charset identifier isn't clean UTF-8) but in a
+    different pymysql method — #150 only patched row *values*
+    (_read_row_from_packet); this one covers column/table *names*, which
+    are parsed before a single row is read, so it previously aborted the
+    query outright with no data shown at all."""
+    def _decode(data):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            return data.decode(encoding, errors="replace")
+
+    self.catalog = self.read_length_coded_string()
+    self.db = self.read_length_coded_string()
+    self.table_name = _decode(self.read_length_coded_string())
+    self.org_table = _decode(self.read_length_coded_string())
+    self.name = _decode(self.read_length_coded_string())
+    self.org_name = _decode(self.read_length_coded_string())
+    (
+        self.charsetnr,
+        self.length,
+        self.type_code,
+        self.flags,
+        self.scale,
+    ) = self.read_struct("<xHIBHBxx")
+
+
+def _ensure_lenient_mysql_field_decoding():
+    """Idempotently patch pymysql to survive non-UTF-8-clean column/table
+    identifiers — see _lenient_parse_field_descriptor. Guarded the same way
+    as _ensure_lenient_mysql_decoding, for the same reason."""
+    try:
+        import pymysql.connections as _pymysql_connections
+        if not hasattr(_pymysql_connections.FieldDescriptorPacket, '_parse_field_descriptor'):
+            return
+        _pymysql_connections.FieldDescriptorPacket._parse_field_descriptor = _lenient_parse_field_descriptor
+    except Exception as ex:
+        logger.warning(f"Could not patch pymysql for lenient field decoding: {ex}")
+
+
 class ReadOnlyViolation(Exception):
     """Raised when a write statement is attempted on a read-only connection.
     This is the backstop guard — always active regardless of which UI entry
@@ -229,6 +274,7 @@ class DbService:
     def _connect_mysql(self, config):
         """Connect to MySQL database"""
         _ensure_lenient_mysql_decoding()
+        _ensure_lenient_mysql_field_decoding()
         # Check if SSH tunnel is needed
         ssh_tunnel_config = config.get("ssh_tunnel", {"enabled": False})
         

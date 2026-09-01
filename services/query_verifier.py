@@ -171,8 +171,8 @@ class QueryVerifier:
             result._diff_cols = common_cols
 
             if common_cols and (len(df_orig) > 0 or len(df_opt) > 0):
-                str_orig = df_orig[common_cols].astype(str).copy()
-                str_opt  = df_opt[common_cols].astype(str).copy()
+                str_orig = df_orig[common_cols].map(str).copy()
+                str_opt  = df_opt[common_cols].map(str).copy()
 
                 # Sort both frames identically → ORDER-BY agnostic
                 str_orig_s = str_orig.sort_values(common_cols).reset_index(drop=True)
