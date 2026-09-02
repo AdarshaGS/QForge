@@ -111,6 +111,38 @@ SQL_FUNCTIONS = [
     "OVER", "PARTITION BY",
 ]
 
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    """Index of the ')' matching the '(' at open_idx, skipping over
+    quoted/backtick-quoted content, or -1 if unbalanced."""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    in_str: Optional[str] = None
+    while i < n:
+        c = text[i]
+        if in_str:
+            if c == "\\" and in_str != "`":
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+        elif c in ("'", '"', "`"):
+            in_str = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+_WITH_RE = re.compile(r"\bWITH\b(?:\s+RECURSIVE\b)?", re.IGNORECASE)
+_CTE_IDENT_RE = re.compile(r"\s*[`\"]?(\w+)[`\"]?")
+_FROM_JOIN_PAREN_RE = re.compile(r"\b(?:FROM|JOIN)\s*\(", re.IGNORECASE)
+
+
 # (keyword, context_name) — checked from most-specific to least
 _CONTEXT_MARKERS = [
     ("EXPLAIN ANALYZE", "AFTER_EXPLAIN"),
@@ -481,6 +513,11 @@ class SqlCompleter:
         self._fk_columns:   dict[str, set[str]]        = {}   # {table: {col_lower that is an FK source}}
         self._aliases:  dict[str, str]       = {}   # {alias_lower: table}
         self._snippets: dict[str, dict]      = {}   # {trigger: {name, body, ...}}
+        # Query-scoped pseudo-tables, recomputed fresh each update() from the
+        # current query text (never persisted across queries like schema
+        # is) — see _extract_ctes/_extract_derived_tables.
+        self._ctes:     dict[str, list[str]] = {}   # {cte_name: [col, ...]}
+        self._derived_columns: dict[str, list[str]] = {}   # {alias: [col, ...]}
 
     # ── Public ──────────────────────────────────────────────────
 
@@ -539,18 +576,22 @@ class SqlCompleter:
         return name in self._views
 
     def resolve_table(self, name_or_alias: str) -> Optional[str]:
-        """A bare table/view name, or an alias already used in the current
-        query (via update()'s _extract_aliases), to its real table name."""
+        """A bare table/view name, a CTE/derived-table alias defined in the
+        current query, or a schema alias already used in the current query
+        (via update()'s _extract_aliases), to its real table name."""
         table = self._aliases.get(name_or_alias.lower())
         if table:
             return table
-        return name_or_alias if name_or_alias in self._tables or name_or_alias in self._views else None
+        if name_or_alias in self._tables or name_or_alias in self._views \
+                or name_or_alias in self._ctes or name_or_alias in self._derived_columns:
+            return name_or_alias
+        return None
 
     def alias_target(self, alias: str) -> Optional[str]:
         return self._aliases.get(alias.lower())
 
     def table_columns(self, table: str) -> list[str]:
-        return list(self._columns.get(table, []))
+        return self._columns_for(table)
 
     def column_meta(self, table: str, column: str) -> Optional[dict]:
         return self._column_meta.get(table, {}).get(column.lower())
@@ -558,6 +599,17 @@ class SqlCompleter:
     def foreign_key_for(self, table: str, column: str) -> Optional[dict]:
         return next((fk for fk in self._foreign_keys.get(table, [])
                      if fk.get("column", "").lower() == column.lower()), None)
+
+    def _columns_for(self, table: str) -> list[str]:
+        """Columns for a real schema table OR a query-scoped CTE/derived
+        pseudo-table — the single lookup every column-suggestion path below
+        should go through so a CTE/derived alias behaves exactly like a
+        real table wherever columns are offered."""
+        if table in self._ctes:
+            return list(self._ctes[table])
+        if table in self._derived_columns:
+            return list(self._derived_columns[table])
+        return list(self._columns.get(table, []))
 
     def primary_key_columns(self, table: str) -> list[str]:
         """Column name(s) of `table` marked primary key in the bulk-fetched
@@ -620,8 +672,14 @@ class SqlCompleter:
             self.hide_popup()
             return
 
-        # Refresh alias map from current query text
+        # Refresh query-scoped pseudo-tables (CTEs, derived-table aliases)
+        # and the alias map from current query text — CTEs first, since
+        # _extract_aliases needs to recognize a CTE name as a valid table.
+        self._ctes = self._extract_ctes(query)
+        self._derived_columns = self._extract_derived_tables(query)
         self._aliases = self._extract_aliases(query)
+        for alias in self._derived_columns:
+            self._aliases[alias.lower()] = alias
 
         context = self._parse_context(query, pos)
         _t0 = perf_counter()
@@ -681,13 +739,17 @@ class SqlCompleter:
         return best_ctx
 
     def _extract_aliases(self, query: str) -> dict[str, str]:
-        """Build {alias_lower: real_table_name} from the query."""
+        """Build {alias_lower: real_table_name} from the query — a "table"
+        here may be a real schema table/view, or a CTE name defined
+        earlier in the same query (see _extract_ctes), so `FROM cte_name`
+        aliases and resolves exactly like a real table."""
         aliases: dict[str, str] = {}
         for m in re.finditer(
                 r'(?:FROM|JOIN|UPDATE)\s+[`"]?(\w+)[`"]?',
                 query, re.IGNORECASE):
             table = m.group(1)
-            if table not in self._tables and table not in self._views:
+            if table not in self._tables and table not in self._views \
+                    and table not in self._ctes:
                 continue
             aliases[table.lower()] = table
             # Matched as a *separate* lookahead (re.match on the tail, not
@@ -699,6 +761,145 @@ class SqlCompleter:
             if am and am.group(1).upper() not in SQL_KEYWORDS:
                 aliases[am.group(1).lower()] = table
         return aliases
+
+    def _extract_ctes(self, query: str) -> dict[str, list[str]]:
+        """Parse WITH-clause CTE names — and, best-effort, their output
+        columns — so `WITH recent_orders AS (SELECT id, total FROM
+        orders ...)` makes `recent_orders` completable as a table for the
+        rest of the query, with `id`/`total` column suggestions when the
+        SELECT list was simple enough to name safely (see
+        _infer_select_columns). A CTE whose columns can't be confidently
+        inferred still resolves as a known table — just with no column
+        suggestions, never a guessed one."""
+        ctes: dict[str, list[str]] = {}
+        for wm in _WITH_RE.finditer(query):
+            i = wm.end()
+            while True:
+                nm = _CTE_IDENT_RE.match(query, i)
+                if not nm:
+                    break
+                name = nm.group(1)
+                i = nm.end()
+
+                explicit_cols: Optional[list[str]] = None
+                j = i
+                while j < len(query) and query[j].isspace():
+                    j += 1
+                if j < len(query) and query[j] == '(':
+                    close = _find_matching_paren(query, j)
+                    if close == -1:
+                        break
+                    after = query[close + 1:]
+                    as_m = re.match(r'\s*AS\s*\(', after, re.IGNORECASE)
+                    if as_m:
+                        inner = query[j + 1:close]
+                        explicit_cols = [c.strip(' `"') for c in inner.split(',') if c.strip()]
+                        body_open = close + 1 + as_m.end() - 1
+                    else:
+                        body_open = None
+                else:
+                    as_m = re.match(r'\s*AS\s*\(', query[i:], re.IGNORECASE)
+                    body_open = i + as_m.end() - 1 if as_m else None
+
+                if body_open is None:
+                    break
+
+                body_close = _find_matching_paren(query, body_open)
+                if body_close == -1:
+                    break
+                body = query[body_open + 1:body_close]
+                cols = explicit_cols if explicit_cols is not None else self._infer_select_columns(body)
+                ctes[name] = cols
+
+                i = body_close + 1
+                k = i
+                while k < len(query) and query[k].isspace():
+                    k += 1
+                if k < len(query) and query[k] == ',':
+                    i = k + 1
+                    continue
+                break
+        return ctes
+
+    def _extract_derived_tables(self, query: str) -> dict[str, list[str]]:
+        """Parse `FROM (SELECT ...) [AS] alias` / `JOIN (SELECT ...) [AS]
+        alias` derived-table aliases so `alias.column` resolves against
+        the subquery's inferred output columns (see
+        _infer_select_columns) — the same best-effort, never-fabricated
+        column inference used for CTEs."""
+        out: dict[str, list[str]] = {}
+        for m in _FROM_JOIN_PAREN_RE.finditer(query):
+            open_idx = m.end() - 1
+            close = _find_matching_paren(query, open_idx)
+            if close == -1:
+                continue
+            body = query[open_idx + 1:close]
+            if not re.match(r'\s*SELECT\b', body, re.IGNORECASE):
+                continue  # a parenthesized non-SELECT (e.g. an IN-list) — not a derived table
+            after = query[close + 1:]
+            alias_m = re.match(r'\s*(?:AS\s+)?[`"]?(\w+)[`"]?', after, re.IGNORECASE)
+            if not alias_m or alias_m.group(1).upper() in SQL_KEYWORDS:
+                continue
+            out[alias_m.group(1)] = self._infer_select_columns(body)
+        return out
+
+    @staticmethod
+    def _infer_select_columns(subquery: str) -> list[str]:
+        """Best-effort display names of a SELECT's top-level column list,
+        e.g. `SELECT a, b AS x, t.c FROM ...` → ['a', 'x', 'c']. Any column
+        this can't confidently name — `SELECT *`, a bare expression with
+        no alias, an aggregate/function call — is simply omitted, never
+        guessed, so a partial result here means "some columns unknown",
+        not "these are the only columns"."""
+        m = re.search(r'\bSELECT\b', subquery, re.IGNORECASE)
+        if not m:
+            return []
+        rest = subquery[m.end():]
+        rest = re.sub(r'^\s*(DISTINCT|ALL)\b', '', rest, flags=re.IGNORECASE)
+
+        depth = 0
+        end = len(rest)
+        i = 0
+        while i < len(rest):
+            c = rest[i]
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+            elif depth == 0 and rest[i:i + 4].upper() == 'FROM' \
+                    and (i == 0 or not rest[i - 1].isalnum()) \
+                    and (i + 4 >= len(rest) or not rest[i + 4].isalnum()):
+                end = i
+                break
+            i += 1
+        select_list = rest[:end]
+
+        parts: list[str] = []
+        depth = 0
+        last = 0
+        for i, c in enumerate(select_list):
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+            elif c == ',' and depth == 0:
+                parts.append(select_list[last:i])
+                last = i + 1
+        parts.append(select_list[last:])
+
+        cols: list[str] = []
+        for part in parts:
+            part = part.strip()
+            if not part or part == '*' or part.endswith('.*'):
+                continue
+            as_m = re.search(r'\bAS\s+[`"]?(\w+)[`"]?\s*$', part, re.IGNORECASE)
+            if as_m:
+                cols.append(as_m.group(1))
+                continue
+            bare_m = re.match(r'^[`"]?(\w+)[`"]?(?:\.[`"]?(\w+)[`"]?)?$', part)
+            if bare_m:
+                cols.append(bare_m.group(2) or bare_m.group(1))
+        return cols
 
     # ── Tables mentioned in the query ────────────────────────────────────────
 
@@ -740,7 +941,7 @@ class SqlCompleter:
         seen: set[str] = set()
         out: list[SuggestionItem] = []
         for tbl in tables:
-            for col in self._columns.get(tbl, []):
+            for col in self._columns_for(tbl):
                 cl = col.lower()
                 if cl in seen:
                     continue
@@ -777,9 +978,10 @@ class SqlCompleter:
         results: list[SuggestionItem] = []
 
         if context in ("AFTER_FROM", "AFTER_JOIN"):
-            # Tables/views first, then all keywords (so WHERE/ON/LIMIT/JOIN always reachable)
+            # Tables/views/CTEs first, then all keywords (so WHERE/ON/LIMIT/JOIN always reachable)
             results += self._score(pl, self._tables,   SuggestionItem.TABLE,   1000, fuzzy=True)
             results += self._score(pl, self._views,    SuggestionItem.VIEW,     990, fuzzy=True)
+            results += self._score_ctes(pl)
             results += self._score(pl, SQL_KEYWORDS,   SuggestionItem.KEYWORD,  600)
             if context == "AFTER_JOIN":
                 results += self._fk_join_on_suggestion(pl, query, pos)
@@ -883,14 +1085,16 @@ class SqlCompleter:
 
     def _dot_suggestions(self, obj: str, partial: str) -> list[SuggestionItem]:
         table = self._aliases.get(obj.lower())
-        if not table and (obj in self._tables or obj in self._views):
+        if not table and (obj in self._tables or obj in self._views
+                           or obj in self._ctes or obj in self._derived_columns):
             table = obj
-        if not table or table not in self._columns:
+        if not table or (table not in self._columns and table not in self._ctes
+                          and table not in self._derived_columns):
             return []
 
         pl  = partial.lower()
         out = []
-        for col in self._columns[table]:
+        for col in self._columns_for(table):
             cl = col.lower()
             if cl.startswith(pl):
                 score = 1000 if cl == pl else (950 - len(col))
@@ -948,13 +1152,22 @@ class SqlCompleter:
             out.append(SuggestionItem(name, kind, s))
         return out
 
+    def _score_ctes(self, prefix: str) -> list[SuggestionItem]:
+        """CTE names defined earlier in this same query (see
+        _extract_ctes) — completable as a table, tagged with a CTE badge
+        so they're visually distinct from real schema tables."""
+        items = self._score(prefix, list(self._ctes.keys()), SuggestionItem.TABLE, 995, fuzzy=True)
+        for item in items:
+            item.extra = {**item.extra, "badge": "CTE"}
+        return items
+
     def _alias_col_items(self, prefix: str) -> list[SuggestionItem]:
         """Suggest alias.col format for all known aliases."""
         out = []
         for alias, table in self._aliases.items():
             if not alias.startswith(prefix):
                 continue
-            for col in self._columns.get(table, []):
+            for col in self._columns_for(table):
                 out.append(SuggestionItem(
                     f"{alias}.{col}", SuggestionItem.COLUMN, 870,
                     extra=self._column_badge_extra(table, col.lower())))
