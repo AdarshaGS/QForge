@@ -760,6 +760,7 @@ class EditableTableWidget(QTableWidget):
         from PySide6.QtWidgets import QApplication
         fm = QFontMetrics(QApplication.font())
         hdr = self.horizontalHeader()
+        any_clamped = False
         for col_idx, col_name in enumerate(dataframe.columns):
             # Header text width
             header_w = fm.horizontalAdvance(str(col_name)) + 24  # padding
@@ -773,6 +774,8 @@ class EditableTableWidget(QTableWidget):
             content_w = sample.map(lambda s: fm.horizontalAdvance(str(s))).max() if not sample.empty else 0
             content_w += 20  # cell padding
             best = max(header_w, content_w, self._COL_WIDTH_DEF)
+            if best > self._COL_WIDTH_MAX:
+                any_clamped = True
             width = min(best, self._COL_WIDTH_MAX)
             width = max(width, self._COL_WIDTH_MIN)
             hdr.resizeSection(col_idx, width)
@@ -780,8 +783,11 @@ class EditableTableWidget(QTableWidget):
         # Cap the widget itself to the columns' total width (+ row header,
         # frame, scrollbar) so a few narrow columns don't stretch across the
         # whole editor with dead space after the last column (issue #29).
-        # Uncapped (large) when there's nothing to size to, e.g. no columns.
-        if len(dataframe.columns):
+        # Skipped when any column's real content was clamped above (e.g. a
+        # single wide text column like EXPLAIN's "QUERY PLAN") — capping the
+        # widget to the clamped width there just recreates the same dead
+        # space one level up, and leaves no room to drag the column wider.
+        if len(dataframe.columns) and not any_clamped:
             from PySide6.QtWidgets import QStyle
             vheader_w = self.verticalHeader().width() if not self.verticalHeader().isHidden() else 0
             scrollbar_w = QApplication.style().pixelMetric(QStyle.PM_ScrollBarExtent)
