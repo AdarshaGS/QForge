@@ -39,10 +39,15 @@ class QueryHistory:
         except Exception as ex:
             logger.warning(f"Failed to save history: {ex}")
 
-    def add_query(self, query, connection_name, rows=0, execution_time=0):
-        """Add a query to history"""
+    def add_query(self, query, connection_name, rows=0, execution_time=0,
+                  cost_score=None, cost_label=None):
+        """Add a query to history. cost_score/cost_label are the optional
+        pre-run estimate from services/query_cost.py — omitted (None) for
+        writes, multi-statement scripts, or when no estimate was
+        computed; existing history entries predate these fields and read
+        back with them as None, same as a query that skipped them."""
         query = query.strip()
-        
+
         if not query:
             return
 
@@ -51,7 +56,9 @@ class QueryHistory:
             "connection": connection_name,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "rows": rows,
-            "execution_time": execution_time
+            "execution_time": execution_time,
+            "cost_score": cost_score,
+            "cost_label": cost_label,
         }
 
         self.queries.insert(0, entry)  # Add to beginning

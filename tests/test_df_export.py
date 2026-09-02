@@ -23,7 +23,6 @@ def test_sql_value_literal_leaves_numbers_unquoted():
 
 def test_sql_value_literal_hex_encodes_blobs_per_dialect():
     assert _sql_value_literal(b"\x01\xff", dialect="mysql") == "X'01ff'"
-    assert _sql_value_literal(b"\x01\xff", dialect="sqlite") == "X'01ff'"
     assert _sql_value_literal(b"\x01\xff", dialect="postgresql") == "E'\\\\x01ff'"
 
 
@@ -37,8 +36,6 @@ def test_quote_identifier_escapes_embedded_quote_char_per_dialect():
     assert _quote_identifier("evil`; DROP TABLE users; --", "mysql") == \
         "`evil``; DROP TABLE users; --`"
     assert _quote_identifier('evil"; DROP TABLE users; --', "postgresql") == \
-        '"evil""; DROP TABLE users; --"'
-    assert _quote_identifier('evil"; DROP TABLE users; --', "sqlite") == \
         '"evil""; DROP TABLE users; --"'
 
 
@@ -60,7 +57,6 @@ def test_to_sql_inserts_quotes_identifiers_per_dialect():
     df = pd.DataFrame([{"id": 1}])
     assert _to_sql_inserts(df, "users", dialect="mysql") == "INSERT INTO `users` (`id`) VALUES (1);"
     assert _to_sql_inserts(df, "users", dialect="postgresql") == 'INSERT INTO "users" ("id") VALUES (1);'
-    assert _to_sql_inserts(df, "users", dialect="sqlite") == 'INSERT INTO "users" ("id") VALUES (1);'
 
 
 def test_to_sql_inserts_builds_one_statement_per_row():

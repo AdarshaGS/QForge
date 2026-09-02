@@ -308,10 +308,7 @@ class SchemaCompareDialog(QDialog):
         # databases — this lets the same server be picked for both Source
         # and Target (e.g. comparing a duplicated database against its
         # original on one host) instead of being stuck with whichever
-        # single "database" happened to be saved on the profile. Left
-        # disabled/empty for sqlite, where the connection *is* a single
-        # database file (same distinction ConnectionPanel's own
-        # DbSwitcherDialog already makes).
+        # single "database" happened to be saved on the profile.
         self.source_db_combo = QComboBox()
         self.source_db_combo.setEnabled(False)
         self.target_db_combo = QComboBox()
@@ -483,7 +480,7 @@ class SchemaCompareDialog(QDialog):
         db_combo.clear()
         db_combo.setEnabled(False)
         config = self._resolve_config(conn_combo)
-        if config is None or config.get("type") == "sqlite":
+        if config is None:
             return
 
         sig = self._databases_loaded

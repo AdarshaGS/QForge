@@ -21,10 +21,23 @@ pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication, QDialog, QWidget
 
 import main as main_mod
+from services.db_service import DbService
 from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
 
 _app = QApplication.instance() or QApplication([])
+
+
+def _fake_connect(self, config):
+    """Stands in for DbService.connect() — sets exactly the state a real
+    connect() would (db_type/connection/connection_name/_config) without
+    touching a real socket, so this test (about focus/activate/raise call
+    sequencing, not connectivity) never depends on a live database."""
+    self.db_type = config.get("type", "mysql").lower()
+    self.connection = object()
+    self.connection_name = config["name"]
+    self._config = config
+    self.read_only = bool(config.get("read_only"))
 
 
 class _StubDialog(QDialog):
@@ -47,7 +60,7 @@ class _StubDialog(QDialog):
         return QDialog.Accepted
 
     def get_selected_connection(self):
-        return {"type": "sqlite", "name": "stub", "database": ":memory:"}
+        return {"type": "mysql", "name": "stub"}
 
 
 class _MainWindowStub(QWidget):
@@ -80,6 +93,7 @@ class _MainWindowStub(QWidget):
 
 def test_prompt_new_connection_reactivates_window_after_connecting(monkeypatch):
     monkeypatch.setattr(main_mod, "ConnectionDialog", _StubDialog)
+    monkeypatch.setattr(DbService, "connect", _fake_connect)
 
     win = _MainWindowStub()
     main_mod.MainWindow._prompt_new_connection(win, allow_cancel_quit=False)

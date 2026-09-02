@@ -191,7 +191,24 @@ def _fetch_side(config: dict, sql: str, order_columns: list, row_limit: int):
     try:
         wrapped = _wrap_query(sql, order_columns, db.db_type)
         max_rows = row_limit if row_limit and row_limit > 0 else None
-        df = db.execute_query(wrapped, max_rows=max_rows)
+        try:
+            df = db.execute_query(wrapped, max_rows=max_rows)
+        except Exception as ex:
+            # A bad key column surfaces here as an ORDER BY on a column that
+            # doesn't exist — both MySQL and PostgreSQL raise for that
+            # (unlike sqlite, which used to silently treat an unresolved
+            # quoted identifier as a string-literal no-op instead). Since
+            # order_columns is exactly the caller-chosen key columns, a
+            # query failure with them applied is presented as the same
+            # friendly ValueError build_data_diff's own post-fetch
+            # column-membership check raises for a key missing from just
+            # one side, rather than a raw driver exception.
+            if order_columns:
+                raise ValueError(
+                    f"Key column(s) {', '.join(order_columns)} could not be used to sort "
+                    f"'{config.get('database', '')}': {ex}"
+                ) from ex
+            raise
         truncated = bool(df.attrs.get("truncated"))
 
         columns = list(df.columns)

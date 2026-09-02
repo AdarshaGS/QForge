@@ -1,7 +1,6 @@
 import time
 import pymysql
 import pandas as pd
-import sqlite3
 from utils.logger import get_logger
 from utils import schema_cache
 from utils import perf_metrics
@@ -160,7 +159,7 @@ class DbService:
     def __init__(self):
         self.connection = None
         self.connection_name = None
-        self.db_type = None  # 'mysql', 'postgresql', 'sqlite'
+        self.db_type = None  # 'mysql', 'postgresql'
         self.ssh_tunnel = None  # SSH tunnel object
         self.read_only = False
         self.in_transaction = False
@@ -172,8 +171,7 @@ class DbService:
         utils/df_export._quote_identifier does for exported SQL (issue
         #114) — table/column names ultimately come from the connected
         database's own schema metadata, which a crafted or compromised
-        database can put anything into. SQLite accepts the same
-        double-quoted identifier syntax as PostgreSQL."""
+        database can put anything into."""
         return _quote_identifier(identifier, "mysql" if self.db_type == "mysql" else "postgresql")
 
     def _guard(self, sql: str):
@@ -195,11 +193,7 @@ class DbService:
         per-statement autocommit until commit_transaction()/
         rollback_transaction() is called. Dialect-specific: MySQL and
         PostgreSQL drivers autocommit by default (see connect()), so
-        starting a manual transaction means explicitly disabling that;
-        SQLite already opens an implicit transaction on the first write
-        under its default isolation level, so an explicit BEGIN just makes
-        that transaction start immediately (covering leading SELECTs too)
-        instead of on the first DML statement."""
+        starting a manual transaction means explicitly disabling that."""
         if not self.connection:
             raise TransactionError("No active database connection.")
         if self.in_transaction:
@@ -211,8 +205,6 @@ class DbService:
                 cur.execute("BEGIN")
         elif self.db_type == "postgresql":
             self.connection.autocommit = False
-        elif self.db_type == "sqlite":
-            self.connection.execute("BEGIN")
         else:
             raise TransactionError(f"Transactions are not supported for {self.db_type}")
 
@@ -236,10 +228,7 @@ class DbService:
 
     def _restore_autocommit(self):
         """Undo the autocommit=False set by begin_transaction() for
-        drivers that need it explicitly re-enabled (MySQL/PostgreSQL).
-        SQLite has no persistent autocommit flag to restore — its default
-        isolation level already re-opens an implicit transaction on the
-        next write and commits it via _execute_query_raw as before."""
+        drivers that need it explicitly re-enabled (MySQL/PostgreSQL)."""
         if self.db_type == "mysql":
             self.connection.autocommit(True)
         elif self.db_type == "postgresql":
@@ -260,8 +249,6 @@ class DbService:
             self._connect_mysql(config)
         elif db_type == "postgresql":
             self._connect_postgresql(config)
-        elif db_type == "sqlite":
-            self._connect_sqlite(config)
         else:
             raise Exception(f"Unsupported database type: {db_type}")
         perf_metrics.record("database", "db_connect", (time.perf_counter() - _connect_t0) * 1000)
@@ -415,26 +402,6 @@ class DbService:
         except ImportError:
             raise Exception("psycopg2 not installed. Run: pip install psycopg2-binary")
 
-    def _connect_sqlite(self, config):
-        """Connect to SQLite database"""
-        db_path = config.get("database", config.get("path", ""))
-        if not db_path:
-            raise Exception("SQLite database path is required")
-
-        # check_same_thread=False: DbService connections are routinely handed
-        # to a background QThread (_QueryWorker, _ExportWorker) after being
-        # opened on the main thread, and an export's producer thread hops
-        # once more — a single DbService is still only ever touched by one
-        # thread at a time, just not always the thread that opened it.
-        self.connection = sqlite3.connect(db_path, check_same_thread=False)
-        self.connection.row_factory = sqlite3.Row
-
-        if config.get("read_only"):
-            try:
-                self.connection.execute("PRAGMA query_only = ON")
-            except Exception as ex:
-                logger.warning(f"Failed to set SQLite query_only pragma: {ex}")
-    
     def _setup_ssh_tunnel(self, ssh_config, db_host, db_port):
         """Setup SSH tunnel and return local host/port"""
         try:
@@ -581,8 +548,8 @@ class DbService:
         logger.info("Reconnect successful")
 
     def select_db(self, database: str):
-        """Point the live connection at *database* (MySQL only — Postgres/
-        SQLite connections are bound to one database for their lifetime).
+        """Point the live connection at *database* (MySQL only — Postgres
+        connections are bound to one database for their lifetime).
         Callers use this instead of `self.connection.select_db(...)`
         directly because that bypasses the reconnect-on-drop retry
         execute_query() gets for free — a connection that went stale (idle
@@ -627,8 +594,7 @@ class DbService:
                 kc.close()
                 return True
             else:
-                # SQLite is always "connected" if we have a connection object
-                return self.connection is not None
+                return False
         except Exception:
             return False
 
@@ -763,12 +729,6 @@ class DbService:
                 rows = cursor.fetchall()
                 cursor.close()
                 return [{"column": r[0], "ref_table": r[1], "ref_column": r[2]} for r in rows]
-            elif self.db_type == "sqlite":
-                cursor = self.connection.cursor()
-                cursor.execute(f"PRAGMA foreign_key_list({self._q(table_name)})")
-                rows = cursor.fetchall()
-                cursor.close()
-                return [{"column": r[3], "ref_table": r[2], "ref_column": r[4]} for r in rows]
         except Exception:
             pass
         return []
@@ -797,13 +757,6 @@ class DbService:
                 rows = cursor.fetchall()
                 cursor.close()
                 return [r[0] for r in rows]
-            elif self.db_type == "sqlite":
-                cursor = self.connection.cursor()
-                cursor.execute(f"PRAGMA table_info({self._q(table_name)})")
-                rows = cursor.fetchall()
-                cursor.close()
-                pk_rows = sorted((r for r in rows if r[5] > 0), key=lambda r: r[5])
-                return [r[1] for r in pk_rows]
         except Exception:
             pass
         return []
@@ -858,14 +811,6 @@ class DbService:
                 rows = cursor.fetchall()
                 cursor.close()
                 return [r[0] for r in rows]
-            elif self.db_type == "sqlite":
-                # PRAGMA table_xinfo adds a `hidden` column PRAGMA table_info
-                # lacks: 2 = VIRTUAL generated, 3 = STORED generated.
-                cursor = self.connection.cursor()
-                cursor.execute(f"PRAGMA table_xinfo({self._q(table_name)})")
-                rows = cursor.fetchall()
-                cursor.close()
-                return [r[1] for r in rows if r[6] in (2, 3)]
         except Exception:
             pass
         return []
@@ -895,8 +840,8 @@ class DbService:
         via cursor.fetchmany() instead of execute_query()'s fetchall() —
         exports use this so memory and time-to-first-byte don't scale with
         table size (issue #158). `rows` is a list of plain tuples in column
-        order regardless of dialect (mysql's cursor yields dicts, sqlite
-        yields sqlite3.Row, postgres yields tuples already).
+        order regardless of dialect (mysql's cursor yields dicts, postgres
+        yields tuples already).
 
         Uses this DbService's own connection directly, with no reconnect
         logic — callers exporting in the background should pass a dedicated
@@ -954,24 +899,6 @@ class DbService:
                 cursor.close()
                 return pd.DataFrame([{"Query OK, rows affected": affected}])
 
-        elif self.db_type == "sqlite":
-            cursor = self.connection.cursor()
-            cursor.execute(query)
-            if cursor.description:
-                cols = [d[0] for d in cursor.description]
-                rows, truncated = self._fetch_rows(cursor, max_rows)
-                cursor.close()
-                data = [dict(row) for row in rows]
-                df = pd.DataFrame(data, columns=cols) if data else pd.DataFrame(columns=cols)
-                df.attrs["truncated"] = truncated
-                return df
-            else:
-                affected = cursor.rowcount
-                if not self.in_transaction:
-                    self.connection.commit()
-                cursor.close()
-                return pd.DataFrame([{"Query OK, rows affected": affected}])
-
         else:
             raise Exception(f"Unsupported database type: {self.db_type}")
 
@@ -1024,8 +951,7 @@ class DbService:
 
     def _execute_update_raw(self, query):
         """Internal: run DML without reconnect logic. The explicit commit()
-        is a no-op for MySQL/PostgreSQL under normal autocommit=True but is
-        what actually persists SQLite writes — skipped while a manual
+        is a no-op under normal autocommit=True — skipped while a manual
         transaction is open so a script's own COMMIT/ROLLBACK decides when
         these statements take effect instead of each one committing
         immediately, which would end the transaction after the first write."""
@@ -1086,9 +1012,6 @@ class DbService:
                 row = cursor.fetchone()
                 cursor.close()
                 return f"PostgreSQL {row[0]}"
-            elif self.db_type == "sqlite":
-                import sqlite3 as _sq
-                return f"SQLite {_sq.sqlite_version}"
         except Exception:
             pass
         return self.db_type.title() if self.db_type else ""
@@ -1111,17 +1034,7 @@ class DbService:
             """)
             result = cursor.fetchall()
             tables = [row[0] for row in result]
-        
-        elif self.db_type == "sqlite":
-            cursor = self.connection.cursor()
-            cursor.execute("""
-                SELECT name FROM sqlite_master 
-                WHERE type='table' AND name NOT LIKE 'sqlite_%'
-                ORDER BY name
-            """)
-            result = cursor.fetchall()
-            tables = [row[0] for row in result]
-        
+
         else:
             tables = []
         
@@ -1146,17 +1059,7 @@ class DbService:
             """)
             result = cursor.fetchall()
             views = [row[0] for row in result]
-        
-        elif self.db_type == "sqlite":
-            cursor = self.connection.cursor()
-            cursor.execute("""
-                SELECT name FROM sqlite_master 
-                WHERE type='view'
-                ORDER BY name
-            """)
-            result = cursor.fetchall()
-            views = [row[0] for row in result]
-        
+
         else:
             views = []
         
@@ -1184,16 +1087,39 @@ class DbService:
             """)
             result = cursor.fetchall()
             items = [row[0] for row in result]
-        
-        elif self.db_type == "sqlite":
-            # SQLite doesn't support stored procedures/functions
-            items = []
-        
+
         else:
             items = []
         
         items.sort() if items else None
         return items
+
+    def get_function_definition(self, name: str) -> str:
+        """Return the CREATE statement for a function/procedure *name*, for
+        display in a read-only viewer. MySQL's get_functions() merges
+        functions and procedures into one list, so SHOW CREATE FUNCTION is
+        tried first and SHOW CREATE PROCEDURE is the fallback."""
+        cursor = self.connection.cursor()
+        if self.db_type == "mysql":
+            try:
+                cursor.execute(f"SHOW CREATE FUNCTION {self._q(name)}")
+                row = cursor.fetchone()
+                return list(row.values())[2] + ";" if row else ""
+            except Exception:
+                cursor.execute(f"SHOW CREATE PROCEDURE {self._q(name)}")
+                row = cursor.fetchone()
+                return list(row.values())[2] + ";" if row else ""
+
+        elif self.db_type == "postgresql":
+            cursor.execute(
+                "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = %s LIMIT 1",
+                (name,),
+            )
+            row = cursor.fetchone()
+            return (row[0] + ";") if row and row[0] else ""
+
+        else:
+            return ""
 
     def get_columns(self, table_name):
         """Get columns for a table based on database type"""
@@ -1214,17 +1140,9 @@ class DbService:
             """, (table_name,))
             result = cursor.fetchall()
             # Convert to dict format similar to MySQL
-            return [{"Field": row[0], "Type": row[1], "Null": row[2], "Default": row[3]} 
+            return [{"Field": row[0], "Type": row[1], "Null": row[2], "Default": row[3]}
                     for row in result]
-        
-        elif self.db_type == "sqlite":
-            cursor = self.connection.cursor()
-            cursor.execute(f"PRAGMA table_info({self._q(table_name)})")
-            result = cursor.fetchall()
-            # Convert to dict format
-            return [{"Field": row[1], "Type": row[2], "Null": "YES" if not row[3] else "NO",
-                    "Default": row[4]} for row in result]
-        
+
         else:
             return []
 
@@ -1234,35 +1152,16 @@ class DbService:
         "Structure" means all three, not just the bare CREATE TABLE.
 
         MySQL's SHOW CREATE TABLE already inlines indexes/FKs, so it needs
-        nothing extra. SQLite stores each object's exact original DDL in
-        sqlite_master — CREATE TABLE inlines its own FKs, so only indexes
-        (skipping the implicit ones backing inline PK/UNIQUE, which have no
-        stored sql text) need appending. PostgreSQL has no single built-in
-        equivalent, so the table is reconstructed from information_schema
-        columns + the primary key, then indexes (excluding the PK's own
-        backing index) and FKs are appended — a reasonable approximation,
-        not a full pg_dump (no comments/non-FK constraints)."""
+        nothing extra. PostgreSQL has no single built-in equivalent, so the
+        table is reconstructed from information_schema columns + the
+        primary key, then indexes (excluding the PK's own backing index)
+        and FKs are appended — a reasonable approximation, not a full
+        pg_dump (no comments/non-FK constraints)."""
         cursor = self.connection.cursor()
         if self.db_type == "mysql":
             cursor.execute(f"SHOW CREATE TABLE {self._q(table_name)}")
             row = cursor.fetchone()
             return list(row.values())[1] + ";" if row else ""
-
-        elif self.db_type == "sqlite":
-            cursor.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
-                (table_name,),
-            )
-            row = cursor.fetchone()
-            if not row or not row[0]:
-                return ""
-            statements = [row[0] + ";"]
-            cursor.execute(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
-                (table_name,),
-            )
-            statements.extend(r[0] + ";" for r in cursor.fetchall())
-            return "\n".join(statements)
 
         elif self.db_type == "postgresql":
             cursor.execute(
@@ -1343,19 +1242,6 @@ class DbService:
                     result.setdefault(row[0], []).append(row[1])
                 return result
 
-            elif self.db_type == "sqlite":
-                cursor = self.connection.cursor()
-                cursor.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND name NOT LIKE 'sqlite_%'"
-                )
-                tables = [r[0] for r in cursor.fetchall()]
-                result = {}
-                for tbl in tables:
-                    cursor.execute(f"PRAGMA table_info({self._q(tbl)})")
-                    result[tbl] = [r[1] for r in cursor.fetchall()]
-                return result
-
         except Exception:
             pass
         return {}
@@ -1416,22 +1302,6 @@ class DbService:
                     })
                 return result
 
-            elif self.db_type == "sqlite":
-                cursor = self.connection.cursor()
-                cursor.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND name NOT LIKE 'sqlite_%'"
-                )
-                tables = [r[0] for r in cursor.fetchall()]
-                result = {}
-                for tbl in tables:
-                    cursor.execute(f"PRAGMA table_info({self._q(tbl)})")
-                    result[tbl] = [{
-                        "name": r[1], "type": r[2], "nullable": not r[3],
-                        "default": r[4], "key": "PRI" if r[5] > 0 else "",
-                    } for r in cursor.fetchall()]
-                return result
-
         except Exception:
             pass
         return {}
@@ -1481,22 +1351,6 @@ class DbService:
                         {"column": r[1], "ref_table": r[2], "ref_column": r[3]})
                 return result
 
-            elif self.db_type == "sqlite":
-                cursor = self.connection.cursor()
-                cursor.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND name NOT LIKE 'sqlite_%'"
-                )
-                tables = [r[0] for r in cursor.fetchall()]
-                result = {}
-                for tbl in tables:
-                    cursor.execute(f"PRAGMA foreign_key_list({self._q(tbl)})")
-                    fks = [{"column": r[3], "ref_table": r[2], "ref_column": r[4]}
-                           for r in cursor.fetchall()]
-                    if fks:
-                        result[tbl] = fks
-                return result
-
         except Exception:
             pass
         return {}
@@ -1509,9 +1363,7 @@ class DbService:
         """Other databases reachable on this already-open connection's host
         — used by database pickers (Schema Compare / Data Compare, issue
         feedback: a saved connection profile is host-level and one host can
-        hold several databases, so comparing by profile alone isn't enough).
-        Empty for sqlite, where the connection *is* a single database file,
-        so there's nothing to list."""
+        hold several databases, so comparing by profile alone isn't enough)."""
         if self.db_type == "mysql":
             cursor = self.connection.cursor()
             cursor.execute("SHOW DATABASES")
@@ -1610,22 +1462,6 @@ class DbService:
                 rows = cursor.fetchall()
                 cursor.close()
                 return [{"name": r[0], "unique": r[1], "type": r[2], "columns": r[3]} for r in rows]
-            elif self.db_type == "sqlite":
-                cursor = self.connection.cursor()
-                cursor.execute(f"PRAGMA index_list({self._q(table_name)})")
-                idx_list = cursor.fetchall()
-                indexes = []
-                for row in idx_list:
-                    row = dict(row) if hasattr(row, 'keys') else row
-                    idx_name = row[1] if isinstance(row, (list, tuple)) else row.get("name", "")
-                    unique = bool(row[2] if isinstance(row, (list, tuple)) else row.get("unique", 0))
-                    cursor.execute(f"PRAGMA index_info({self._q(idx_name)})")
-                    info_rows = [dict(r) if hasattr(r, 'keys') else r for r in cursor.fetchall()]
-                    cols = ", ".join(str(r[2] if isinstance(r, (list, tuple)) else r.get("name", ""))
-                                    for r in info_rows)
-                    indexes.append({"name": idx_name, "columns": cols, "unique": unique, "type": "BTREE"})
-                cursor.close()
-                return indexes
         except Exception:
             pass
         return []

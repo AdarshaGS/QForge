@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QFrame,
+    QStyledItemDelegate,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QBrush, QShortcut, QKeySequence, QCursor
@@ -115,6 +116,16 @@ class _SortHighlightHeader(QHeaderView):
         text = self.model().headerData(logical_index, Qt.Horizontal, Qt.DisplayRole)
         painter.drawText(rect.adjusted(8, 0, -8, 0), Qt.AlignVCenter | Qt.AlignLeft, str(text or ""))
         painter.restore()
+
+
+class _NoEditDelegate(QStyledItemDelegate):
+    """Blocks edit-mode outright — assigned to the filler rows/columns that
+    pad the grid out to fill the viewport (they have no backing data, so
+    letting a double-click start an edit there would silently fabricate a
+    phantom 'modified row' against a blank or out-of-range column)."""
+
+    def createEditor(self, parent, option, index):
+        return None
 
 
 # ── Undo/redo command stack (issue #124) ────────────────────────────────
@@ -322,6 +333,26 @@ class EditableTableWidget(QTableWidget):
         self._movable_before_freeze = None
         self._syncing_frozen_width = False
 
+        # Filler columns pad the grid horizontally to fill the viewport
+        # past the real data (like TablePlus/a spreadsheet) — non-editable
+        # via a per-column delegate rather than per-item flags, so blocking
+        # them costs O(columns shown), not O(cells), and stays correct
+        # across reloads with a different real column count (see the reset
+        # in _display_data_impl, since clear()/setColumnCount() don't clear
+        # per-column delegate assignments themselves). Rows are NOT padded
+        # the same way — row structure is mutated incrementally elsewhere
+        # (add/duplicate/delete/undo), and a per-row delegate assignment
+        # doesn't shift when QTableWidget.insertRow()/removeRow() does,
+        # so it would silently drift onto the wrong row.
+        self._default_delegate = self.itemDelegate()
+        self._no_edit_delegate = _NoEditDelegate(self)
+        self._filler_col_range = range(0, 0)
+        # Real (non-filler) column count for the currently displayed data —
+        # every place that must not see the filler columns (SQL generation,
+        # header-click sort, bulk edit, row duplication, clipboard copy)
+        # reads this instead of columnCount(). See real_column_count().
+        self._real_col_count = 0
+
         # Enable editing
         self.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
 
@@ -433,9 +464,9 @@ class EditableTableWidget(QTableWidget):
             # Light theme
             self.setStyleSheet("""
                 QTableWidget {
-                    gridline-color: #e0e0e3;
-                    background-color: #ffffff;
-                    alternate-background-color: #ffffff;
+                    gridline-color: #d4d4d7;
+                    background-color: #e8e8e8;
+                    alternate-background-color: #e8e8e8;
                     color: #1c1c1e;
                     selection-background-color: #d0e8ff;
                     selection-color: #1c1c1e;
@@ -445,15 +476,15 @@ class EditableTableWidget(QTableWidget):
                 QTableWidget::item {
                     padding: 1px 8px;
                     border: none;
-                    border-bottom: 1px solid #e8e8eb;
-                    border-right: 1px solid #e8e8eb;
+                    border-bottom: 1px solid #d8d8db;
+                    border-right: 1px solid #d8d8db;
                 }
                 QTableWidget::item:selected {
                     background: #d0e8ff;
                     color: #1c1c1e;
                 }
                 QHeaderView::section {
-                    background: #f4f4f6;
+                    background: #eeeeee;
                     color: #636366;
                     border: none;
                     border-right: 1px solid #dcdcdf;
@@ -463,7 +494,7 @@ class EditableTableWidget(QTableWidget):
                     font-weight: 600;
                     text-align: left;
                 }
-                QHeaderView::section:hover { background: #e8e8eb; color: #1c1c1e; }
+                QHeaderView::section:hover { background: #dcdcdf; color: #1c1c1e; }
                 QHeaderView::section:first { border-left: none; }
             """)
 
@@ -537,16 +568,43 @@ class EditableTableWidget(QTableWidget):
             self.itemChanged.connect(self.on_item_changed)
             return
         
-        # Show columns even for empty tables
-        self.setColumnCount(len(dataframe.columns))
+        # Reset delegates from whatever range was filler on the previous
+        # load — clear()/setColumnCount() don't clear per-column delegate
+        # assignments themselves, so a stale no-edit delegate on an index
+        # that's real data this time would otherwise silently block a
+        # legitimate edit.
+        for col in self._filler_col_range:
+            self.setItemDelegateForColumn(col, self._default_delegate)
+
+        real_cols = len(dataframe.columns)
+        self._real_col_count = real_cols
+        # Pad the grid with blank, non-editable filler columns past the
+        # real data so a narrow result set still fills the viewport width
+        # (like TablePlus/a spreadsheet) instead of leaving dead space to
+        # the right of the last column. Filler cells are left item-less
+        # (Qt still paints empty grid cells/gridlines for them) and the
+        # columns are blocked from ever entering edit mode via
+        # _NoEditDelegate, so this costs O(real cells), not O(total grid
+        # cells), regardless of row count.
+        total_cols = real_cols + self._EMPTY_PLACEHOLDER_COLUMNS
+
+        self.setColumnCount(total_cols)
         self.setHorizontalHeaderLabels([str(col) for col in dataframe.columns])
-        
+        for col in range(real_cols, total_cols):
+            # Otherwise QTableWidget falls back to a numbered label ("31",
+            # "32", ...) for header sections with no explicit item.
+            self.setHorizontalHeaderItem(col, QTableWidgetItem(""))
+
+        self._filler_col_range = range(real_cols, total_cols)
+        for col in self._filler_col_range:
+            self.setItemDelegateForColumn(col, self._no_edit_delegate)
+
         if dataframe.empty:
             # For empty tables, show column headers with placeholder rows
             # filling the grid (like TablePlus), not just a handful.
             self.setRowCount(self._EMPTY_PLACEHOLDER_ROWS)
             for row in range(self._EMPTY_PLACEHOLDER_ROWS):
-                for col in range(len(dataframe.columns)):
+                for col in range(real_cols):
                     item = QTableWidgetItem("")
                     self.setItem(row, col, item)
                     self._cell_snapshot[(row, col)] = ""
@@ -555,7 +613,7 @@ class EditableTableWidget(QTableWidget):
             self.setRowCount(len(dataframe))
 
             for row in range(len(dataframe)):
-                for col in range(len(dataframe.columns)):
+                for col in range(real_cols):
                     value = dataframe.iloc[row, col]
 
                     # pd.isna() on a non-scalar (a Postgres array-typed
@@ -594,6 +652,11 @@ class EditableTableWidget(QTableWidget):
             self._frozen_col_count = min(self._frozen_col_count, self.columnCount())
             self._apply_frozen_visibility()
             self._update_frozen_geometry()
+
+    def real_column_count(self) -> int:
+        """Number of real data columns — excludes the blank filler columns
+        appended to fill the viewport width (see _display_data_impl)."""
+        return self._real_col_count
 
     def _restore_dirty_highlights(self):
         """Re-apply colour to all rows that have a known dirty state.
@@ -751,11 +814,19 @@ class EditableTableWidget(QTableWidget):
     # window height; upgrade to a dynamic viewport-height calculation if a
     # pathologically tall window ever needs more (issue #26).
     _EMPTY_PLACEHOLDER_ROWS = 50
+    # Same reasoning, horizontally: a fixed count of default-width filler
+    # columns (below) rather than measuring the viewport. 30 * _COL_WIDTH_DEF
+    # (120px) = 3600px, comfortably past real column width for any
+    # realistic window — these are blocked from editing by _NoEditDelegate
+    # in _display_data_impl, so a generous count costs nothing per-row.
+    _EMPTY_PLACEHOLDER_COLUMNS = 30
 
     def _set_compact_column_widths(self, dataframe):
         """Set column widths: sample the first 50 rows to pick a sensible
         width, clamped to [_COL_WIDTH_MIN, _COL_WIDTH_MAX]. Does NOT
-        resize very-wide columns so long text values stay compact."""
+        resize very-wide columns so long text values stay compact. Filler
+        columns past the real data (see _display_data_impl) get the
+        default width so they still contribute to the max-width cap below."""
         from PySide6.QtGui import QFontMetrics
         from PySide6.QtWidgets import QApplication
         fm = QFontMetrics(QApplication.font())
@@ -779,6 +850,8 @@ class EditableTableWidget(QTableWidget):
             width = min(best, self._COL_WIDTH_MAX)
             width = max(width, self._COL_WIDTH_MIN)
             hdr.resizeSection(col_idx, width)
+        for col_idx in range(len(dataframe.columns), self.columnCount()):
+            hdr.resizeSection(col_idx, self._COL_WIDTH_DEF)
 
         # Cap the widget itself to the columns' total width (+ row header,
         # frame, scrollbar) so a few narrow columns don't stretch across the
@@ -1097,7 +1170,7 @@ class EditableTableWidget(QTableWidget):
     def add_new_row(self):
         """Add a new empty row"""
         row = self.rowCount()
-        values = [""] * self.columnCount()
+        values = [""] * self._real_col_count
         self._insert_row_with_values(row, values)
         self._push_history(_RowInsertCommand(row, values))
 
@@ -1140,13 +1213,13 @@ class EditableTableWidget(QTableWidget):
         if self.primary_key_columns:
             name_to_idx = {
                 self.horizontalHeaderItem(c).text().lower(): c
-                for c in range(self.columnCount())
+                for c in range(self._real_col_count)
             }
             idxs = [name_to_idx[name.lower()] for name in self.primary_key_columns
                     if name.lower() in name_to_idx]
             if idxs:
                 return idxs
-        return list(range(self.columnCount()))
+        return list(range(self._real_col_count))
 
     def get_changes(self):
         """
@@ -1216,7 +1289,7 @@ class EditableTableWidget(QTableWidget):
             columns = []
             values = []
             
-            for col in range(self.columnCount()):
+            for col in range(self._real_col_count):
                 col_name = self.horizontalHeaderItem(col).text()
                 item = self.item(row, col)
                 value = item.text()
@@ -1287,6 +1360,10 @@ class EditableTableWidget(QTableWidget):
     def on_header_clicked(self, col: int):
         """Sort the currently displayed data by the clicked column (client-side)."""
         if self.filtered_data is None or self.filtered_data.empty:
+            return
+        # A click on one of the blank filler columns past the real data
+        # (see _display_data_impl) — nothing to sort by.
+        if col >= self._real_col_count:
             return
 
         # Sorting while there are unsaved edits would corrupt the row-index
@@ -1491,7 +1568,11 @@ class EditableTableWidget(QTableWidget):
         longer matches display order at that point."""
         rows = sorted({item.row() for item in self.selectedItems()})
         hdr = self.horizontalHeader()
-        cols = [hdr.logicalIndex(v) for v in range(self.columnCount())]
+        # Filter by logical index (not just range-bounded) so a filler
+        # column dragged out of its natural trailing position still gets
+        # excluded, not just one sitting past real_col_count visually.
+        cols = [hdr.logicalIndex(v) for v in range(self.columnCount())
+                if hdr.logicalIndex(v) < self._real_col_count]
         headers = [self.horizontalHeaderItem(c).text()
                    if self.horizontalHeaderItem(c) else str(c) for c in cols]
         data = []
@@ -1661,7 +1742,7 @@ class EditableTableWidget(QTableWidget):
 
         source_row = current.row()
         values = [self.item(source_row, col).text() if self.item(source_row, col) else ""
-                  for col in range(self.columnCount())]
+                  for col in range(self._real_col_count)]
         row = source_row + 1
         self._insert_row_with_values(row, values)
         self._push_history(_RowInsertCommand(row, values))
@@ -1720,7 +1801,7 @@ class EditableTableWidget(QTableWidget):
         # never disturbed by an insertion made earlier in this same loop.
         for source_row in reversed(selected_rows):
             values = [self.item(source_row, col).text() if self.item(source_row, col) else ""
-                      for col in range(self.columnCount())]
+                      for col in range(self._real_col_count)]
             row = source_row + 1
             self._insert_row_with_values(row, values)
             self._push_history(_RowInsertCommand(row, values))
@@ -1750,7 +1831,7 @@ class EditableTableWidget(QTableWidget):
         col_layout = QHBoxLayout()
         col_layout.addWidget(QLabel("Column:"))
         column_combo = QComboBox()
-        for col in range(self.columnCount()):
+        for col in range(self._real_col_count):
             column_combo.addItem(self.horizontalHeaderItem(col).text())
         col_layout.addWidget(column_combo)
         layout.addLayout(col_layout)

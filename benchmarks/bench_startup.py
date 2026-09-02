@@ -1,9 +1,10 @@
 """Application startup benchmarks (issue #59).
 
 Constructs a real MainWindow under QT_QPA_PLATFORM=offscreen, with
-ConnectionDialog stubbed to a pre-accepted sqlite :memory: profile — same
-pattern proven in tests/test_main_window_focus_after_connect.py — so this
-runs unattended with no live database and no interactive prompt.
+ConnectionDialog stubbed to a pre-accepted profile and DbService.connect()
+stubbed to a no-op success — same pattern proven in
+tests/test_main_window_focus_after_connect.py — so this runs unattended
+with no live database and no interactive prompt.
 
 Every construction is isolated to a fresh temporary app-data directory
 (utils.paths.app_data_dir patched before `main` is first imported, since
@@ -52,8 +53,8 @@ def _make_noop_thread_stub():
 
 class _StubConnectionDialog:
     """Stands in for ui.connection_dialog.ConnectionDialog: a pre-accepted
-    dialog offering one sqlite :memory: profile, so MainWindow.__init__'s
-    blocking _prompt_new_connection() returns immediately."""
+    dialog offering one profile, so MainWindow.__init__'s blocking
+    _prompt_new_connection() returns immediately."""
 
     def __init__(self, auto_connect_last=False, parent=None):
         pass
@@ -63,7 +64,19 @@ class _StubConnectionDialog:
         return QDialog.Accepted
 
     def get_selected_connection(self):
-        return {"type": "sqlite", "name": "bench-startup", "database": ":memory:"}
+        return {"type": "mysql", "name": "bench-startup"}
+
+
+def _fake_connect(self, config):
+    """Stands in for DbService.connect() — sets exactly the state a real
+    connect() would (db_type/connection/connection_name/_config) without
+    touching a real socket, so this benchmark never depends on a live
+    database (same pattern as tests/test_main_window_focus_after_connect.py)."""
+    self.db_type = config.get("type", "mysql").lower()
+    self.connection = object()
+    self.connection_name = config["name"]
+    self._config = config
+    self.read_only = bool(config.get("read_only"))
 
 
 def _construct_one_main_window(main_mod) -> None:
@@ -90,19 +103,26 @@ def benchmarks() -> list:
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch("utils.paths.app_data_dir", return_value=Path(tmpdir)):
             import main as main_mod
+            from services.db_service import DbService
 
             noop_thread_cls = _make_noop_thread_stub()
             main_mod.ConnectionDialog = _StubConnectionDialog
             main_mod.UpdateChecker = noop_thread_cls
             main_mod.EntitlementConfigFetcher = noop_thread_cls
 
-            for _ in range(_REPS):
-                perf_metrics.reset()
-                _construct_one_main_window(main_mod)
-                snap = perf_metrics.snapshot().get("startup", {})
-                for stage in _STAGES:
-                    if stage in snap:
-                        stage_samples[stage].append(snap[stage]["last"])
+            # Scoped (not a bare assignment) so DbService.connect reverts to
+            # the real implementation once this benchmark is done — a
+            # process-wide patch left in place would silently break any
+            # bench_*.py module that runs after this one in the same
+            # process (see benchmarks/run.py's MODULES list).
+            with mock.patch.object(DbService, "connect", _fake_connect):
+                for _ in range(_REPS):
+                    perf_metrics.reset()
+                    _construct_one_main_window(main_mod)
+                    snap = perf_metrics.snapshot().get("startup", {})
+                    for stage in _STAGES:
+                        if stage in snap:
+                            stage_samples[stage].append(snap[stage]["last"])
 
     results = []
     for stage, samples in stage_samples.items():

@@ -20,9 +20,9 @@ _Last updated: 2026-08-18._
 
 | Item | Status |
 |---|---|
-| What QForge is | **Done** — desktop SQL client for MySQL, PostgreSQL, SQLite. macOS-first (direct DMG, not Mac App Store — sandboxing would break SSH tunneling and Keychain access); Windows/Linux planned, not yet verified-supported. |
+| What QForge is | **Done** — desktop SQL client for MySQL, PostgreSQL. macOS-first (direct DMG, not Mac App Store — sandboxing would break SSH tunneling and Keychain access); Windows/Linux planned, not yet verified-supported. |
 | Target users | Developers, data analysts — confirmed by the feature set (SQL editor, schema browser, ER diagrams, schema compare, query diff/verifier). |
-| V1 scope | **Done** — MySQL (`pymysql`), PostgreSQL (`psycopg2`), SQLite (stdlib), all with SSH tunnel support except SQLite. |
+| V1 scope | **Done** — MySQL (`pymysql`), PostgreSQL (`psycopg2`), both with SSH tunnel support. SQLite (stdlib) was supported at one point and has since been removed. |
 | Core value | **Draft**, needs your validation: *"A native TablePlus/Postico-class SQL client at about half the price, with schema-compare and a query-diff/verifier that most competitors in this tier charge extra for or don't offer at all."* This is synthesized from your feature list + pricing stance — say if it's off. |
 
 ## 2. UX
@@ -191,17 +191,18 @@ Remaining, per `LAUNCH_PLAN.md`'s own estimate:
 
 - **Architecture** — **Done**, layered `services/` / `ui/` / `utils/` app on PySide6.
 - **Testing** — this is further along than "dev testing happening": a real
-  pytest suite (217+ tests referenced in the latest session, including live
-  Postgres and SQLite integration tests that auto-skip if unreachable) runs
-  in CI on every push/PR, plus `bandit` static security analysis. Worth
-  updating your own mental model here — it's an automated suite, not manual spot-checks.
+  pytest suite (hundreds of tests, including live Postgres integration
+  tests that auto-skip if no local server is reachable) runs in CI on
+  every push/PR (CI now starts a Postgres service container so those
+  suites run for real, not just skip), plus `bandit` static security
+  analysis. Worth updating your own mental model here — it's an automated
+  suite, not manual spot-checks.
 - **CI/CD** — **Done**: `tests.yml` (pytest + bandit on push/PR) and
   `build-release.yml` (tag-triggered build → sign → DMG → GitHub Release →
   Homebrew tap bump).
 - **Compatibility** — checklist to define explicitly:
   - Minimum macOS version + Apple Silicon vs. Intel (confirm whether the current build is universal or arch-specific)
   - MySQL major versions (5.7 / 8.0 / 8.4) and Postgres major versions (12–17) your drivers are actually tested against
-  - SQLite bundled-version behavior across OS Python builds
   - PySide6/Python upgrade path (pin vs. float)
   - Windows/Linux parity — explicitly out of scope until the CI comment's stated blockers are resolved
 

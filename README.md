@@ -1,17 +1,17 @@
 # QForge
 
-QForge is a desktop SQL client for exploring and working with **MySQL**,
-**PostgreSQL**, and **SQLite** databases. Built with Python and PySide6, it
-combines a SQL editor, schema browser, editable data grids, connection
-profiles, and query-analysis tools in a focused native interface.
+QForge is a desktop SQL client for exploring and working with **MySQL** and
+**PostgreSQL** databases. Built with Python and PySide6, it combines a SQL
+editor, schema browser, editable data grids, connection profiles, and
+query-analysis tools in a focused native interface.
 
 It is currently macOS-oriented: the included build script produces a macOS
 app and user settings are stored under `~/Library/Application Support/QForge`.
 
 ## What you can do
 
-- Connect to MySQL, PostgreSQL, and SQLite; keep several database connections
-  open at once in separate top-level tabs.
+- Connect to MySQL and PostgreSQL; keep several database connections open at
+  once in separate top-level tabs.
 - Connect to MySQL or PostgreSQL through an SSH tunnel using a password or
   private key.
 - Save, group, search, reorder, test, and reconnect connection profiles.
@@ -37,7 +37,7 @@ app and user settings are stored under `~/Library/Application Support/QForge`.
 ## Free vs. Pro
 
 QForge Free covers everyday database work with no license required and no
-internet connection needed: MySQL/PostgreSQL/SQLite connections, the SQL
+internet connection needed: MySQL/PostgreSQL connections, the SQL
 editor and result grid, the schema explorer, and a basic ER diagram, each
 capped at a sensible limit —
 
@@ -68,7 +68,7 @@ blocking the app.
 ### Prerequisites
 
 - Python 3
-- Access to a MySQL, PostgreSQL, or SQLite database
+- Access to a MySQL or PostgreSQL database
 - `pip`
 
 ### Install and run
@@ -94,9 +94,6 @@ python main.py
 
 On first launch, create a connection profile in the Connection Manager, test
 it if desired, then select **Connect**.
-
-For SQLite, choose **SQLite** and provide the database file path. Host, port,
-username, and password are not required.
 
 ## Core workflows
 
@@ -127,7 +124,7 @@ routine mutates data.
 
 Where the driver supports it, QForge also asks the database itself for a
 read-only session (`SET SESSION TRANSACTION READ ONLY` on MySQL, a read-only
-session on PostgreSQL, `PRAGMA query_only` on SQLite) as a second layer. This
+session on PostgreSQL) as a second layer. This
 client-side checking is a convenience, not a security boundary — database
 permissions are what actually protect a database, and Read-only is not a
 substitute for a real read-only database user.
@@ -276,7 +273,6 @@ depending on the system key mapping.
 | --- | --- | --- |
 | MySQL | `pymysql` | Yes |
 | PostgreSQL | `psycopg2-binary` | Yes |
-| SQLite | Python standard library | Not applicable |
 
 ## Local data and credentials
 

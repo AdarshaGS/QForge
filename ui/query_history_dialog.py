@@ -96,13 +96,16 @@ class QueryHistoryDialog(QDialog):
             connection = entry["connection"]
             rows = entry.get("rows", 0)
             time = entry.get("execution_time", 0)
-            
+            cost_label = entry.get("cost_label")
+            cost_score = entry.get("cost_score")
+            cost_suffix = f" | cost: {cost_score} ({cost_label})" if cost_label else ""
+
             # Truncate query for display
             query_preview = entry["query"].replace("\n", " ")[:80]
             if len(entry["query"]) > 80:
                 query_preview += "..."
-            
-            display_text = f"{timestamp} | {connection} | {rows} rows | {time:.2f}s\n{query_preview}"
+
+            display_text = f"{timestamp} | {connection} | {rows} rows | {time:.2f}s{cost_suffix}\n{query_preview}"
             
             item = QListWidgetItem(display_text)
             item.setData(Qt.UserRole, entry)

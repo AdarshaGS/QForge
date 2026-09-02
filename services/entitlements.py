@@ -42,7 +42,6 @@ class Limit(Enum):
 class Feature(Enum):
     SCHEMA_COMPARE = "schema_compare"
     ADVANCED_ERD = "advanced_erd"
-    QUERY_VERIFIER = "query_verifier"
     DATA_COMPARE = "data_compare"
 
 

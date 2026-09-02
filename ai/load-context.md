@@ -7,7 +7,7 @@ item below.
 
 ## Project at a glance
 
-QForge is a PySide6 desktop SQL client for MySQL, PostgreSQL, and SQLite. Its
+QForge is a PySide6 desktop SQL client for MySQL and PostgreSQL. Its
 main capabilities include connection profiles (including SSH tunnels), a schema
 browser, SQL editor and completion, tabbed results, table-data editing,
 imports/exports, SQL snippets, query history, query comparison, and a macOS
@@ -32,7 +32,7 @@ frustrating.
 
 ## Current behaviour to preserve
 
-- Supports MySQL, PostgreSQL, and SQLite.
+- Supports MySQL and PostgreSQL.
 - A query can be selected text, the statement at the cursor, or editor text.
 - Multi-statement SQL is split with `sqlparse` and each statement is run.
 - Result editing can generate data-changing statements; users can commit or
@@ -95,9 +95,8 @@ from the current connection or query session. Make transaction state highly
 visible and avoid silently committing a group of changes.
 
 Before changing existing execution behaviour, understand that current MySQL
-and PostgreSQL connections use autocommit and SQLite commits after non-result
-statements. A design must preserve today’s normal workflow or provide a clear,
-tested migration.
+and PostgreSQL connections use autocommit. A design must preserve today’s
+normal workflow or provide a clear, tested migration.
 
 ### 5. Query limits, timeout, and cancellation
 

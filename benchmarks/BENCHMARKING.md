@@ -22,8 +22,8 @@ A single module can also be run directly, e.g. `python -m benchmarks.bench_db_se
 
 `<component>.<operation>[_<variant>]`, all lowercase, dot-separated:
 
-- `db_connect.sqlite` — connection establishment, sqlite variant
-- `query_execute.sqlite_select_10k` — query execution, 10k-row select variant
+- `db_connect.postgresql` — connection establishment, PostgreSQL variant
+- `query_execute.postgresql_select_10k` — query execution, 10k-row select variant
 - `startup.window_created` — one stage of application startup
 
 Keep the component prefix stable across variants of the same operation so
@@ -84,21 +84,33 @@ after `python -m benchmarks.run` and looking at `delta_pct`.
 
 ## Scope: which database backends
 
-Only `sqlite` is benchmarked in the default, unattended suite — it needs no
-live server, so it's the only backend that can run offline/in CI. MySQL,
-PostgreSQL, and SSH-tunnel variants need a reachable server and are
-deliberately out of scope here; add an opt-in, separately-invoked module for
-those if/when a benchmark server becomes available (same reasoning already
-documented in `bench_db_service.py`).
+`bench_db_service.py` and `bench_connection_switching.py` run against a
+local PostgreSQL server at `qforge_test@localhost:5432` (see
+`benchmarks/_pg_fixture.py` — same convention `tests/test_db_service_postgresql.py`
+and `tests/test_query_cost.py` already use). Both check reachability first
+and print a one-line skip message instead of crashing when that server
+isn't running, so `python -m benchmarks.run` still completes cleanly
+without it — just with fewer results. MySQL/SSH-tunnel variants need the
+same treatment once a standard local-server convention exists for them
+too. (Before sqlite support was removed from the app, these two modules
+ran against a throwaway sqlite file instead, purely because it needed no
+live server — not for any dialect-specific reason.)
+
+`bench_startup.py` needs no live database at all: `DbService.connect()` is
+stubbed to a no-op success (scoped with `mock.patch.object`, so it reverts
+before any other module in `benchmarks/run.py`'s `MODULES` list runs), since
+this benchmark measures pure window/UI construction time, not connection
+behavior.
 
 ## Modules
 
-- `bench_db_service.py` — sqlite connection establishment, query execution.
+- `bench_db_service.py` — PostgreSQL connection establishment, query execution.
 - `bench_startup.py` — application startup stages (issue #59): app init,
   main window construction, connection-manager-ready, UI-interactive. Built
   under `QT_QPA_PLATFORM=offscreen` with a stubbed, pre-accepted connection
-  dialog (same pattern as `tests/test_main_window_focus_after_connect.py`)
-  so it runs unattended with no live DB or real user interaction.
+  dialog and a stubbed `DbService.connect()` (same pattern as
+  `tests/test_main_window_focus_after_connect.py`) so it runs unattended
+  with no live DB or real user interaction.
 - `bench_connection_switching.py` — connection/database switching and
-  `ConnectionPanel` construction time (issue #60), sqlite-only for the same
-  reason as `bench_db_service.py`.
+  `ConnectionPanel` construction time (issue #60), against PostgreSQL for
+  the same reason as `bench_db_service.py`.

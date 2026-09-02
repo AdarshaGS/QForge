@@ -27,7 +27,6 @@ def test_free_bundled_defaults(tmp_path, monkeypatch):
     assert ent.limit(Limit.ER_DIAGRAM_TABLES) == 10
     assert ent.is_enabled(Feature.SCHEMA_COMPARE) is False
     assert ent.is_enabled(Feature.ADVANCED_ERD) is False
-    assert ent.is_enabled(Feature.QUERY_VERIFIER) is False
     assert ent.is_enabled(Feature.DATA_COMPARE) is False
 
 
@@ -44,7 +43,6 @@ def test_pro_bundled_defaults(tmp_path, monkeypatch):
     assert ent.limit(Limit.QUERY_HISTORY) == 100
     assert ent.is_enabled(Feature.SCHEMA_COMPARE) is True
     assert ent.is_enabled(Feature.ADVANCED_ERD) is True
-    assert ent.is_enabled(Feature.QUERY_VERIFIER) is True
     assert ent.is_enabled(Feature.DATA_COMPARE) is True
 
 

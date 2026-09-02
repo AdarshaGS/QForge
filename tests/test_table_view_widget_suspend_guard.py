@@ -31,7 +31,7 @@ def _pump_until_loaded(w, timeout_ms=5000):
 
 
 class _FakeDbService:
-    db_type = "sqlite"
+    db_type = "mysql"
 
     def __init__(self, rows):
         self._rows = rows

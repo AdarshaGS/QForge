@@ -1,7 +1,8 @@
 """Integration tests for services/db_service.py's PostgreSQL path.
 
-Runs against a real local Postgres (mirrors tests/test_db_service_sqlite.py's
-"real engine, not mocks" approach) — connects as the `qforge_test` role
+Runs against a real local Postgres ("real engine, not mocks", same
+approach the rest of this test suite's live-DB fixtures use) — connects
+as the `qforge_test` role
 against a fresh, uniquely-named database per test (see the `pg_database`
 fixture) so tests can't see each other's state. A fresh *database* rather
 than a fresh schema, specifically because DbService hardcodes
@@ -51,7 +52,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 def pg_database():
     """A fresh, uniquely-named database — created before the test, dropped
-    after. Mirrors the SQLite suite's fresh tmp_path file per test."""
+    after, so tests can't see each other's state."""
     name = f"qforge_test_{uuid.uuid4().hex[:12]}"
     admin = psycopg2.connect(connect_timeout=5, **_ADMIN_PARAMS)
     admin.autocommit = True
@@ -374,10 +375,9 @@ def test_begin_rollback_discards_change(db, pg_database):
 
 
 def test_uncommitted_change_is_invisible_to_another_connection(db, pg_database):
-    """The Postgres-specific case the SQLite suite can't exercise: with a
-    real second connection over the network (not just another handle to
-    the same file), a manual transaction's writes must stay invisible
-    until commit — proving isolation, not just that commit() was called."""
+    """With a real second connection over the network, a manual
+    transaction's writes must stay invisible until commit — proving
+    isolation, not just that commit() was called."""
     db.begin_transaction()
     db.execute_update("UPDATE users SET name = 'Carol' WHERE id = 1")
 

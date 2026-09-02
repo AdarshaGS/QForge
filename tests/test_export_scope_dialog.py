@@ -123,19 +123,15 @@ def test_auto_increment_and_strip_generated_default_on_mysql():
     assert dlg._strip_generated_cb.isEnabled()
 
 
-def test_auto_increment_disabled_on_postgresql_and_sqlite():
-    for dialect in ("postgresql", "sqlite"):
-        dlg = ExportScopeDialog(["users"], dialect=dialect)
-        assert not dlg._auto_increment_cb.isEnabled()
-        assert dlg.include_auto_increment() is False
+def test_auto_increment_disabled_on_postgresql():
+    dlg = ExportScopeDialog(["users"], dialect="postgresql")
+    assert not dlg._auto_increment_cb.isEnabled()
+    assert dlg.include_auto_increment() is False
 
 
-def test_strip_generated_disabled_only_on_postgresql():
+def test_strip_generated_disabled_on_postgresql():
     dlg = ExportScopeDialog(["users"], dialect="postgresql")
     assert not dlg._strip_generated_cb.isEnabled()
-
-    dlg = ExportScopeDialog(["users"], dialect="sqlite")
-    assert dlg._strip_generated_cb.isEnabled()
 
 
 def test_auto_increment_and_strip_generated_disabled_outside_sql_tab():

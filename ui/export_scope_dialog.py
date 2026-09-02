@@ -49,11 +49,11 @@ class ExportScopeDialog(QDialog):
     #39). Reused by both ConnectionPanel.export_database() and
     ._export_table() — for a single table the grid still shows one row.
 
-    *dialect* ('mysql' | 'postgresql' | 'sqlite') disables the two
-    dialect-limited toggles — "include auto-increment value" only means
-    anything on MySQL's DDL text, "exclude generated columns from CREATE
-    TABLE" only on MySQL/SQLite, whose DDL text can actually contain a
-    GENERATED clause to strip (issue #160)."""
+    *dialect* ('mysql' | 'postgresql') disables the two dialect-limited
+    toggles — "include auto-increment value" only means anything on
+    MySQL's DDL text, "exclude generated columns from CREATE TABLE" only
+    on MySQL, whose DDL text can actually contain a GENERATED clause to
+    strip (issue #160)."""
 
     def __init__(self, tables: list[str], dialect: str = "mysql", parent=None):
         super().__init__(parent)
@@ -63,7 +63,7 @@ class ExportScopeDialog(QDialog):
         self._dialect = dialect
         self._dialect_supports = {
             "auto_increment": dialect == "mysql",
-            "strip_generated": dialect in ("mysql", "sqlite"),
+            "strip_generated": dialect == "mysql",
         }
 
         self._table_checks: dict[str, dict[str, QCheckBox]] = {}
@@ -292,7 +292,7 @@ class ExportScopeDialog(QDialog):
     def include_auto_increment(self) -> bool:
         """False strips MySQL's `AUTO_INCREMENT=N` clause from the exported
         DDL text (issue #160) — a no-op the dialog never surfaces on
-        Postgres/SQLite, which have no such clause in the first place."""
+        Postgres, which has no such clause in the first place."""
         return self._auto_increment_cb.isChecked()
 
     def strip_generated_columns(self) -> bool:

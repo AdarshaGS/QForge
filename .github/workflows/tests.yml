@@ -8,6 +8,27 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    # A growing share of the suite (schema diff/migration, data diff, ERD,
+    # export worker, generated columns, stream_table_rows, schema snapshot,
+    # schema cache invalidation, query cost) runs against a real Postgres
+    # server instead of the sqlite fixture these used before sqlite support
+    # was removed from the app — those suites already self-skip when no
+    # server matching these credentials is reachable, so without this
+    # service they'd silently stop running in CI rather than fail loudly.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: qforge_test
+          POSTGRES_PASSWORD: qforge_test_pw
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 

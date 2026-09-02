@@ -58,8 +58,8 @@ _TOKEN_RE = re.compile(r"\{(seq|seq0|uuid|random_int)(?::(-?\d+)-(-?\d+))?\}")
 
 
 def _type_bucket(sql_type: str) -> str:
-    """Normalize a raw `get_columns()` `Type` string (MySQL/Postgres/SQLite
-    spellings all differ) into a small set of buckets `infer_generator` and
+    """Normalize a raw `get_columns()` `Type` string (MySQL/Postgres
+    spellings differ) into a small set of buckets `infer_generator` and
     the numeric/date generators key off. Order matters: datetime/timestamp
     must be checked before the bare "date" prefix check."""
     t = (sql_type or "").lower()

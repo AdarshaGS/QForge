@@ -26,6 +26,19 @@ from utils.logger import get_logger
 
 logger = get_logger()
 
+# Display/comparison stand-in for NULL cells once a column is cast to str
+# (see _stringify_for_diff() below). Bracket-wrapped so it reads clearly in
+# the diff table and is very unlikely to collide with real data, unlike
+# bare "NULL" which could be an actual stored string.
+_NULL_TOKEN = "⟨NULL⟩"  # nosec B105
+
+
+def _stringify_for_diff(v):
+    """Per-cell str() used to build the diff/sort key — BLOB-safe (no numpy
+    astype) and NULL-safe (NaN/NaT become _NULL_TOKEN instead of the
+    literal string "nan", which could otherwise collide with real data)."""
+    return _NULL_TOKEN if pd.isna(v) else str(v)
+
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
 
@@ -171,8 +184,15 @@ class QueryVerifier:
             result._diff_cols = common_cols
 
             if common_cols and (len(df_orig) > 0 or len(df_opt) > 0):
-                str_orig = df_orig[common_cols].map(str).copy()
-                str_opt  = df_opt[common_cols].map(str).copy()
+                # astype(str) chokes on BLOB/bytes cells and does not
+                # stringify NaN/NaT — it leaves the raw float/NaT in place
+                # (pandas' missing-value convention), which would otherwise
+                # make two NULLs compare unequal (NaN != NaN). map() with an
+                # explicit per-element str() is BLOB-safe (issue: BLOB column
+                # crashes) and lets us swap NaN for a real, comparable
+                # sentinel instead of the literal string "nan".
+                str_orig = df_orig[common_cols].map(_stringify_for_diff).copy()
+                str_opt  = df_opt[common_cols].map(_stringify_for_diff).copy()
 
                 # Sort both frames identically → ORDER-BY agnostic
                 str_orig_s = str_orig.sort_values(common_cols).reset_index(drop=True)

@@ -98,14 +98,6 @@ def _alter_table_sql(table_diff, db_type: str) -> list:
             stmts.append(f"ALTER TABLE {t} ADD COLUMN {c} {_column_def_sql(col.source)};")
         elif col.change == "added":  # present in target only -> drop from target
             stmts.append(f"ALTER TABLE {t} DROP COLUMN {c};")
-        elif db_type == "sqlite":
-            # ponytail: SQLite's ALTER TABLE can't change a column's type,
-            # nullability, or default — flagging for manual review instead
-            # of emitting DDL that would fail. Upgrade path: rebuild-and-copy
-            # (CREATE new table, INSERT...SELECT, DROP old, RENAME) if this
-            # comes up often enough to be worth automating.
-            stmts.append(f"-- {table_diff.name}.{col.name}: column changes aren't supported by "
-                          f"SQLite's ALTER TABLE; recreate the table manually.")
         elif db_type == "mysql":
             stmts.append(f"ALTER TABLE {t} MODIFY COLUMN {c} {_column_def_sql(col.source)};")
         else:  # postgresql — type/null each need their own ALTER COLUMN clause
@@ -117,10 +109,9 @@ def _alter_table_sql(table_diff, db_type: str) -> list:
         stmts.extend(_index_sql(table_diff.name, idx, db_type))
 
     if table_diff.foreign_keys:
-        # ponytail: get_foreign_keys() doesn't carry constraint names (sqlite's
-        # PRAGMA doesn't even have one), so a changed FK can't be DROP'd by
-        # name. Upgrade path: track constraint names for mysql/postgres if
-        # generating FK DDL becomes a real ask.
+        # ponytail: get_foreign_keys() doesn't carry constraint names, so a
+        # changed FK can't be DROP'd by name. Upgrade path: track constraint
+        # names for mysql/postgres if generating FK DDL becomes a real ask.
         stmts.append(f"-- {table_diff.name}: {len(table_diff.foreign_keys)} foreign key change(s) "
                       f"require manual review (constraint names aren't tracked).")
 

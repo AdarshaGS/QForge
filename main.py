@@ -51,9 +51,7 @@ def _is_remote_connection(config: dict) -> bool:
     """True for connections where establishing db_service.connect() is slow
     enough (SSH tunnel setup, WAN round-trip) that blocking the UI behind a
     modal "Connecting…" dialog is actually felt — as opposed to local MySQL/
-    Postgres/SQLite, which connect in well under human-perceptible time."""
-    if config.get("type") == "sqlite":
-        return False
+    Postgres, which connect in well under human-perceptible time."""
     if config.get("ssh_tunnel", {}).get("enabled"):
         return True
     return config.get("host", "") not in _LOOPBACK_HOSTS
@@ -494,7 +492,7 @@ class MainWindow(QMainWindow):
             # db_service.connect() (TCP + auth + SSH tunnel, the actual
             # source of the lag) runs on a background thread inside the
             # panel itself instead (ConnectionPanel._connect_in_background).
-            # Local MySQL/Postgres/SQLite connect fast enough that this
+            # Local MySQL/Postgres connect fast enough that this
             # wouldn't be felt, so they keep the simpler blocking path.
             optimistic = (
                 _is_remote_connection(config)
@@ -900,6 +898,11 @@ class MainWindow(QMainWindow):
         self.data_compare_action = db_menu.addAction("Compare Data…")
         self.data_compare_action.triggered.connect(
             lambda: self._current_panel() and self._current_panel().open_data_compare()
+        )
+
+        act = db_menu.addAction("Analyze Query…")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().open_query_analyzer()
         )
 
         db_menu.addSeparator()

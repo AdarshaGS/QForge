@@ -29,6 +29,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from services.query_cost import (
+    Issue,
+    SEVERITY_SCORE,
+    analyze_explain_rows,
+    analyze_sql_text,
+    score_issues,
+)
+
 # ---------------------------------------------------------------------------
 # Optional SSH tunnel — same logic as db_service.py
 # ---------------------------------------------------------------------------
@@ -49,17 +57,9 @@ except ImportError:
 # ===========================================================================
 # Data structures
 # ===========================================================================
-
-@dataclass
-class Issue:
-    severity: str          # CRITICAL | HIGH | MEDIUM | LOW | INFO
-    code: str              # short machine-readable tag
-    message: str           # human-readable explanation
-    suggestion: str        # what to do about it
-
-
-SEVERITY_SCORE = {"CRITICAL": 100, "HIGH": 50, "MEDIUM": 20, "LOW": 5, "INFO": 1}
-
+# Issue / SEVERITY_SCORE live in services/query_cost.py — imported above —
+# so the CLI, the SQL editor's status-bar cost badge, and the Analyze Query
+# dialog all share one rule engine.
 
 @dataclass
 class QueryResult:
@@ -196,212 +196,6 @@ def run_explain_analyze(conn, sql: str) -> tuple[str, float]:
             return tree, total_ms
     except Exception:
         return "", 0.0
-
-
-# ===========================================================================
-# Issue detection
-# ===========================================================================
-
-def _int(val) -> int:
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return 0
-
-
-def analyze_explain_rows(rows: list[dict], sql: str) -> list[Issue]:
-    issues: list[Issue] = []
-    total_rows_examined = 0
-
-    for row in rows:
-        select_type = str(row.get("select_type", "")).upper()
-        tbl         = row.get("table", "?")
-        typ         = str(row.get("type", "")).lower()
-        possible    = row.get("possible_keys")
-        used_key    = row.get("key")
-        extra       = str(row.get("Extra") or "").lower()
-        est_rows    = _int(row.get("rows", 0))
-        filtered    = float(row.get("filtered") or 100)
-        total_rows_examined += est_rows
-
-        # ---- Full table scan ------------------------------------------------
-        if typ == "all":
-            issues.append(Issue(
-                severity="CRITICAL",
-                code="FULL_TABLE_SCAN",
-                message=f"Table `{tbl}` uses a full scan ({est_rows:,} estimated rows). "
-                        f"Type=ALL, key={used_key}.",
-                suggestion=(
-                    f"Add an index on the column(s) used in the WHERE / JOIN condition "
-                    f"for `{tbl}`.  If this is the driving table filtered by a status "
-                    f"column, e.g. `ALTER TABLE {tbl} ADD INDEX idx_status (loan_status_id);`"
-                ),
-            ))
-
-        # ---- No index available ---------------------------------------------
-        elif typ not in ("eq_ref", "ref", "range", "index", "const", "system") \
-                and possible is None and tbl != "<derived>":
-            issues.append(Issue(
-                severity="HIGH",
-                code="NO_POSSIBLE_KEYS",
-                message=f"Table `{tbl}` has no possible indexes (type={typ}, "
-                        f"possible_keys=NULL, rows≈{est_rows:,}).",
-                suggestion=f"Inspect the JOIN / WHERE predicates touching `{tbl}` "
-                           f"and create a covering index.",
-            ))
-
-        # ---- Correlated / dependent subquery --------------------------------
-        if "DEPENDENT" in select_type:
-            issues.append(Issue(
-                severity="HIGH",
-                code="DEPENDENT_SUBQUERY",
-                message=f"Select #{row.get('id')} on `{tbl}` is a DEPENDENT_SUBQUERY — "
-                        f"runs once per outer row (~{est_rows:,} rows each pass).",
-                suggestion="Refactor into a JOIN, LEFT JOIN, or a WITH (CTE) that is "
-                           "executed once and then joined back to the main query.",
-            ))
-
-        # ---- Filesort -------------------------------------------------------
-        if "filesort" in extra:
-            issues.append(Issue(
-                severity="MEDIUM",
-                code="FILESORT",
-                message=f"Table `{tbl}` requires a filesort (ORDER BY cannot use an index).",
-                suggestion="Add a composite index that covers the ORDER BY columns "
-                           "(and optionally the WHERE columns) for `{tbl}`.",
-            ))
-
-        # ---- Temporary table ------------------------------------------------
-        if "temporary" in extra:
-            issues.append(Issue(
-                severity="MEDIUM",
-                code="TEMP_TABLE",
-                message=f"Query creates a temporary table (table=`{tbl}`, select_type={select_type}).",
-                suggestion="Rewrite GROUP BY / DISTINCT to avoid temp tables, or ensure "
-                           "the GROUP BY columns are indexed.",
-            ))
-
-        # ---- Low filtered % with many rows ----------------------------------
-        if est_rows > 10_000 and filtered < 20:
-            issues.append(Issue(
-                severity="MEDIUM",
-                code="LOW_SELECTIVITY",
-                message=f"Table `{tbl}`: {est_rows:,} rows estimated, only {filtered:.1f}% "
-                        f"pass the filter — {int(est_rows * filtered / 100):,} rows survive.",
-                suggestion=f"A more selective index on `{tbl}` can reduce rows examined.",
-            ))
-
-    # ---- Total rows examined ------------------------------------------------
-    if total_rows_examined > 500_000:
-        issues.append(Issue(
-            severity="HIGH",
-            code="HIGH_ROWS_EXAMINED",
-            message=f"Total estimated rows examined across all tables: {total_rows_examined:,}.",
-            suggestion="Reduce driving table size with a better index on the primary "
-                       "filter column, or use CTEs to pre-filter data.",
-        ))
-
-    # ---- Static SQL analysis ------------------------------------------------
-    issues += analyze_sql_text(sql)
-
-    return issues
-
-
-def analyze_sql_text(sql: str) -> list[Issue]:
-    """Rule-based SQL text analysis independent of EXPLAIN."""
-    issues: list[Issue] = []
-    upper = sql.upper()
-
-    # --- Duplicate WHEN branches in CASE -------------------------------------
-    when_vals = re.findall(r"WHEN\s+'([^']+)'", sql, re.IGNORECASE)
-    seen: set[str] = set()
-    dups: set[str] = set()
-    for v in when_vals:
-        if v in seen:
-            dups.add(v)
-        seen.add(v)
-    if dups:
-        issues.append(Issue(
-            severity="LOW",
-            code="DUPLICATE_WHEN",
-            message=f"Duplicate WHEN branch values found: {', '.join(sorted(dups))}.",
-            suggestion="Remove the duplicate WHEN branches; only the first match is used.",
-        ))
-
-    # --- LIKE without wildcards (should be =) --------------------------------
-    like_exact = re.findall(r"LIKE\s+'([^%_]+)'", sql, re.IGNORECASE)
-    if like_exact:
-        examples = like_exact[:3]
-        issues.append(Issue(
-            severity="LOW",
-            code="LIKE_WITHOUT_WILDCARD",
-            message=f"LIKE used for exact string match (no % or _): "
-                    f"{', '.join(repr(e) for e in examples)}{' ...' if len(like_exact)>3 else ''}.",
-            suggestion="Replace LIKE 'exact string' with = 'exact string' to allow index use.",
-        ))
-
-    # --- Function on a column in WHERE (index-killer) -----------------------
-    func_patterns = [
-        (r"WHERE.*?YEAR\s*\(", "YEAR()"),
-        (r"WHERE.*?MONTH\s*\(", "MONTH()"),
-        (r"WHERE.*?DATE\s*\(", "DATE()"),
-        (r"WHERE.*?LOWER\s*\(", "LOWER()"),
-        (r"WHERE.*?UPPER\s*\(", "UPPER()"),
-    ]
-    for pat, name in func_patterns:
-        if re.search(pat, sql, re.IGNORECASE | re.DOTALL):
-            issues.append(Issue(
-                severity="MEDIUM",
-                code="FUNCTION_ON_COLUMN",
-                message=f"{name} applied to a column inside WHERE — prevents index use.",
-                suggestion=f"Rewrite to compare against a computed constant: e.g. "
-                           f"`duedate >= '2026-06-01' AND duedate < '2026-07-01'` "
-                           f"instead of `MONTH(duedate) = MONTH(CURDATE())`.",
-            ))
-            break  # report once
-
-    # --- OR NOT LIKE / NOT LIKE x OR NOT LIKE y (always true) ---------------
-    if re.search(r"NOT\s+LIKE\s+'.+?'\s+OR\s+.+?NOT\s+LIKE", sql, re.IGNORECASE | re.DOTALL):
-        issues.append(Issue(
-            severity="HIGH",
-            code="ALWAYS_TRUE_CONDITION",
-            message="Pattern `NOT LIKE 'X' OR ... NOT LIKE 'Y'` is logically always TRUE "
-                    "because no single value can equal both X and Y simultaneously.",
-            suggestion="Replace with `column NOT IN ('X', 'Y')` to express the intended logic.",
-        ))
-
-    # --- SELECT * ------------------------------------------------------------
-    if re.search(r"SELECT\s+\*", upper):
-        issues.append(Issue(
-            severity="LOW",
-            code="SELECT_STAR",
-            message="SELECT * fetches all columns, including unused ones.",
-            suggestion="List only the columns you need to reduce I/O and network traffic.",
-        ))
-
-    # --- Missing LIMIT on large correlated subqueries -----------------------
-    corr_count = upper.count("DEPENDENT") + len(re.findall(
-        r"SELECT\b.+?FROM\b.+?WHERE\b.+?=\s*\w+\.\w+",
-        sql, re.IGNORECASE | re.DOTALL
-    ))
-    if corr_count > 3:
-        issues.append(Issue(
-            severity="HIGH",
-            code="MANY_CORRELATED_SUBQUERIES",
-            message=f"Query contains {corr_count} apparent correlated subqueries in the SELECT list.",
-            suggestion="Consolidate correlated subqueries into a single pre-aggregated CTE "
-                       "joined back to the main query (one scan instead of N scans).",
-        ))
-
-    return issues
-
-
-# ===========================================================================
-# Score a query
-# ===========================================================================
-
-def score_issues(issues: list[Issue]) -> int:
-    return sum(SEVERITY_SCORE[i.severity] for i in issues)
 
 
 # ===========================================================================

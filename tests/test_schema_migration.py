@@ -1,11 +1,74 @@
-"""Tests for the schema-compare migration SQL generator (issue #69)."""
+"""Tests for the schema-compare migration SQL generator (issue #69).
+
+The two tests that need a real source/target schema diff (rather than a
+hand-built SchemaDiff) run against a local Postgres server and are skipped
+if none is reachable — mirrors tests/test_db_service_postgresql.py's
+fixture."""
+import uuid
+
+import psycopg2
+import pytest
+
 from services.db_service import DbService
 from services.schema_diff import ColumnDiff, ColumnInfo, IndexDiff, SchemaDiff, TableDiff, build_schema_diff
 from services.schema_migration import _alter_table_sql, _column_def_sql, _index_sql, generate_migration_sql
 
+_PG_HOST = "localhost"
+_PG_PORT = 5432
+_PG_USER = "qforge_test"
+_PG_PASSWORD = "qforge_test_pw"
+_ADMIN_PARAMS = dict(host=_PG_HOST, port=_PG_PORT, user=_PG_USER, password=_PG_PASSWORD, database="postgres")
 
-def _make_sqlite_config(tmp_path, name):
-    return {"type": "sqlite", "name": name, "database": str(tmp_path / f"{name}.db")}
+
+def _postgres_available() -> bool:
+    try:
+        conn = psycopg2.connect(connect_timeout=2, **_ADMIN_PARAMS)
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def _create_db(name: str) -> None:
+    admin = psycopg2.connect(connect_timeout=5, **_ADMIN_PARAMS)
+    admin.autocommit = True
+    with admin.cursor() as cur:
+        cur.execute(f'CREATE DATABASE "{name}"')
+    admin.close()
+
+
+def _drop_db(name: str) -> None:
+    admin = psycopg2.connect(connect_timeout=5, **_ADMIN_PARAMS)
+    admin.autocommit = True
+    with admin.cursor() as cur:
+        cur.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = %s AND pid <> pg_backend_pid()", (name,))
+        cur.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin.close()
+
+
+def _config(name: str) -> dict:
+    return {
+        "type": "postgresql", "name": name, "host": _PG_HOST, "port": _PG_PORT,
+        "user": _PG_USER, "password": _PG_PASSWORD, "database": name,
+    }
+
+
+@pytest.fixture
+def db_pair():
+    if not _postgres_available():
+        pytest.skip(
+            "No local Postgres reachable as qforge_test@localhost:5432 — see "
+            "tests/test_db_service_postgresql.py's module docstring for setup."
+        )
+    source_name = f"qforge_test_src_{uuid.uuid4().hex[:10]}"
+    target_name = f"qforge_test_tgt_{uuid.uuid4().hex[:10]}"
+    _create_db(source_name)
+    _create_db(target_name)
+    yield _config(source_name), _config(target_name)
+    _drop_db(source_name)
+    _drop_db(target_name)
 
 
 def _run(config, *statements):
@@ -44,9 +107,8 @@ def test_table_name_for_added_table_only_drops_that_table():
     assert sql == "DROP TABLE `b`;"
 
 
-def test_table_removed_from_target_becomes_create_table(tmp_path):
-    source = _make_sqlite_config(tmp_path, "source")
-    target = _make_sqlite_config(tmp_path, "target")
+def test_table_removed_from_target_becomes_create_table(db_pair):
+    source, target = db_pair
     _run(source, "CREATE TABLE only_in_source (id INTEGER PRIMARY KEY)")
     _run(target, "CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
 
@@ -57,9 +119,8 @@ def test_table_removed_from_target_becomes_create_table(tmp_path):
     assert "only_in_source" in sql
 
 
-def test_table_added_to_target_becomes_drop_table(tmp_path):
-    source = _make_sqlite_config(tmp_path, "source")
-    target = _make_sqlite_config(tmp_path, "target")
+def test_table_added_to_target_becomes_drop_table(db_pair):
+    source, target = db_pair
     _run(source, "CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
     _run(target, "CREATE TABLE only_in_target (id INTEGER PRIMARY KEY)")
 
@@ -95,19 +156,6 @@ def test_alter_table_modified_column_mysql_uses_source_definition():
     stmts = _alter_table_sql(table_diff, "mysql")
 
     assert stmts == ["ALTER TABLE `users` MODIFY COLUMN `email` varchar(255) NOT NULL;"]
-
-
-def test_alter_table_modified_column_sqlite_flags_for_manual_review():
-    table_diff = TableDiff(name="users", columns=[
-        ColumnDiff(name="email", change="modified",
-                   source=_col("email", nullable=False), target=_col("email", nullable=True)),
-    ])
-
-    stmts = _alter_table_sql(table_diff, "sqlite")
-
-    assert len(stmts) == 1
-    assert stmts[0].startswith("--")
-    assert "manually" in stmts[0]
 
 
 def test_foreign_key_changes_flagged_not_generated():

@@ -58,7 +58,6 @@ def test_emit_health_updates_last_health_and_fans_out_to_open_sql_tabs():
 @pytest.mark.parametrize("db_type,expected", [
     ("mysql", "MySQL"),
     ("postgresql", "PostgreSQL"),
-    ("sqlite", "SQLite"),
     ("weirddb", "WEIRDDB"),
 ])
 def test_dialect_display_name_maps_known_types_and_falls_back_for_unknown(db_type, expected):

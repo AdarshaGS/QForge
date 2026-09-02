@@ -22,7 +22,7 @@ def strip_auto_increment_value(ddl: str) -> str:
     `SHOW CREATE TABLE` output (issue #160), so re-importing the dump
     starts the counter fresh instead of resuming from the source table's
     last value. A no-op on dialects whose DDL doesn't contain this clause
-    (Postgres/SQLite have no such text to strip)."""
+    (Postgres has no such text to strip)."""
     return _AUTO_INCREMENT_RE.sub("", ddl)
 
 

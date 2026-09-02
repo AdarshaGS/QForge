@@ -1,14 +1,63 @@
-"""Tests for the ERD metadata graph model (issue #63) — pure data, no UI."""
+"""Tests for the ERD metadata graph model (issue #63) — pure data, no UI.
+
+Live-Postgres integration (skipped if no local server, mirrors
+tests/test_db_service_postgresql.py's fixture)."""
+import uuid
+
+import psycopg2
+import pytest
+
 from services.db_service import DbService
 from services.erd_model import build_erd_graph, fetch_table_indexes
 
+_PG_HOST = "localhost"
+_PG_PORT = 5432
+_PG_USER = "qforge_test"
+_PG_PASSWORD = "qforge_test_pw"
+_ADMIN_PARAMS = dict(host=_PG_HOST, port=_PG_PORT, user=_PG_USER, password=_PG_PASSWORD, database="postgres")
 
-def _make_sqlite_config(tmp_path, name="erd_test"):
-    return {"type": "sqlite", "name": name, "database": str(tmp_path / f"{name}.db")}
+
+def _postgres_available() -> bool:
+    try:
+        conn = psycopg2.connect(connect_timeout=2, **_ADMIN_PARAMS)
+        conn.close()
+        return True
+    except Exception:
+        return False
 
 
-def test_build_erd_graph_represents_tables_columns_pk_fk(tmp_path):
-    config = _make_sqlite_config(tmp_path)
+pytestmark = pytest.mark.skipif(
+    not _postgres_available(),
+    reason="No local Postgres reachable as qforge_test@localhost:5432 — see "
+           "tests/test_db_service_postgresql.py's module docstring for setup.",
+)
+
+
+@pytest.fixture
+def config():
+    name = f"qforge_test_{uuid.uuid4().hex[:12]}"
+    admin = psycopg2.connect(connect_timeout=5, **_ADMIN_PARAMS)
+    admin.autocommit = True
+    with admin.cursor() as cur:
+        cur.execute(f'CREATE DATABASE "{name}"')
+    admin.close()
+
+    yield {
+        "type": "postgresql", "name": "erd_test", "host": _PG_HOST, "port": _PG_PORT,
+        "user": _PG_USER, "password": _PG_PASSWORD, "database": name,
+    }
+
+    admin = psycopg2.connect(connect_timeout=5, **_ADMIN_PARAMS)
+    admin.autocommit = True
+    with admin.cursor() as cur:
+        cur.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = %s AND pid <> pg_backend_pid()", (name,))
+        cur.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    admin.close()
+
+
+def test_build_erd_graph_represents_tables_columns_pk_fk(config):
     setup = DbService()
     setup.connect(config)
     setup.execute_update("""
@@ -50,12 +99,12 @@ def test_build_erd_graph_represents_tables_columns_pk_fk(tmp_path):
     assert rel.target_column == "id"
 
 
-def test_build_erd_graph_drops_relationship_to_a_table_outside_the_set(tmp_path):
+def test_build_erd_graph_drops_relationship_to_a_table_outside_the_set(config):
     """A FK pointing at a table that wasn't included (or doesn't exist)
     must not crash generation and must not appear as a relationship."""
-    config = _make_sqlite_config(tmp_path)
     setup = DbService()
     setup.connect(config)
+    setup.execute_update("CREATE TABLE customers (id INTEGER PRIMARY KEY)")
     setup.execute_update("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
@@ -65,14 +114,13 @@ def test_build_erd_graph_drops_relationship_to_a_table_outside_the_set(tmp_path)
     """)
     setup.disconnect()
 
-    graph = build_erd_graph(config)
+    graph = build_erd_graph(config, table_names=["orders"])
 
     assert set(graph.tables) == {"orders"}
     assert graph.relationships == []
 
 
-def test_build_erd_graph_on_empty_database_returns_empty_graph(tmp_path):
-    config = _make_sqlite_config(tmp_path)
+def test_build_erd_graph_on_empty_database_returns_empty_graph(config):
     setup = DbService()
     setup.connect(config)
     setup.disconnect()
@@ -83,8 +131,7 @@ def test_build_erd_graph_on_empty_database_returns_empty_graph(tmp_path):
     assert graph.relationships == []
 
 
-def test_build_erd_graph_respects_table_names_filter(tmp_path):
-    config = _make_sqlite_config(tmp_path)
+def test_build_erd_graph_respects_table_names_filter(config):
     setup = DbService()
     setup.connect(config)
     setup.execute_update("CREATE TABLE a (id INTEGER PRIMARY KEY)")
@@ -96,8 +143,7 @@ def test_build_erd_graph_respects_table_names_filter(tmp_path):
     assert set(graph.tables) == {"a"}
 
 
-def test_build_erd_graph_marks_one_to_one_when_fk_column_is_unique(tmp_path):
-    config = _make_sqlite_config(tmp_path)
+def test_build_erd_graph_marks_one_to_one_when_fk_column_is_unique(config):
     setup = DbService()
     setup.connect(config)
     setup.execute_update("""
@@ -131,8 +177,7 @@ def test_build_erd_graph_marks_one_to_one_when_fk_column_is_unique(tmp_path):
     assert rel_by_source["books"].is_one_to_one is False
 
 
-def test_fetch_table_indexes_returns_indexes_for_a_table(tmp_path):
-    config = _make_sqlite_config(tmp_path)
+def test_fetch_table_indexes_returns_indexes_for_a_table(config):
     setup = DbService()
     setup.connect(config)
     setup.execute_update("""
@@ -149,8 +194,7 @@ def test_fetch_table_indexes_returns_indexes_for_a_table(tmp_path):
     assert any(idx["unique"] and idx["columns"] == "sku" for idx in indexes)
 
 
-def test_get_primary_keys_sqlite(tmp_path):
-    config = _make_sqlite_config(tmp_path)
+def test_get_primary_keys_composite(config):
     db = DbService()
     db.connect(config)
     db.execute_update("""

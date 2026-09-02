@@ -55,7 +55,7 @@ def test_hint_shown_on_fresh_install_with_no_connections_file(isolated_dialog_fa
 def test_hint_hidden_when_a_connection_exists(isolated_dialog_factory, tmp_path):
     conn_file = str(tmp_path / "connections.json")
     with open(conn_file, "w") as f:
-        json.dump([{"id": "x", "name": "test", "type": "sqlite", "database": ":memory:"}], f)
+        json.dump([{"id": "x", "name": "test", "type": "mysql"}], f)
 
     dlg = isolated_dialog_factory()
     assert len(dlg.connections) == 1

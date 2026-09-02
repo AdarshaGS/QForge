@@ -220,10 +220,9 @@ def _diff_indexes(source_idx: list, target_idx: list) -> list:
 
 
 def _diff_foreign_keys(source_fks: list, target_fks: list) -> list:
-    # No constraint-name column is fetched by db_service.get_foreign_keys
-    # (sqlite's PRAGMA foreign_key_list doesn't even have one) — identity is
-    # the (column, ref_table, ref_column) triple, so a changed FK shows as
-    # a remove + add rather than a "modified" entry.
+    # No constraint-name column is fetched by db_service.get_foreign_keys —
+    # identity is the (column, ref_table, ref_column) triple, so a changed
+    # FK shows as a remove + add rather than a "modified" entry.
     def _key(fk):
         return (fk.get("column", ""), fk.get("ref_table", ""), fk.get("ref_column", ""))
 

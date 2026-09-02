@@ -43,7 +43,7 @@ class ConnectionDialog(QDialog):
 
     # Issue #116: bounds used to validate a hand-edited or malicious
     # connections.json on load rather than trusting its shape.
-    _ALLOWED_TYPES = ("mysql", "postgresql", "sqlite")
+    _ALLOWED_TYPES = ("mysql", "postgresql")
     _MAX_STRING_LEN = 4096
 
     # Form field widths (issue #55) — small/medium/large are fixed caps;
@@ -156,7 +156,7 @@ class ConnectionDialog(QDialog):
         MEDIUM_FIELD_WIDTH = self.MEDIUM_FIELD_WIDTH
         LARGE_FIELD_WIDTH = self.LARGE_FIELD_WIDTH
         self.type_input = QComboBox()
-        self.type_input.addItems(["MySQL", "PostgreSQL", "SQLite"])
+        self.type_input.addItems(["MySQL", "PostgreSQL"])
         self.type_input.currentTextChanged.connect(self.on_type_changed)
         self.type_input.setMaximumWidth(SMALL_FIELD_WIDTH)
 
@@ -420,7 +420,7 @@ class ConnectionDialog(QDialog):
                 # still starts out fully working, independently.
                 old_id = new_conn.get("id")
                 new_conn["id"] = uuid.uuid4().hex
-                if old_id and new_conn.get("type") != "sqlite":
+                if old_id:
                     db_pw = self._resolve_password(old_id, "db")
                     if db_pw:
                         credential_store.set_password(new_conn["id"], "db", db_pw)
@@ -664,13 +664,12 @@ class ConnectionDialog(QDialog):
             conn = ConnectionDialog._sanitize_connection_entry(raw)
             if conn is None:
                 return None
-            if conn.get("type") != "sqlite":
-                conn["password"] = credential_store.get_password(conn_id, "db")
-                ssh = conn.get("ssh_tunnel")
-                if ssh and ssh.get("enabled") and not ssh.get("use_key"):
-                    ssh = dict(ssh)
-                    ssh["password"] = credential_store.get_password(conn_id, "ssh")
-                    conn["ssh_tunnel"] = ssh
+            conn["password"] = credential_store.get_password(conn_id, "db")
+            ssh = conn.get("ssh_tunnel")
+            if ssh and ssh.get("enabled") and not ssh.get("use_key"):
+                ssh = dict(ssh)
+                ssh["password"] = credential_store.get_password(conn_id, "ssh")
+                conn["ssh_tunnel"] = ssh
             return conn
         return None
 
@@ -800,7 +799,7 @@ class ConnectionDialog(QDialog):
 
             for conn_idx in indices:
                 conn = self.connections[conn_idx]
-                _type_names = {"mysql": "MySQL", "postgresql": "PostgreSQL", "sqlite": "SQLite"}
+                _type_names = {"mysql": "MySQL", "postgresql": "PostgreSQL"}
                 raw_type = conn.get("type", "mysql")
                 db_type = _type_names.get(raw_type, raw_type.upper())
                 host = conn.get("host", "")
@@ -864,8 +863,6 @@ class ConnectionDialog(QDialog):
                 conn["read_only"] = False
                 needs_resave = True
 
-            if conn.get("type") == "sqlite":
-                continue
             conn_id = conn["id"]
 
             plaintext_pw = conn.get("password", "")
@@ -900,7 +897,7 @@ class ConnectionDialog(QDialog):
         value for that connection, so `save_connections()` knows it's safe to
         sync (rather than skipping a credential it never actually resolved)."""
         if "password" not in data:
-            return  # sqlite: no credential to track
+            return
         self._resolved_passwords[(data["id"], "db")] = data["password"]
         ssh = data.get("ssh_tunnel")
         if ssh and ssh.get("enabled") and not ssh.get("use_key"):
@@ -914,7 +911,7 @@ class ConnectionDialog(QDialog):
             c = dict(conn)
             conn_id = c.get("id")
             c.pop("password", None)
-            if conn_id and c.get("type") != "sqlite":
+            if conn_id:
                 c["password"] = self._sync_password(conn_id, "db", c.get("name", conn_id), keyring_failures)
 
                 ssh = c.get("ssh_tunnel")
@@ -1003,30 +1000,29 @@ class ConnectionDialog(QDialog):
             "database": database,
         }
 
-        if db_type != "sqlite":
-            port_text = self.port_input.text().strip()
-            if not port_text.isdigit():
-                raise ValueError(f"Port must be a number (got '{port_text}').")
-            data["host"] = host
-            data["port"] = int(port_text)
-            data["user"] = self.user_input.text().strip()
-            data["password"] = self.password_input.text()
+        port_text = self.port_input.text().strip()
+        if not port_text.isdigit():
+            raise ValueError(f"Port must be a number (got '{port_text}').")
+        data["host"] = host
+        data["port"] = int(port_text)
+        data["user"] = self.user_input.text().strip()
+        data["password"] = self.password_input.text()
 
-            if self.ssh_enabled_check.isChecked():
-                ssh_port_text = self.ssh_port_input.text().strip()
-                if not ssh_port_text.isdigit():
-                    raise ValueError(f"SSH port must be a number (got '{ssh_port_text}').")
-                data["ssh_tunnel"] = {
-                    "enabled": True,
-                    "host": self.ssh_host_input.text().strip(),
-                    "port": int(ssh_port_text),
-                    "user": self.ssh_user_input.text().strip(),
-                    "use_key": self.ssh_use_key_checkbox.isChecked(),
-                    "password": self.ssh_password_input.text() if not self.ssh_use_key_checkbox.isChecked() else "",
-                    "key_path": self.ssh_key_path_input.text() if self.ssh_use_key_checkbox.isChecked() else "",
-                }
-            else:
-                data["ssh_tunnel"] = {"enabled": False}
+        if self.ssh_enabled_check.isChecked():
+            ssh_port_text = self.ssh_port_input.text().strip()
+            if not ssh_port_text.isdigit():
+                raise ValueError(f"SSH port must be a number (got '{ssh_port_text}').")
+            data["ssh_tunnel"] = {
+                "enabled": True,
+                "host": self.ssh_host_input.text().strip(),
+                "port": int(ssh_port_text),
+                "user": self.ssh_user_input.text().strip(),
+                "use_key": self.ssh_use_key_checkbox.isChecked(),
+                "password": self.ssh_password_input.text() if not self.ssh_use_key_checkbox.isChecked() else "",
+                "key_path": self.ssh_key_path_input.text() if self.ssh_use_key_checkbox.isChecked() else "",
+            }
+        else:
+            data["ssh_tunnel"] = {"enabled": False}
 
         return data
 
@@ -1180,30 +1176,29 @@ class ConnectionDialog(QDialog):
         self.group_input.lineEdit().setText(connection.get("group", ""))
         self.database_input.setText(connection.get("database", ""))
 
-        if db_type != "sqlite":
-            self.host_input.setText(connection.get("host", ""))
-            self.port_input.setText(str(connection.get("port", 3306)))
-            self.user_input.setText(connection.get("user", ""))
-            resolved_pw = self._resolve_password(connection["id"], "db")
-            connection["password"] = resolved_pw
-            self.password_input.setText(resolved_pw)
+        self.host_input.setText(connection.get("host", ""))
+        self.port_input.setText(str(connection.get("port", 3306)))
+        self.user_input.setText(connection.get("user", ""))
+        resolved_pw = self._resolve_password(connection["id"], "db")
+        connection["password"] = resolved_pw
+        self.password_input.setText(resolved_pw)
 
-            ssh_data = connection.get("ssh_tunnel", {"enabled": False})
-            if ssh_data.get("enabled", False):
-                self.ssh_enabled_check.setChecked(True)
-                self.ssh_host_input.setText(ssh_data.get("host", ""))
-                self.ssh_port_input.setText(str(ssh_data.get("port", 22)))
-                self.ssh_user_input.setText(ssh_data.get("user", ""))
-                use_key = ssh_data.get("use_key", False)
-                self.ssh_use_key_checkbox.setChecked(use_key)
-                if use_key:
-                    self.ssh_key_path_input.setText(ssh_data.get("key_path", ""))
-                else:
-                    resolved_ssh_pw = self._resolve_password(connection["id"], "ssh")
-                    ssh_data["password"] = resolved_ssh_pw
-                    self.ssh_password_input.setText(resolved_ssh_pw)
+        ssh_data = connection.get("ssh_tunnel", {"enabled": False})
+        if ssh_data.get("enabled", False):
+            self.ssh_enabled_check.setChecked(True)
+            self.ssh_host_input.setText(ssh_data.get("host", ""))
+            self.ssh_port_input.setText(str(ssh_data.get("port", 22)))
+            self.ssh_user_input.setText(ssh_data.get("user", ""))
+            use_key = ssh_data.get("use_key", False)
+            self.ssh_use_key_checkbox.setChecked(use_key)
+            if use_key:
+                self.ssh_key_path_input.setText(ssh_data.get("key_path", ""))
             else:
-                self.ssh_enabled_check.setChecked(False)
+                resolved_ssh_pw = self._resolve_password(connection["id"], "ssh")
+                ssh_data["password"] = resolved_ssh_pw
+                self.ssh_password_input.setText(resolved_ssh_pw)
+        else:
+            self.ssh_enabled_check.setChecked(False)
 
         # setText() leaves the cursor at the end of the string, which scrolls
         # long values so the START is hidden (e.g. "Adaptive Connection"

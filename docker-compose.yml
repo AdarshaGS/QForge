@@ -1,8 +1,8 @@
-# Dev-only fixture environment for adversarial-input testing against real
-# MySQL/PostgreSQL engine quirks (issue #139) — quoting rules, identifier
-# length limits, encoding edge cases — that SQLite (far more permissive)
-# can't exercise. Never part of the shipped app; not referenced by
-# build.sh/QForge.spec/build-release.yml.
+# Dev/CI fixture environment for MySQL/PostgreSQL engine quirks (issue
+# #139) — quoting rules, identifier length limits, encoding edge cases —
+# and, since sqlite support was removed from the app, for every suite that
+# needs a real database engine at all (see tests/README.md). Never part of
+# the shipped app; not referenced by build.sh/QForge.spec/build-release.yml.
 #
 # Usage:
 #   docker compose up -d

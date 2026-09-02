@@ -25,9 +25,10 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QStackedWidget,
     QApplication,
 )
-from PySide6.QtGui import QShortcut, QKeySequence, QCursor
+from PySide6.QtGui import QShortcut, QKeySequence, QCursor, QFont
 
 from services.db_service import DbService
+from services import query_cost
 from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
 from services.schema_snapshot import fetch_schema_snapshot
@@ -102,6 +103,7 @@ class _QueryWorker(QObject):
     multi_done = Signal(list,  float)    # ([(label, df|Exception), ...], elapsed)
     errored    = Signal(str,   float)    # (error_message, elapsed_seconds)
     cancelled  = Signal()
+    cost_ready = Signal(object)          # CostEstimate — best-effort, may never fire
 
     def __init__(self, db_service, query: str, cancel_flag, multi: bool = False):
         super().__init__()
@@ -110,9 +112,22 @@ class _QueryWorker(QObject):
         self._flag  = cancel_flag
         self._multi = multi
 
+    def _maybe_emit_cost(self, stmt: str):
+        """Best-effort pre-run cost estimate for the status-bar badge —
+        plan-only (EXPLAIN never executes the statement), so this runs
+        before the real query on the same connection with no data-scan
+        cost of its own. Silently skipped for writes/unsupported
+        statements; any EXPLAIN failure is swallowed the same way."""
+        try:
+            from services import query_classifier
+            if query_classifier.classify(stmt).is_write:
+                return
+            self.cost_ready.emit(query_cost.estimate_cost(self._db, stmt))
+        except Exception:
+            pass
+
     def run(self):
         import sqlparse as _sp
-        t0 = time.time()
         try:
             # Multi-statement: detect 2+ non-empty statements.
             # sqlparse.split raises SQLParseError on very large queries (>10k tokens);
@@ -121,7 +136,14 @@ class _QueryWorker(QObject):
                 stmts = [s.strip() for s in _sp.split(self._q) if s.strip()]
             except Exception:
                 stmts = [self._q.strip()]
-            if self._multi or len(stmts) > 1:
+            is_multi = self._multi or len(stmts) > 1
+            if not is_multi and stmts:
+                self._maybe_emit_cost(stmts[0])
+            # t0 starts here, after the cost estimate, so "Query time" keeps
+            # reflecting only the real query — not the EXPLAIN round-trip
+            # that precedes it.
+            t0 = time.time()
+            if is_multi:
                 results = self._db.execute_multi_query(self._q, max_rows=_MAX_RESULT_ROWS)
                 elapsed = time.time() - t0
                 if self._flag.is_set():
@@ -468,6 +490,7 @@ class ConnectionPanel(QWidget):
     _q_multi_done = Signal(object, list,   float)  # (tab, [(label,df),...], elapsed)
     _q_errored    = Signal(object, str,    float)  # (tab, message, elapsed)
     _q_cancelled  = Signal(object)                 # (tab,)
+    _q_cost_ready = Signal(object, object)         # (tab, CostEstimate)
     # ── Public observability signals ─────────────────────────────────────
     # 'idle' / 'running' / 'disconnected' / 'connecting'
     health_changed = Signal(str)
@@ -544,6 +567,7 @@ class ConnectionPanel(QWidget):
         self._q_multi_done.connect(self._on_query_multi_done, Qt.QueuedConnection)
         self._q_errored.connect(self._on_query_errored, Qt.QueuedConnection)
         self._q_cancelled.connect(self._on_query_cancelled, Qt.QueuedConnection)
+        self._q_cost_ready.connect(self._on_query_cost_ready, Qt.QueuedConnection)
         self._schema_done.connect(self._on_schema_loaded, Qt.QueuedConnection)
         self._schema_error.connect(self._on_schema_error, Qt.QueuedConnection)
         self._schema_fast.connect(self._on_schema_tables_ready, Qt.QueuedConnection)
@@ -1353,7 +1377,7 @@ class ConnectionPanel(QWidget):
         # auth round-trip, or (potentially tunnelled) SSH setup. Previously
         # every switch paid the full disconnect+reconnect cost, which is
         # where the multi-second freeze reported in issue #23 actually came
-        # from. Postgres/SQLite connections are bound to one database for
+        # from. Postgres connections are bound to one database for
         # their lifetime, so they still need a real reconnect — done
         # synchronously (as before) so nothing else can use the shared
         # connection mid-reconnect. The (potentially slower) schema listing
@@ -1525,6 +1549,8 @@ class ConnectionPanel(QWidget):
         # no-op instead of trying to open a table that doesn't exist.
         if self._active_category in ("tables", "views") and item.text(0) in self._active_category_items():
             self.open_table_view(item.text(0))
+        elif self._active_category == "functions" and item.text(0) in self._active_category_items():
+            self._show_function_definition(item.text(0))
 
     def _show_context_menu(self, position):
         """Full table/view context menu (issue #142, TablePlus parity).
@@ -1537,6 +1563,9 @@ class ConnectionPanel(QWidget):
         that are not implemented" requirement."""
         item = self.schema_tree.itemAt(position)
         if not item:
+            return
+        if self._active_category == "functions" and item.text(0) in self._active_category_items():
+            self._show_function_context_menu(item.text(0), position)
             return
         if self._active_category not in ("tables", "views") or item.text(0) not in self._active_category_items():
             return
@@ -1831,12 +1860,12 @@ class ConnectionPanel(QWidget):
         count = self.tabs.count() + 1
         idx = self.tabs.addTab(tab, f"Tab {count}")
         tab.run_btn.clicked.connect(lambda: self._run_query_in_tab(tab))
-        tab.verify_btn.clicked.connect(lambda: self._open_verify_dialog(tab))
         tab.begin_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "BEGIN"))
         tab.commit_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "COMMIT"))
         tab.rollback_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "ROLLBACK"))
         # Wire inline-edit commit: execute SQL with our db_service
         tab.commit_sql.connect(lambda sqls, t=tab: self._execute_commit_sql(sqls, t))
+        tab.open_analyzer.connect(lambda: self.open_query_analyzer(focus_cost_tab=True))
         # Push current schema so autocomplete works immediately
         tab.set_schema(self.all_tables, self._column_cache,
                         column_details=self._column_details_cache,
@@ -1940,7 +1969,12 @@ class ConnectionPanel(QWidget):
         tab.update_status(len(df), elapsed, truncated=df.attrs.get("truncated", False))
         # Load FK map so right-click "Go to …" works in the result grid
         self._wire_result_fk(tab, table_name)
-        self.query_history.add_query(query, self.config["name"], len(df), elapsed)
+        cost = getattr(tab, '_last_cost_estimate', None)
+        self.query_history.add_query(
+            query, self.config["name"], len(df), elapsed,
+            cost_score=cost.score if cost and not cost.error else None,
+            cost_label=cost.label if cost and not cost.error else None,
+        )
         if self._sidebar_stack.currentIndex() == 2:
             self._reload_history_list(self._history_search.text())
         self._emit_health('idle')
@@ -2031,6 +2065,16 @@ class ConnectionPanel(QWidget):
         # this one didn't, leaving the status bar's readiness dot stuck on
         # "Running…" forever after a cancel (issue #178).
         self._emit_health('idle')
+
+    def _on_query_cost_ready(self, tab, estimate):
+        """Receives worker `cost_ready` signal via bridge — best-effort,
+        never fires for a write, a multi-statement script, or an
+        unsupported dialect/statement. Arrives before _on_query_done since
+        the worker computes it first, so it's already on `tab` by the time
+        query_history.add_query() reads it there."""
+        tab._last_cost_estimate = estimate
+        if hasattr(tab, 'set_cost_estimate'):
+            tab.set_cost_estimate(estimate)
 
     # ── Parameterised query helpers ────────────────────────────────────────────
 
@@ -2151,6 +2195,9 @@ class ConnectionPanel(QWidget):
 
         tab._query_running = True
         tab._last_query    = query
+        tab._last_cost_estimate = None
+        if hasattr(tab, 'clear_cost_estimate'):
+            tab.clear_cost_estimate()
         tab._cancel_flag   = threading.Event()
         tab._query_start_time = time.time()
         tab.run_btn.setEnabled(False)
@@ -2227,6 +2274,8 @@ class ConnectionPanel(QWidget):
             lambda msg, elapsed: self._q_errored.emit(tab, msg, elapsed))
         worker.cancelled.connect(
             lambda: self._q_cancelled.emit(tab))
+        worker.cost_ready.connect(
+            lambda estimate: self._q_cost_ready.emit(tab, estimate))
 
         # Safely (re)connect Cancel button — Cancel kills on the dedicated connection
         cancel_slot = getattr(tab, '_cancel_slot', None)
@@ -2293,13 +2342,20 @@ class ConnectionPanel(QWidget):
                 return True
         return False
 
-    def _open_verify_dialog(self, tab):
-        """Open the Query Verifier dialog pre-populated with the current tab's query."""
-        if not require_pro(Feature.QUERY_VERIFIER, "Query Verifier", self):
+    def open_query_analyzer(self, focus_cost_tab: bool = False):
+        """Open the consolidated Analyze Query dialog (Cost & Profile +
+        Compare Queries), pre-populated with the current tab's query.
+        Free tier — no require_pro() gate, unlike Schema/Data Compare;
+        this is a safety/education aid, not a power-user workflow."""
+        if not self.db_service or not self.db_service.connection:
+            QMessageBox.information(self, "Analyze Query", "Connect to a database first.")
             return
-        from ui.query_verifier_dialog import QueryVerifierDialog
-        query = tab.get_query().strip()
-        dlg = QueryVerifierDialog(self.db_service, initial_query=query, parent=self)
+        from ui.query_analyzer_dialog import QueryAnalyzerDialog
+        tab = self.tabs.currentWidget()
+        query = tab.get_query().strip() if tab and hasattr(tab, 'get_query') else ""
+        dlg = QueryAnalyzerDialog(self.db_service, initial_query=query, parent=self)
+        if focus_cost_tab:
+            dlg.show_cost_tab()
         dlg.show()
 
     @staticmethod
@@ -2376,6 +2432,58 @@ class ConnectionPanel(QWidget):
                     self.load_schema()
             except Exception as ex:
                 QMessageBox.critical(self, "Error", str(ex))
+
+    def _show_function_context_menu(self, name: str, position):
+        menu = QMenu(self)
+        view_action = menu.addAction("🔍 View Definition")
+        copy_action = menu.addAction("Copy Definition")
+        copy_name_action = menu.addAction("Copy Name")
+        action = menu.exec_(self.schema_tree.mapToGlobal(position))
+        if action == view_action:
+            self._show_function_definition(name)
+        elif action == copy_action:
+            self._copy_function_definition(name)
+        elif action == copy_name_action:
+            QApplication.clipboard().setText(name)
+
+    def _show_function_definition(self, name: str):
+        """Read-only popup showing a function/procedure's CREATE statement
+        (issue: functions in the sidebar had no way to see what's inside
+        them — clicking/right-clicking one was a no-op)."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QPlainTextEdit, QDialogButtonBox
+        try:
+            ddl = self.db_service.get_function_definition(name)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Could not load definition for {name}:\n{ex}")
+            return
+        if not ddl:
+            QMessageBox.information(self, "View Definition", f"No definition found for '{name}'.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Definition — {name}")
+        dlg.resize(700, 500)
+        layout = QVBoxLayout(dlg)
+        text = QPlainTextEdit(dlg)
+        text.setPlainText(ddl)
+        text.setReadOnly(True)
+        text.setFont(QFont("Menlo, Consolas, monospace"))
+        layout.addWidget(text)
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        copy_btn = btns.addButton("Copy", QDialogButtonBox.ActionRole)
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(ddl))
+        layout.addWidget(btns)
+        dlg.exec()
+
+    def _copy_function_definition(self, name: str):
+        try:
+            ddl = self.db_service.get_function_definition(name)
+        except Exception as ex:
+            QMessageBox.critical(self, "Copy Definition Error", f"Could not load definition for {name}:\n{ex}")
+            return
+        QApplication.clipboard().setText(ddl)
 
     def _show_table_structure(self, table_name: str):
         """Open (or focus) *table_name*'s tab and switch it to the Structure
@@ -2750,8 +2858,6 @@ class ConnectionPanel(QWidget):
         # Build INSERT statements and execute in batches
         db_type = self.db_service.db_type
         ph = "%s"  # MySQL / PostgreSQL
-        if db_type == "sqlite":
-            ph = "?"
 
         # Issue #114/#115: column names come straight from the imported
         # file's header row — untrusted input — so they're quoted and
@@ -2975,10 +3081,8 @@ class ConnectionPanel(QWidget):
         self.load_schema()
 
     def _truncate_table(self, table_name: str):
-        db_type = self.db_service.db_type
         quoted = self._qualified_name(table_name, quote=True)
-        # SQLite has no TRUNCATE statement — DELETE FROM is the equivalent.
-        sql = f"DELETE FROM {quoted}" if db_type == "sqlite" else f"TRUNCATE TABLE {quoted}"  # nosec B608
+        sql = f"TRUNCATE TABLE {quoted}"  # nosec B608
         if not self._guard_write(sql):
             return
         reply = QMessageBox.question(
@@ -3686,7 +3790,7 @@ class ConnectionPanel(QWidget):
                 w.set_connection_state(status)
 
     def _dialect_display_name(self) -> str:
-        return {"mysql": "MySQL", "postgresql": "PostgreSQL", "sqlite": "SQLite"}.get(
+        return {"mysql": "MySQL", "postgresql": "PostgreSQL"}.get(
             self.config.get("type", ""), self.config.get("type", "DB").upper())
 
     def disconnect(self):

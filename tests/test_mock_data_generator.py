@@ -134,7 +134,7 @@ def test_build_insert_sql_produces_valid_insert_statements_per_dialect():
     }
     df = gen.generate_dataframe(columns, 3, specs)
 
-    for dialect in ("mysql", "postgresql", "sqlite"):
+    for dialect in ("mysql", "postgresql"):
         sql = gen.build_insert_sql(df, "users", dialect=dialect)
         statements = split_statements(sql)
         assert len(statements) == 3

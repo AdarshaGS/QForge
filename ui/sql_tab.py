@@ -96,6 +96,9 @@ class SqlTab(QWidget):
 
     # Emitted when user confirms inline edits — parent executes the SQL
     commit_sql = Signal(list)  # list of SQL strings
+    # Emitted when the status-bar cost badge is clicked — parent opens the
+    # Analyze Query dialog's Cost & Profile tab for this tab's query
+    open_analyzer = Signal()
 
     def __init__(self):
         super().__init__()
@@ -235,25 +238,6 @@ class SqlTab(QWidget):
         """)
         self.diff_btn.toggled.connect(self._on_diff_toggled)
         run_layout.addWidget(self.diff_btn)
-
-        # ── Verify Query button ──
-        self.verify_btn = QPushButton("⚖ Verify")
-        self.verify_btn.setFixedHeight(28)
-        self.verify_btn.setToolTip(
-            "Compare this query against another query to verify result correctness"
-        )
-        self.verify_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                color: #8e8e93;
-                border: 1px solid #3a3a3c;
-                border-radius: 5px;
-                padding: 0 10px;
-                font-size: 12px;
-            }
-            QPushButton:hover { color: #0A84FF; border-color: #0A84FF; }
-        """)
-        run_layout.addWidget(self.verify_btn)
 
         # ── Pin / favourite toggle ──
         self.pin_btn = QPushButton("★")
@@ -1702,7 +1686,7 @@ class SqlTab(QWidget):
         """Add filter input boxes to column headers"""
         from ui.filter_header import FilterHeaderWidget
         
-        for col in range(self.result_table.columnCount()):
+        for col in range(self.result_table.real_column_count()):
             col_name = self.result_table.horizontalHeaderItem(col).text()
             filter_widget = FilterHeaderWidget(col, col_name)
             filter_widget.filter_changed.connect(self.result_table.apply_column_filter)
@@ -1881,6 +1865,22 @@ class SqlTab(QWidget):
             "color: #30d158; font-size: 11px; font-weight: 600; background: transparent;")
         self._query_time_lbl = _seg("Query time: —")
         self._rows_status_lbl = _seg("Rows: —")
+
+        # Pre-run cost badge (issue: query costing) — hidden until a
+        # read-only query's EXPLAIN-based estimate arrives; best-effort,
+        # so most write-only tabs never show it. Clicking opens the
+        # consolidated Analyze Query dialog's Cost & Profile tab.
+        self._cost_badge_btn = QPushButton("")
+        self._cost_badge_btn.setFlat(True)
+        self._cost_badge_btn.setCursor(Qt.PointingHandCursor)
+        self._cost_badge_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none;"
+            " font-size: 11px; padding: 0; }"
+        )
+        self._cost_badge_btn.clicked.connect(self.open_analyzer.emit)
+        self._cost_badge_btn.hide()
+        layout.addWidget(self._cost_badge_btn)
+
         layout.addStretch()
         self._cursor_pos_lbl = _seg("Ln 1, Col 1")
         _seg("UTF-8")
@@ -1958,6 +1958,41 @@ class SqlTab(QWidget):
         self.status_label.setFixedHeight(int(h))
         self.status_label.show()
         self._status_row.show()
+
+    def _cost_badge_color(self, score: int) -> str:
+        """Mirrors ui/query_analyzer_dialog.py's _score_color so the badge
+        and the dialog it opens agree on what "expensive" looks like."""
+        if score == 0:
+            return "#30d158"
+        if score < 20:
+            return "#0A84FF"
+        if score < 50:
+            return "#ff9f0a"
+        return "#ff453a"
+
+    def set_cost_estimate(self, estimate):
+        """Populate the status-bar cost badge from a
+        services.query_cost.CostEstimate. Silently hides the badge on
+        error — best-effort, never surfaces EXPLAIN failures to the user
+        here (they'd just re-run Estimate Cost in the dialog if curious)."""
+        if estimate is None or getattr(estimate, "error", ""):
+            self.clear_cost_estimate()
+            return
+        color = self._cost_badge_color(estimate.score)
+        self._cost_badge_btn.setText(f"●  Cost: {estimate.score} · {estimate.label}")
+        self._cost_badge_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none;"
+            f" color: {color}; font-size: 11px; padding: 0; }}"
+            f" QPushButton:hover {{ text-decoration: underline; }}"
+        )
+        self._cost_badge_btn.setToolTip(
+            "\n".join(f"[{i.severity}] {i.message}" for i in estimate.issues[:8])
+            or "No issues detected — click for the full Cost & Profile view."
+        )
+        self._cost_badge_btn.show()
+
+    def clear_cost_estimate(self):
+        self._cost_badge_btn.hide()
 
     def update_status(self, rows, execution_time, truncated=False):
         """Row count and query time live only in the bottom status bar —
