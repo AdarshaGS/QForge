@@ -196,6 +196,13 @@ class ConnectionDialog(QDialog):
         self.host_input.textChanged.connect(lambda: self._fit_field_to_content(self.host_input))
         self.port_input = QLineEdit("3306")
         self.port_input.setMaximumWidth(SMALL_FIELD_WIDTH)
+        # textEdited (not textChanged) fires only on real keystrokes/paste,
+        # never on programmatic setText() — so this only flips true when the
+        # user actually typed a port themselves, and on_type_changed below
+        # can tell that apart from the field still holding its auto-filled
+        # dialect default.
+        self._port_edited_by_user = False
+        self.port_input.textEdited.connect(self._on_port_edited_by_user)
         self.database_input = QLineEdit()
         self.database_input.setMinimumWidth(MEDIUM_FIELD_WIDTH)
         self.database_input.setMaximumWidth(MEDIUM_FIELD_WIDTH)
@@ -455,6 +462,9 @@ class ConnectionDialog(QDialog):
 
     # ── DB type change ───────────────────────────────────────────
 
+    def _on_port_edited_by_user(self, _text: str):
+        self._port_edited_by_user = True
+
     def on_type_changed(self, db_type):
         if db_type == "SQLite":
             self.host_input.setEnabled(False)
@@ -470,10 +480,16 @@ class ConnectionDialog(QDialog):
             self.password_input.setEnabled(True)
             self.database_input.setPlaceholderText("Database name (optional)")
             self.ssh_enabled_check.setEnabled(True)
-            if db_type == "MySQL":
-                self.port_input.setText("3306")
-            elif db_type == "PostgreSQL":
-                self.port_input.setText("5432")
+            # Don't clobber a port the user (or load_selected_connection)
+            # already put there — only auto-fill the dialect default while
+            # the field still holds a previous auto-filled value (issue: a
+            # custom port typed before picking the DB type from the
+            # dropdown was silently overwritten back to 5432/3306).
+            if not self._port_edited_by_user:
+                if db_type == "MySQL":
+                    self.port_input.setText("3306")
+                elif db_type == "PostgreSQL":
+                    self.port_input.setText("5432")
 
     def _on_environment_changed(self, index: int):
         """Auto-suggest Read-only when the user picks Staging/Production —
@@ -1015,6 +1031,7 @@ class ConnectionDialog(QDialog):
         return data
 
     def clear_form(self):
+        self._port_edited_by_user = False
         self.type_input.setCurrentIndex(0)
         self.name_input.clear()
         self.environment_input.setCurrentIndex(0)
@@ -1149,6 +1166,10 @@ class ConnectionDialog(QDialog):
         connection = self.connections[conn_idx]
         db_type = connection.get("type", "mysql")
         type_map = {"mysql": "MySQL", "postgresql": "PostgreSQL", "sqlite": "SQLite"}
+        # Reset before setCurrentText() below (which fires on_type_changed)
+        # so a *previous* connection's manually-typed port doesn't leak into
+        # this one and block its dialect-default fill.
+        self._port_edited_by_user = False
         self.type_input.setCurrentText(type_map.get(db_type, "MySQL"))
         self.name_input.setText(connection["name"])
         env = environment.normalize(connection.get("environment"))
