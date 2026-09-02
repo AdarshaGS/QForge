@@ -57,7 +57,8 @@ class DbSwitcherDialog(QDialog):
         }
     """
 
-    def __init__(self, databases: list[str], current_db: str = "", parent=None):
+    def __init__(self, databases: list[str], current_db: str = "", parent=None,
+                 placeholder: str = "Switch database…"):
         super().__init__(parent)
         # Issue #234: this needs to close on a click anywhere outside it,
         # including clicks on QForge's own main window right behind it.
@@ -81,7 +82,7 @@ class DbSwitcherDialog(QDialog):
 
         # Search field
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Switch database…")
+        self.search.setPlaceholderText(placeholder)
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._filter)
         self.search.installEventFilter(self)

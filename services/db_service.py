@@ -331,30 +331,81 @@ class DbService:
         try:
             import psycopg2
             import psycopg2.extras
-            
+
             # Check if SSH tunnel is needed
             ssh_tunnel_config = config.get("ssh_tunnel", {"enabled": False})
-            
+
             if ssh_tunnel_config.get("enabled", False):
                 host, port = self._setup_ssh_tunnel(ssh_tunnel_config, config["host"], config["port"])
             else:
                 host = config["host"]
                 port = config["port"]
-            
+
             # Database is optional for PostgreSQL too
             connect_params = {
                 "host": host,
                 "port": port,
                 "user": config["user"],
-                "password": config["password"]
+                "password": config["password"],
+                # Without this, a stalled/unreachable server hangs the
+                # caller on the OS's default TCP timeout instead of failing
+                # with a message — matches MySQL's connect_timeout above.
+                "connect_timeout": 30,
             }
-            
+
             # Only add database if provided
             if config.get("database"):
                 connect_params["database"] = config["database"]
-            
-            self.connection = psycopg2.connect(**connect_params)
-            self.connection.autocommit = True
+
+            # A proxy/access-broker in front of the real server (rather than
+            # Postgres itself) can hand back a socket that completes the
+            # handshake and then dies before its first real command — seen
+            # in practice as "server closed the connection unexpectedly" on
+            # the very next statement. Each fresh TCP connection through such
+            # a proxy is a new roll of the dice on which backend answers it,
+            # so a retry (a genuinely new connection, not a retry on the same
+            # dead socket) is usually enough to land on a live one. The
+            # SELECT 1 probe exists purely to surface that failure here,
+            # inside the retry loop, instead of letting a "successfully
+            # connected" connection die on the caller's first real query.
+            last_err = None
+            for attempt in range(1, 4):
+                try:
+                    self.connection = psycopg2.connect(**connect_params)
+                    self.connection.autocommit = True
+                    with self.connection.cursor() as cur:
+                        cur.execute("SELECT 1")
+                    last_err = None
+                    break
+                except Exception as ex:
+                    last_err = ex
+                    try:
+                        self.connection.close()
+                    except Exception:
+                        pass
+                    self.connection = None
+                    if attempt < 3:
+                        logger.warning(
+                            f"PostgreSQL connect attempt {attempt} failed "
+                            f"({ex}) — retrying"
+                        )
+                        time.sleep(0.5)
+            if last_err is not None:
+                raise last_err
+
+            # A Postgres database can hold many schemas beyond the 'public'
+            # default (get_tables/get_views/etc. below all key off
+            # current_schema()) — config["schema"] lets a connection profile
+            # pin one, set here via search_path so every later query on this
+            # connection resolves unqualified names against it.
+            if config.get("schema"):
+                try:
+                    with self.connection.cursor() as cur:
+                        cur.execute(
+                            f"SET search_path TO {self._q(config['schema'])}, public"
+                        )
+                except Exception as ex:
+                    logger.warning(f"Failed to set PostgreSQL search_path: {ex}")
 
             if config.get("read_only"):
                 try:
@@ -1054,8 +1105,8 @@ class DbService:
         elif self.db_type == "postgresql":
             cursor = self.connection.cursor()
             cursor.execute("""
-                SELECT tablename FROM pg_tables 
-                WHERE schemaname = 'public'
+                SELECT tablename FROM pg_tables
+                WHERE schemaname = current_schema()
                 ORDER BY tablename
             """)
             result = cursor.fetchall()
@@ -1089,8 +1140,8 @@ class DbService:
         elif self.db_type == "postgresql":
             cursor = self.connection.cursor()
             cursor.execute("""
-                SELECT viewname FROM pg_views 
-                WHERE schemaname = 'public'
+                SELECT viewname FROM pg_views
+                WHERE schemaname = current_schema()
                 ORDER BY viewname
             """)
             result = cursor.fetchall()
@@ -1127,8 +1178,8 @@ class DbService:
         elif self.db_type == "postgresql":
             cursor = self.connection.cursor()
             cursor.execute("""
-                SELECT routine_name FROM information_schema.routines 
-                WHERE routine_schema = 'public'
+                SELECT routine_name FROM information_schema.routines
+                WHERE routine_schema = current_schema()
                 ORDER BY routine_name
             """)
             result = cursor.fetchall()
@@ -1283,7 +1334,7 @@ class DbService:
                 cursor.execute("""
                     SELECT table_name, column_name
                     FROM information_schema.columns
-                    WHERE table_schema = 'public'
+                    WHERE table_schema = current_schema()
                     ORDER BY table_name, ordinal_position
                 """)
                 rows = cursor.fetchall()
@@ -1353,7 +1404,7 @@ class DbService:
                              ON tc.constraint_name = kcu.constraint_name
                         WHERE tc.constraint_type = 'PRIMARY KEY'
                     ) pk ON pk.table_name = c.table_name AND pk.column_name = c.column_name
-                    WHERE c.table_schema = 'public'
+                    WHERE c.table_schema = current_schema()
                     ORDER BY c.table_name, c.ordinal_position
                 """)
                 rows = cursor.fetchall()
@@ -1470,6 +1521,31 @@ class DbService:
             df = self.execute_query("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
             return df["datname"].tolist()
         return []
+
+    def get_schemas(self) -> list:
+        """PostgreSQL schemas in the current database (get_tables/get_views/
+        etc. only ever see the one selected via search_path — see
+        connect()'s config["schema"] handling) — used by the schema
+        switcher. Empty for mysql/sqlite, where "database" already plays
+        this role."""
+        if self.db_type != "postgresql":
+            return []
+        df = self.execute_query(
+            "SELECT schema_name FROM information_schema.schemata "
+            "WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
+            "AND schema_name NOT LIKE 'pg_temp%' AND schema_name NOT LIKE 'pg_toast_temp%' "
+            "ORDER BY schema_name"
+        )
+        return df["schema_name"].tolist()
+
+    def set_schema(self, schema: str):
+        """Repoint this already-open PostgreSQL connection at a different
+        schema (see connect()'s config["schema"] handling) — no reconnect
+        needed, unlike switching database."""
+        if self.db_type != "postgresql" or not self.connection:
+            return
+        with self.connection.cursor() as cur:
+            cur.execute(f"SET search_path TO {self._q(schema)}, public")
 
     def describe_table(self, table_name):
 

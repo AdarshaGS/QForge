@@ -64,11 +64,13 @@ def fetch_schema_snapshot(config: dict, on_tables_ready=None) -> dict:
                 df = db.execute_query(
                     "SELECT datname FROM pg_database WHERE datistemplate = false")
                 result["dbs"] = df["datname"].tolist()
+                result["schemas"] = db.get_schemas()
             else:
                 result["dbs"] = []
         except Exception as ex:
             logger.debug(f"Failed to list databases: {ex}")
             result["dbs"] = []
+            result["schemas"] = []
 
         try:
             result["tables"] = db.get_tables()

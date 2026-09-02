@@ -514,6 +514,7 @@ class ConnectionPanel(QWidget):
         self.all_schema_items = []
         self.current_theme = "dark"
         self._available_dbs: list[str] = []
+        self._available_schemas: list[str] = []
 
         # Schema sidebar category filter (All Tables / Views / Functions) —
         # a flat, single-category-at-a-time list styled after a categorized
@@ -590,8 +591,19 @@ class ConnectionPanel(QWidget):
         self.db_pill = QPushButton()
         self.db_pill.setToolTip("Switch database (Cmd+K)")
         self.db_pill.clicked.connect(self.show_db_switcher)
-        self._apply_pill_style()
         left_layout.addWidget(self.db_pill)
+
+        # Schema pill — PostgreSQL only (a database can hold many schemas
+        # beyond 'public'; get_tables()/etc. only ever see one at a time via
+        # search_path). Hidden until _update_pill_label() finds schemas to
+        # switch between.
+        self.schema_pill = QPushButton()
+        self.schema_pill.setToolTip("Switch schema")
+        self.schema_pill.clicked.connect(self.show_schema_switcher)
+        self.schema_pill.setVisible(False)
+        left_layout.addWidget(self.schema_pill)
+
+        self._apply_pill_style()
 
         # Cmd+K shortcut (also works as Ctrl+K on non-mac)
         QShortcut(QKeySequence("Ctrl+K"), self).activated.connect(self.show_db_switcher)
@@ -1125,6 +1137,7 @@ class ConnectionPanel(QWidget):
         # Update DB list + pill
         dbs = result.get("dbs", [])
         self._available_dbs = dbs
+        self._available_schemas = result.get("schemas", [])
         if "switched_db" in result:
             new_db = result["switched_db"]
             self.config["database"] = new_db
@@ -1250,6 +1263,57 @@ class ConnectionPanel(QWidget):
         # _connect_in_background).
         self.db_pill.setEnabled(bool(self._available_dbs) and not self._connecting)
 
+        # Every real Postgres database has a 'public' schema, so
+        # get_schemas() is practically never empty — only worth a switcher
+        # when there's actually more than one to pick from (issue #238).
+        has_schemas = len(self._available_schemas) > 1
+        self.schema_pill.setVisible(has_schemas)
+        if has_schemas:
+            current_schema = self.config.get("schema") or "public"
+            self.schema_pill.setText(f"  schema: {current_schema}")
+            self.schema_pill.setEnabled(not self._connecting)
+
+    def show_schema_switcher(self):
+        """Popup twin of show_db_switcher() below, for PostgreSQL schemas."""
+        if len(self._available_schemas) <= 1:
+            return
+        current_schema = self.config.get("schema") or "public"
+        dialog = DbSwitcherDialog(self._available_schemas, current_schema, self,
+                                   placeholder="Switch schema…")
+        dialog.move(self.schema_pill.mapToGlobal(
+            self.schema_pill.rect().bottomLeft()))
+        dialog.db_selected.connect(self._switch_schema)
+        self._schema_switcher_dialog = dialog
+        dialog.show()
+
+    def _switch_schema(self, new_schema: str):
+        if new_schema == (self.config.get("schema") or "public"):
+            return
+        if self._connecting:
+            QMessageBox.information(
+                self, "Connecting…",
+                "Still connecting to the database — try switching in a moment.")
+            return
+
+        self.schema_tree.clear()
+        self.schema_tree.addTopLevelItem(QTreeWidgetItem(["Switching schema…"]))
+        from PySide6.QtWidgets import QApplication as _QApp
+        _QApp.processEvents()
+
+        # Unlike _switch_database, this never needs a reconnect — Postgres
+        # schemas live inside one already-open database connection, so
+        # just repointing search_path is enough (see DbService.set_schema).
+        if self.db_service.connection:
+            try:
+                self.db_service.set_schema(new_schema)
+            except Exception as ex:
+                self._on_schema_error(str(ex))
+                return
+
+        self.config["schema"] = new_schema
+        self._update_pill_label()
+        self._spawn_schema_fetch(dict(self.config))
+
     def show_db_switcher(self):
         """Open the Cmd+K database switcher dialog."""
         if not self._available_dbs:
@@ -1305,6 +1369,12 @@ class ConnectionPanel(QWidget):
         else:
             try:
                 self.db_service.disconnect()
+                # Schemas are per-database — a schema pinned in the old
+                # database may not exist in new_db, so don't carry it over
+                # (SET search_path to a nonexistent schema silently resolves
+                # nothing rather than erroring, which would look identical
+                # to "no tables" here).
+                self.config.pop("schema", None)
                 self.db_service.connect(dict(self.config, database=new_db))
             except Exception as ex:
                 self._on_schema_error(str(ex))
@@ -3334,7 +3404,7 @@ class ConnectionPanel(QWidget):
     def _apply_pill_style(self):
         is_dark = self.current_theme == "dark"
         if is_dark:
-            self.db_pill.setStyleSheet("""
+            style = """
                 QPushButton {
                     text-align: left;
                     padding: 5px 10px;
@@ -3351,9 +3421,9 @@ class ConnectionPanel(QWidget):
                     color: #ffffff;
                 }
                 QPushButton:pressed { background-color: #0A84FF33; }
-            """)
+            """
         else:
-            self.db_pill.setStyleSheet("""
+            style = """
                 QPushButton {
                     text-align: left;
                     padding: 5px 10px;
@@ -3369,7 +3439,9 @@ class ConnectionPanel(QWidget):
                     background-color: #f2f2f7;
                 }
                 QPushButton:pressed { background-color: #007AFF22; }
-            """)
+            """
+        self.db_pill.setStyleSheet(style)
+        self.schema_pill.setStyleSheet(style)
 
     @staticmethod
     def _toggle_style_for(is_dark: bool) -> str:

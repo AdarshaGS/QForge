@@ -23,7 +23,7 @@ _FILE = os.path.join(app_data_dir(), "schema_cache.json")
 
 # Structural metadata only — never row data, query results, or credentials.
 _CACHED_KEYS = ("tables", "columns", "column_details", "foreign_keys",
-                "views", "functions", "server_version", "dbs")
+                "views", "functions", "server_version", "dbs", "schemas")
 
 # ponytail: fixed default rather than a per-profile setting — add a UI knob
 # if users ever ask to tune it. Only affects the "stale" UI hint below; a
