@@ -558,7 +558,14 @@ class EditableTableWidget(QTableWidget):
                 for col in range(len(dataframe.columns)):
                     value = dataframe.iloc[row, col]
 
-                    display_text = "" if pd.isna(value) else _cell_display_text(value)
+                    # pd.isna() on a non-scalar (a Postgres array-typed
+                    # column, or a JSON value that decoded to a list)
+                    # returns an array of bools, not one bool — ambiguous
+                    # in this condition. A NULL always arrives as scalar
+                    # None, so a non-scalar here is a real value, not a
+                    # NULL; skip straight to display text for it.
+                    is_na = pd.api.types.is_scalar(value) and pd.isna(value)
+                    display_text = "" if is_na else _cell_display_text(value)
 
                     item = QTableWidgetItem(display_text)
                     item.setData(Qt.UserRole, dataframe.iloc[row, col])  # Store original value
@@ -890,7 +897,10 @@ class EditableTableWidget(QTableWidget):
 
         original_value = item.data(Qt.UserRole)
         current_value = item.text()
-        unchanged = (current_value == "" and pd.isna(original_value)) or \
+        # See _display_data_impl's identical guard: pd.isna() on a
+        # non-scalar (array/list) value is ambiguous, not falsy.
+        original_is_na = pd.api.types.is_scalar(original_value) and pd.isna(original_value)
+        unchanged = (current_value == "" and original_is_na) or \
             _cell_display_text(original_value) == current_value
 
         if unchanged:
@@ -1232,7 +1242,11 @@ class EditableTableWidget(QTableWidget):
             col_name = self.horizontalHeaderItem(col).text()
             item = self.item(row, col)
             original_value = item.data(Qt.UserRole)
-            if pd.isna(original_value):
+            # See _display_data_impl's identical guard: pd.isna() on a
+            # non-scalar (array/list) value is ambiguous, not falsy — and
+            # never actually a NULL (psycopg2 already represents NULL as
+            # scalar None).
+            if pd.api.types.is_scalar(original_value) and pd.isna(original_value):
                 where_parts.append(f"{col_name} IS NULL")
             elif isinstance(original_value, (bytes, bytearray)):
                 # A BLOB column's raw value needs a binary literal (X'...')

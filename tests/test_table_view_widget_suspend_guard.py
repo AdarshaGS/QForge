@@ -12,11 +12,22 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
+from PySide6.QtTest import QTest
 
 from ui.table_view_widget import TableViewWidget
 from utils import perf_metrics
 
 _app = QApplication.instance() or QApplication([])
+
+
+def _pump_until_loaded(w, timeout_ms=5000):
+    """load_table_data() now runs its DB work on a background QThread —
+    wait for it to finish (via the _loading flag it clears) instead of
+    asserting immediately after a call that used to be synchronous."""
+    elapsed = 0
+    while getattr(w, "_loading", False) and elapsed < timeout_ms:
+        QTest.qWait(10)
+        elapsed += 10
 
 
 class _FakeDbService:
@@ -45,7 +56,8 @@ def test_page_load_overlapping_suspend_window_is_filtered_not_recorded():
     perf_metrics._SUSPEND_WINDOWS.append((now - 5, now + 5))
 
     rows = pd.DataFrame({"id": [1, 2, 3]})
-    TableViewWidget(_FakeDbService(rows), "t")
+    w = TableViewWidget(_FakeDbService(rows), "t")
+    _pump_until_loaded(w)
 
     assert "page_load" not in perf_metrics.snapshot().get("result_grid", {})
     assert perf_metrics.counter_get("suspend_filtered") == {"page_load": 1}
@@ -53,7 +65,8 @@ def test_page_load_overlapping_suspend_window_is_filtered_not_recorded():
 
 def test_page_load_without_suspend_window_is_recorded_normally():
     rows = pd.DataFrame({"id": [1, 2, 3]})
-    TableViewWidget(_FakeDbService(rows), "t")
+    w = TableViewWidget(_FakeDbService(rows), "t")
+    _pump_until_loaded(w)
 
     assert "page_load" in perf_metrics.snapshot().get("result_grid", {})
     assert perf_metrics.counter_get("suspend_filtered") == {}

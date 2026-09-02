@@ -15,10 +15,21 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
+from PySide6.QtTest import QTest
 
 from ui.table_view_widget import TableViewWidget
 
 _app = QApplication.instance() or QApplication([])
+
+
+def _pump_until_loaded(w, timeout_ms=5000):
+    """load_table_data() now runs its DB work on a background QThread —
+    wait for it to finish (via the _loading flag it clears) instead of
+    asserting immediately after a call that used to be synchronous."""
+    elapsed = 0
+    while getattr(w, "_loading", False) and elapsed < timeout_ms:
+        QTest.qWait(10)
+        elapsed += 10
 
 
 class FakeDbService:
@@ -59,7 +70,9 @@ class FakeDbServiceWithEstimate(FakeDbService):
 
 
 def _widget(db_service):
-    return TableViewWidget(db_service, "permissions")
+    w = TableViewWidget(db_service, "permissions")
+    _pump_until_loaded(w)
+    return w
 
 
 def test_unfiltered_load_keeps_real_rows_despite_stale_zero_count():
@@ -77,6 +90,7 @@ def test_filtered_load_sets_total_rows_without_crashing():
 
     w.current_filter = "id > 0"
     w.load_table_data()
+    _pump_until_loaded(w)
 
     assert w.total_rows == 3
     assert "Error" not in w.limit_label.text()
@@ -92,10 +106,13 @@ def test_page_turn_and_sort_do_not_recount():
     assert db.count_queries == 1  # initial load
 
     w.next_page()
+    _pump_until_loaded(w)
     w.on_column_header_clicked(0)  # sort by first column
+    _pump_until_loaded(w)
     assert db.count_queries == 1  # neither re-ran COUNT(*)
 
     w.apply_all_filters()
+    _pump_until_loaded(w)
     assert db.count_queries == 2  # filter change does recount
 
 
@@ -121,6 +138,7 @@ def test_filtered_load_still_counts_even_with_estimate_available():
     w.current_filter = "id > 0"
     w.total_rows = None  # what reset_and_load_first_page() does on a real filter apply
     w.load_table_data()
+    _pump_until_loaded(w)
 
     assert db.count_queries == 1
     assert w.total_rows == 3

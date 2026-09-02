@@ -1639,7 +1639,7 @@ class ConnectionPanel(QWidget):
         if not self._under_tab_limit(silent):
             return
 
-        tv = TableViewWidget(self.db_service, table_name)
+        tv = TableViewWidget(self.db_service, table_name, self.config)
         tv.execute_query_signal.connect(self._run_query_in_tab)
         tab_index = self.tabs.addTab(tv, table_name)
         self._attach_close_btn(tab_index)
@@ -2270,6 +2270,12 @@ class ConnectionPanel(QWidget):
             except Exception as ex:
                 logger.debug(f"Failed to close tab transaction connection: {ex}")
             w._tx_db_service = None
+        dedicated_db = getattr(w, '_dedicated_db', None)
+        if dedicated_db is not None:
+            try:
+                dedicated_db.disconnect()
+            except Exception as ex:
+                logger.debug(f"Failed to close tab's dedicated connection: {ex}")
         self.tabs.removeTab(index)
 
     def _rename_tab(self, index):

@@ -20,9 +20,11 @@ from ui.theme_manager import ThemeManager
 
 from ui.sql_tab import SqlTab
 from ui.edit_error_dialog import show_save_errors
+from services.db_service import DbService
 from utils.logger import get_logger
 from utils import perf_metrics
 import pandas as pd
+import threading
 import time
 
 logger = get_logger()
@@ -103,11 +105,29 @@ class TableViewWidget(QWidget):
     execute_query_signal = Signal(object)  # Signal to execute query in query editor tab
     dirty_changed = Signal(bool)           # True = unsaved changes, False = clean
 
-    def __init__(self, db_service, table_name, parent=None):
+    # Bridge signals for load_table_data()/commit_changes()'s background
+    # threading.Thread workers (same pattern as SchemaCompareDialog/
+    # DataCompareDialog's _worker()+signal.emit()) — Qt auto-marshals the
+    # connected slot to this widget's (main) thread, so the worker thread
+    # itself needs no QThread/event-loop machinery of its own.
+    _page_loaded = Signal(object)
+    _page_load_errored = Signal(str)
+    _commit_done = Signal(object)
+    _commit_errored = Signal(str)
+
+    def __init__(self, db_service, table_name, config=None, parent=None):
         super().__init__(parent)
 
         self.db_service = db_service
         self.table_name = table_name
+        self.config = config
+        # A dedicated connection for background queries/writes — never the
+        # shared self.db_service, which every other open tab and the schema
+        # tree also touch with no locking (services/db_service.py:373-377).
+        # Opened lazily by _get_worker_db(); closed by the owning
+        # ConnectionPanel._close_tab.
+        self._dedicated_db = None
+        self._loading = False
         self.current_filter = ""
         self.columns = []
         self._primary_keys = None   # lazily fetched once — see load_table_data()
@@ -140,6 +160,11 @@ class TableViewWidget(QWidget):
         # Add Cmd+S shortcut to save changes
         self.save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         self.save_shortcut.activated.connect(self.commit_changes)
+
+        self._page_loaded.connect(self._apply_page_result)
+        self._page_load_errored.connect(self._on_page_load_failed)
+        self._commit_done.connect(self._apply_commit_result)
+        self._commit_errored.connect(self._on_commit_failed)
 
         # Load first page of data
         self.reset_and_load_first_page()
@@ -444,6 +469,26 @@ class TableViewWidget(QWidget):
         # which rows match, so skip the recount.
         self.reset_and_load_first_page(keep_count=True)
 
+    def _get_worker_db(self):
+        """The connection background loads/saves should use. Opens (once)
+        a connection dedicated to this tab so its queries can run on a
+        background thread without racing the shared self.db_service other
+        tabs use. Falls back to self.db_service — synchronously, on the
+        caller's thread — if no config was given or the dedicated connect
+        fails, so the tab still works, just without the async benefit."""
+        if self._dedicated_db is not None:
+            return self._dedicated_db
+        if not self.config:
+            return self.db_service
+        try:
+            db = DbService()
+            db.connect(self.config)
+            self._dedicated_db = db
+            return db
+        except Exception as ex:
+            logger.debug(f"Dedicated connection failed for {self.table_name}, falling back to shared: {ex}")
+            return self.db_service
+
     def _warn_and_discard_changes(self):
         """Every reload path (refresh, page change, sort, filter) overwrites
         the grid with a fresh query result — there was previously no warning
@@ -462,169 +507,234 @@ class TableViewWidget(QWidget):
             icon="⚠", kind="warning",
         )
 
-    def reset_and_load_first_page(self, keep_count: bool = False):
+    def reset_and_load_first_page(self, keep_count: bool = False, warn: bool = True):
         """Reset to the first page and load it. *keep_count* skips the
         total_rows reset for callers (e.g. sort) that don't change which
-        rows match, only their order — avoiding a needless recount."""
-        self._warn_and_discard_changes()
+        rows match, only their order — avoiding a needless recount.
+        *warn* controls the discard toast: callers reloading after a
+        successful save pass False since those changes are persisted,
+        not discarded."""
+        if warn:
+            self._warn_and_discard_changes()
         self.current_page = 1
         if not keep_count:
             self.total_rows = None
         self.load_table_data()
 
     def load_table_data(self):
-        """Load the current page for current filter and sort, refreshing row count"""
-        _page_load_t0 = time.perf_counter()
-        _page_load_wall_start = time.time()
-        try:
-            # Cached across page turns and sort changes — those don't alter
-            # the row count, so re-running a count on every next/prev click
-            # was pure waste. Only filter changes, refresh, and save reset
-            # total_rows to None to force a recount.
-            #
-            # For an unfiltered table, prefer the catalog's stats-based row
-            # estimate over a real COUNT(*): on a huge table (hundreds of
-            # GB) a real COUNT(*) is a full scan that can block the UI for
-            # minutes just to open the table. The estimate can be stale, but
-            # it can't hide real data — the "bump up if a full page came
-            # back" logic below already corrects any undercount, so the only
-            # downside of a stale estimate is a wrong-looking "of N rows"
-            # label, never missing rows. A WHERE clause has no such catalog
-            # stat, so filtered loads still pay for a real COUNT(*).
-            if self.total_rows is None:
-                estimate = None
-                if not self.current_filter:
-                    get_estimate = getattr(self.db_service, "get_estimated_row_count", None)
-                    if get_estimate:
-                        try:
-                            estimate = get_estimate(self.table_name)
-                        except Exception as ex:
-                            logger.debug(f"Row count estimate failed for {self.table_name}: {ex}")
+        """Load the current page for current filter and sort, refreshing row
+        count. The DB work runs on a background thread (via _fetch_page) so
+        a slow/remote query doesn't freeze the UI — every caller
+        (reset_and_load_first_page, on_column_header_clicked, prev_page,
+        next_page, apply_all_filters, clear_all_filters,
+        refresh_current_view, commit_changes) routes through here, so this
+        one re-entrancy guard covers all of them."""
+        if self._loading:
+            return
+        self._loading = True
+        self._page_load_t0 = time.perf_counter()
+        self._page_load_wall_start = time.time()
+        self.loading_overlay.show()
+        self.loading_overlay.raise_()
+        self.prev_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
 
-                if estimate is not None:
-                    self.total_rows = estimate
-                else:
+        def _worker():
+            try:
+                result = self._fetch_page()
+            except Exception as ex:
+                self._page_load_errored.emit(str(ex))
+            else:
+                self._page_loaded.emit(result)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _fetch_page(self):
+        """Runs on the background thread started by load_table_data() —
+        must never touch Qt widgets, only self's plain attributes (safe:
+        the _loading guard means nothing else mutates them meanwhile) and
+        the DB. Returns a dict consumed by _apply_page_result() on the main
+        thread."""
+        db = self._get_worker_db()
+        total_rows = self.total_rows
+
+        # Cached across page turns and sort changes — those don't alter
+        # the row count, so re-running a count on every next/prev click
+        # was pure waste. Only filter changes, refresh, and save reset
+        # total_rows to None to force a recount.
+        #
+        # For an unfiltered table, prefer the catalog's stats-based row
+        # estimate over a real COUNT(*): on a huge table (hundreds of
+        # GB) a real COUNT(*) is a full scan that can block the UI for
+        # minutes just to open the table. The estimate can be stale, but
+        # it can't hide real data — the "bump up if a full page came
+        # back" logic below already corrects any undercount, so the only
+        # downside of a stale estimate is a wrong-looking "of N rows"
+        # label, never missing rows. A WHERE clause has no such catalog
+        # stat, so filtered loads still pay for a real COUNT(*).
+        if total_rows is None:
+            estimate = None
+            if not self.current_filter:
+                get_estimate = getattr(db, "get_estimated_row_count", None)
+                if get_estimate:
                     try:
-                        where_clause = f" WHERE {self.current_filter}" if self.current_filter else ""
-                        count_query = f"SELECT COUNT(*) as total FROM {self.table_name}{where_clause}"  # nosec B608
-                        count_df = self.db_service.execute_query(count_query)
-                        self.total_rows = int(count_df.iloc[0]['total'])
+                        estimate = get_estimate(self.table_name)
                     except Exception as ex:
-                        logger.debug(f"Row count failed for {self.table_name}: {ex}")
-                        self.total_rows = 1000000
-            
-            # Calculate offset
-            offset = (self.current_page - 1) * self.page_size
-            
-            # Build ORDER BY clause
-            order_clause = ""
-            if self.sort_column:
-                order_clause = f" ORDER BY {self.sort_column} {self.sort_order}"
-            
-            # Build query with pagination
-            if self.current_filter:
-                query = f"SELECT * FROM {self.table_name} WHERE {self.current_filter}{order_clause} LIMIT {self.page_size} OFFSET {offset}"  # nosec B608
-            else:
-                query = f"SELECT * FROM {self.table_name}{order_clause} LIMIT {self.page_size} OFFSET {offset}"  # nosec B608
-            
-            df = self.db_service.execute_query(query)
-            
-            # Store column names for filter - even if table is empty
-            if not self.columns:
-                # Try to get columns from table structure if data is empty
-                if len(df.columns) > 0:
-                    self.columns = list(df.columns)
-                else:
-                    # Fallback: get structure from database
-                    try:
-                        cols = self.db_service.get_columns(self.table_name)
-                        self.columns = [col.get('Field', '') for col in cols]
-                    except Exception:
-                        pass
+                        logger.debug(f"Row count estimate failed for {self.table_name}: {ex}")
 
-                if self.columns:
-                    # Update all filter row column combos
-                    for i in range(self.filter_rows_layout.count()):
-                        row_widget = self.filter_rows_layout.itemAt(i).widget()
-                        if row_widget:
-                            column_combo = row_widget.findChild(QComboBox, "column_combo")
-                            if column_combo:
-                                current = column_combo.currentText()
-                                column_combo.clear()
-                                column_combo.addItems(self.columns)
-                                if current in self.columns:
-                                    column_combo.setCurrentText(current)
-            
-            # Any approximate row-count statistic (MySQL's TABLE_ROWS, or a
-            # stale/cached COUNT) can be wrong in either direction — not
-            # just "reads 0 right after a bulk load", but stale-too-small
-            # on any table with enough writes since the last ANALYZE. Never
-            # let it override what was actually fetched: a full page means
-            # there's likely more beyond it, so bump the estimate up rather
-            # than letting a too-small stale number cap pagination and hide
-            # real data on every later page.
-            if len(df) > 0:
-                got_full_page = len(df) == self.page_size
-                min_known_rows = offset + len(df) + (1 if got_full_page else 0)
-                self.total_rows = max(self.total_rows, min_known_rows)
-            elif self.total_rows == 0 and self.columns:
-                import pandas as pd
-                df = pd.DataFrame(columns=self.columns)
-            
-            self.data_table.load_data(df, table_name=self.table_name)
-            if self._primary_keys is None:
+            if estimate is not None:
+                total_rows = estimate
+            else:
                 try:
-                    self._primary_keys = self.db_service.get_primary_keys(self.table_name)
+                    where_clause = f" WHERE {self.current_filter}" if self.current_filter else ""
+                    count_query = f"SELECT COUNT(*) as total FROM {self.table_name}{where_clause}"  # nosec B608
+                    count_df = db.execute_query(count_query)
+                    total_rows = int(count_df.iloc[0]['total'])
                 except Exception as ex:
-                    logger.debug(f"get_primary_keys failed for {self.table_name}: {ex}")
-                    self._primary_keys = []
-            self.data_table.set_primary_key_columns(self._primary_keys)
-            _page_load_ms = (time.perf_counter() - _page_load_t0) * 1000
-            # issue #174: a page load spanning a detected system
-            # suspend/sleep isn't a real measurement of this operation's
-            # cost — don't let it pollute page_load's mean/p95 with a
-            # number that has nothing to do with query or render speed.
-            if perf_metrics.likely_suspended_between(_page_load_wall_start, time.time()):
-                perf_metrics.counter_inc("suspend_filtered", "page_load")
-                logger.info(
-                    f"load_table_data took {_page_load_ms:.0f}ms but overlapped a detected "
-                    "system suspend — not recorded as a normal page_load sample"
-                )
+                    logger.debug(f"Row count failed for {self.table_name}: {ex}")
+                    total_rows = 1000000
+
+        # Calculate offset
+        offset = (self.current_page - 1) * self.page_size
+
+        # Build ORDER BY clause
+        order_clause = ""
+        if self.sort_column:
+            order_clause = f" ORDER BY {self.sort_column} {self.sort_order}"
+
+        # Build query with pagination
+        if self.current_filter:
+            query = f"SELECT * FROM {self.table_name} WHERE {self.current_filter}{order_clause} LIMIT {self.page_size} OFFSET {offset}"  # nosec B608
+        else:
+            query = f"SELECT * FROM {self.table_name}{order_clause} LIMIT {self.page_size} OFFSET {offset}"  # nosec B608
+
+        df = db.execute_query(query)
+
+        # Store column names for filter - even if table is empty
+        columns = self.columns
+        if not columns:
+            # Try to get columns from table structure if data is empty
+            if len(df.columns) > 0:
+                columns = list(df.columns)
             else:
-                perf_metrics.record("result_grid", "page_load", _page_load_ms)
-            perf_metrics.record("result_grid", "rows_rendered", len(df))
-            # load_data() resets the grid's own sort state — restore it so
-            # the header shows the arrow/highlight for the column this page
-            # was actually ordered by (sorting itself is done server-side,
-            # above, via ORDER BY, not by EditableTableWidget).
-            if self.sort_column and self.sort_column in df.columns:
-                self.data_table._sort_col = list(df.columns).index(self.sort_column)
-                self.data_table._sort_asc = (self.sort_order == "ASC")
-                self.data_table._apply_sort_header_labels()
+                # Fallback: get structure from database
+                try:
+                    cols = db.get_columns(self.table_name)
+                    columns = [col.get('Field', '') for col in cols]
+                except Exception:
+                    columns = []
+
+        # Any approximate row-count statistic (MySQL's TABLE_ROWS, or a
+        # stale/cached COUNT) can be wrong in either direction — not
+        # just "reads 0 right after a bulk load", but stale-too-small
+        # on any table with enough writes since the last ANALYZE. Never
+        # let it override what was actually fetched: a full page means
+        # there's likely more beyond it, so bump the estimate up rather
+        # than letting a too-small stale number cap pagination and hide
+        # real data on every later page.
+        if len(df) > 0:
+            got_full_page = len(df) == self.page_size
+            min_known_rows = offset + len(df) + (1 if got_full_page else 0)
+            total_rows = max(total_rows, min_known_rows)
+        elif total_rows == 0 and columns:
+            df = pd.DataFrame(columns=columns)
+
+        primary_keys = self._primary_keys
+        if primary_keys is None:
+            try:
+                primary_keys = db.get_primary_keys(self.table_name)
+            except Exception as ex:
+                logger.debug(f"get_primary_keys failed for {self.table_name}: {ex}")
+                primary_keys = []
+
+        return {
+            "df": df, "offset": offset, "total_rows": total_rows,
+            "columns": columns, "primary_keys": primary_keys,
+        }
+
+    def _finish_loading(self):
+        self._loading = False
+        self.loading_overlay.hide()
+
+    def _apply_page_result(self, result):
+        """Main-thread handler for load_table_data()'s worker `_page_loaded`
+        signal — applies a _fetch_page() result to the widgets."""
+        self._finish_loading()
+        df = result["df"]
+        offset = result["offset"]
+        self.total_rows = result["total_rows"]
+        self.columns = result["columns"]
+        self._primary_keys = result["primary_keys"]
+
+        if self.columns:
+            # Update all filter row column combos
+            for i in range(self.filter_rows_layout.count()):
+                row_widget = self.filter_rows_layout.itemAt(i).widget()
+                if row_widget:
+                    column_combo = row_widget.findChild(QComboBox, "column_combo")
+                    if column_combo:
+                        current = column_combo.currentText()
+                        column_combo.clear()
+                        column_combo.addItems(self.columns)
+                        if current in self.columns:
+                            column_combo.setCurrentText(current)
+
+        self.data_table.load_data(df, table_name=self.table_name)
+        self.data_table.set_primary_key_columns(self._primary_keys)
+        _page_load_ms = (time.perf_counter() - self._page_load_t0) * 1000
+        # issue #174: a page load spanning a detected system
+        # suspend/sleep isn't a real measurement of this operation's
+        # cost — don't let it pollute page_load's mean/p95 with a
+        # number that has nothing to do with query or render speed.
+        if perf_metrics.likely_suspended_between(self._page_load_wall_start, time.time()):
+            perf_metrics.counter_inc("suspend_filtered", "page_load")
+            logger.info(
+                f"load_table_data took {_page_load_ms:.0f}ms but overlapped a detected "
+                "system suspend — not recorded as a normal page_load sample"
+            )
+        else:
+            perf_metrics.record("result_grid", "page_load", _page_load_ms)
+        perf_metrics.record("result_grid", "rows_rendered", len(df))
+        # load_data() resets the grid's own sort state — restore it so
+        # the header shows the arrow/highlight for the column this page
+        # was actually ordered by (sorting itself is done server-side,
+        # above, via ORDER BY, not by EditableTableWidget).
+        if self.sort_column and self.sort_column in df.columns:
+            self.data_table._sort_col = list(df.columns).index(self.sort_column)
+            self.data_table._sort_asc = (self.sort_order == "ASC")
+            self.data_table._apply_sort_header_labels()
+        total_pages = (self.total_rows + self.page_size - 1) // self.page_size
+        self.page_label.setText(f"{self.current_page}/{max(1, total_pages)}")
+
+        start_row = offset + 1 if self.total_rows > 0 else 0
+        end_row = min(offset + self.page_size, self.total_rows)
+
+        if self.total_rows == 0:
+            # For empty tables, show message in center
+            self.limit_label.setText(f"No data - 0 rows")
+        elif self.current_filter:
+            self.limit_label.setText(f"Showing {start_row}-{end_row} of {self.total_rows} rows (filtered)")
+        else:
+            self.limit_label.setText(f"Showing {start_row}-{end_row} of {self.total_rows} rows")
+
+        # Update pagination buttons
+        self.prev_btn.setEnabled(self.current_page > 1)
+        self.next_btn.setEnabled(self.current_page < total_pages)
+
+        logger.info(f"Loaded page {self.current_page} ({len(df)} rows) from {self.table_name}")
+        self._load_failed = False
+
+    def _on_page_load_failed(self, msg):
+        """Main-thread handler for load_table_data()'s worker
+        `_page_load_errored` signal."""
+        self._finish_loading()
+        logger.error(f"Failed to load table data: {msg}")
+        self.limit_label.setText(f"Error: {msg}")
+        self._load_failed = True
+        if self.total_rows is not None:
             total_pages = (self.total_rows + self.page_size - 1) // self.page_size
-            self.page_label.setText(f"{self.current_page}/{max(1, total_pages)}")
-            
-            start_row = offset + 1 if self.total_rows > 0 else 0
-            end_row = min(offset + self.page_size, self.total_rows)
-            
-            if self.total_rows == 0:
-                # For empty tables, show message in center
-                self.limit_label.setText(f"No data - 0 rows")
-            elif self.current_filter:
-                self.limit_label.setText(f"Showing {start_row}-{end_row} of {self.total_rows} rows (filtered)")
-            else:
-                self.limit_label.setText(f"Showing {start_row}-{end_row} of {self.total_rows} rows")
-            
-            # Update pagination buttons
             self.prev_btn.setEnabled(self.current_page > 1)
             self.next_btn.setEnabled(self.current_page < total_pages)
-            
-            logger.info(f"Loaded page {self.current_page} ({len(df)} rows) from {self.table_name}")
-            self._load_failed = False
-        except Exception as ex:
-            logger.error(f"Failed to load table data: {str(ex)}", exc_info=True)
-            self.limit_label.setText(f"Error: {str(ex)}")
-            self._load_failed = True
 
     def reload_if_errored(self):
         """Retry the current page if the last load attempt failed (issue
@@ -993,8 +1103,15 @@ class TableViewWidget(QWidget):
     # ─── Data editing ─────────────────────────────────────────────────────────
 
     def commit_changes(self):
-        """Save all changes to the database (Cmd+S)"""
+        """Save all changes to the database (Cmd+S). The actual SQL
+        execution runs on a background thread (reusing load_table_data's
+        _loading guard/overlay, since a save and a page load would
+        otherwise contend for the same dedicated connection) so a large
+        batch of edits doesn't freeze the UI."""
         logger.info("🔵 Cmd+S pressed - checking for changes...")
+
+        if self._loading:
+            return
 
         if not self.data_table.has_changes():
             logger.info("⚪ No changes to save")
@@ -1021,63 +1138,93 @@ class TableViewWidget(QWidget):
 
         logger.info(f"📊 Generated SQL: {len(changes['updates'])} UPDATEs, {len(changes['inserts'])} INSERTs, {len(changes['deletes'])} DELETEs")
 
-        try:
-            # Execute all statements silently
-            errors = []
-            success_count = 0
+        self._loading = True
+        self.loading_overlay.show()
+        self.loading_overlay.raise_()
 
-            # Execute DELETEs first
-            for sql in changes['deletes']:
-                try:
-                    affected = self.db_service.execute_update(sql)
-                    if affected == 0:
-                        raise Exception("matched 0 rows — the row may have already changed or its key no longer matches")
-                    success_count += 1
-                    logger.info(f"✓ DELETE: {sql}")
-                except Exception as e:
-                    errors.append({"kind": "DELETE", "sql": sql, "error": str(e)})
-                    logger.error(f"✗ DELETE failed: {sql} - {str(e)}")
-
-            # Then UPDATEs
-            for sql in changes['updates']:
-                try:
-                    affected = self.db_service.execute_update(sql)
-                    if affected == 0:
-                        raise Exception("matched 0 rows — the row may have already changed or its key no longer matches")
-                    success_count += 1
-                    logger.info(f"✓ UPDATE: {sql}")
-                except Exception as e:
-                    errors.append({"kind": "UPDATE", "sql": sql, "error": str(e)})
-                    logger.error(f"✗ UPDATE failed: {sql} - {str(e)}")
-
-            # Finally INSERTs
-            for sql in changes['inserts']:
-                try:
-                    self.db_service.execute_update(sql)
-                    success_count += 1
-                    logger.info(f"✓ INSERT: {sql}")
-                except Exception as e:
-                    errors.append({"kind": "INSERT", "sql": sql, "error": str(e)})
-                    logger.error(f"✗ INSERT failed: {sql} - {str(e)}")
-
-            # Only show a dialog if there are errors (issue #143: structured
-            # summary + per-failure classification instead of the raw
-            # exception text as the primary message)
-            if errors:
-                show_save_errors(self, success_count, errors)
+        def _worker():
+            try:
+                result = self._run_commit_sql(changes)
+            except Exception as ex:
+                self._commit_errored.emit(str(ex))
             else:
-                # Success - log only, no popup
-                logger.info(f"✓✓✓ Saved {success_count} changes successfully")
+                self._commit_done.emit(result)
 
-            # Reload table data to show saved changes
-            self.reset_and_load_first_page()
-            # Notify parent tab is now clean
-            self.dirty_changed.emit(False)
+        threading.Thread(target=_worker, daemon=True).start()
 
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Save Error",
-                f"Failed to save:\\n{str(e)}"
-            )
-            logger.error(f"Save failed: {str(e)}")
+    def _run_commit_sql(self, changes):
+        """Runs on the background thread started by commit_changes() —
+        executes the staged DELETE/UPDATE/INSERT statements against the
+        dedicated connection and returns (errors, success_count)."""
+        db = self._get_worker_db()
+        errors = []
+        success_count = 0
+
+        # Execute DELETEs first
+        for sql in changes['deletes']:
+            try:
+                affected = db.execute_update(sql)
+                if affected == 0:
+                    raise Exception("matched 0 rows — the row may have already changed or its key no longer matches")
+                success_count += 1
+                logger.info(f"✓ DELETE: {sql}")
+            except Exception as e:
+                errors.append({"kind": "DELETE", "sql": sql, "error": str(e)})
+                logger.error(f"✗ DELETE failed: {sql} - {str(e)}")
+
+        # Then UPDATEs
+        for sql in changes['updates']:
+            try:
+                affected = db.execute_update(sql)
+                if affected == 0:
+                    raise Exception("matched 0 rows — the row may have already changed or its key no longer matches")
+                success_count += 1
+                logger.info(f"✓ UPDATE: {sql}")
+            except Exception as e:
+                errors.append({"kind": "UPDATE", "sql": sql, "error": str(e)})
+                logger.error(f"✗ UPDATE failed: {sql} - {str(e)}")
+
+        # Finally INSERTs
+        for sql in changes['inserts']:
+            try:
+                db.execute_update(sql)
+                success_count += 1
+                logger.info(f"✓ INSERT: {sql}")
+            except Exception as e:
+                errors.append({"kind": "INSERT", "sql": sql, "error": str(e)})
+                logger.error(f"✗ INSERT failed: {sql} - {str(e)}")
+
+        return errors, success_count
+
+    def _apply_commit_result(self, result):
+        """Main-thread handler for commit_changes()'s worker `_commit_done`
+        signal."""
+        self._finish_loading()
+        errors, success_count = result
+
+        # Only show a dialog if there are errors (issue #143: structured
+        # summary + per-failure classification instead of the raw
+        # exception text as the primary message)
+        if errors:
+            show_save_errors(self, success_count, errors)
+        else:
+            # Success - log only, no popup
+            logger.info(f"✓✓✓ Saved {success_count} changes successfully")
+
+        # Reload table data to show saved changes — these were just
+        # persisted, not discarded, so skip the discard-warning toast.
+        self.reset_and_load_first_page(warn=False)
+        # Notify parent tab is now clean
+        self.dirty_changed.emit(False)
+
+    def _on_commit_failed(self, msg):
+        """Main-thread handler for commit_changes()'s worker
+        `_commit_errored` signal — an exception outside the per-statement
+        try/excepts."""
+        self._finish_loading()
+        QMessageBox.critical(
+            self,
+            "Save Error",
+            f"Failed to save:\\n{msg}"
+        )
+        logger.error(f"Save failed: {msg}")
