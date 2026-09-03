@@ -260,9 +260,13 @@ class QuickSearchDialog(QDialog):
         help_text.setStyleSheet("color: #666; font-size: 11px; margin: 5px; text-align: center;")
         help_text.setAlignment(Qt.AlignCenter)
         layout.addWidget(help_text)
-        
-        # Don't populate initially - wait for user input
-        
+
+        # Render the initial (empty-query) state right away — textChanged
+        # only fires on an actual edit, so without this the list stayed
+        # blank until the first keystroke even when there were default
+        # items (e.g. Command Palette's "All Commands") to show up front.
+        self.filter_items("")
+
     def eventFilter(self, obj, event):
         """Handle arrow key navigation from search input"""
         if obj == self.search_input and event.type() == event.Type.KeyPress:

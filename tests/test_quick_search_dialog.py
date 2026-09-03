@@ -30,6 +30,23 @@ def _user_data(dialog, row):
     return dialog.results_list.item(row).data(Qt.UserRole)
 
 
+def test_fresh_open_renders_without_any_keystroke():
+    # Regression guard: filter_items was only wired to textChanged, which
+    # never fires on construction — so a dialog with default items (e.g.
+    # Command Palette's "All Commands") stayed completely blank until the
+    # first keystroke instead of showing them immediately on open.
+    with_defaults = QuickSearchDialog(
+        [("command", "Refresh", None)], recent_items=[("command", "Refresh", None)],
+        empty_state_label="All Commands",
+    )
+    assert with_defaults.results_list.count() == 1
+    assert with_defaults.count_label.text() == "All Commands"
+
+    without_defaults = QuickSearchDialog([("table", "orders", None)])
+    assert without_defaults.results_list.count() == 0
+    assert without_defaults.count_label.text() == "Type to search..."
+
+
 def test_default_search_excludes_columns():
     all_items = [("table", "orders", None), ("view", "order_totals", None)]
     column_items = [("column", "orders.id", "id"), ("column", "orders.total", "total")]
