@@ -135,7 +135,8 @@ class QuickSearchDialog(QDialog):
     COLUMN_FILTER_PREFIX = "c:"
 
     def __init__(self, all_items, parent=None, column_items=None,
-                 recency_scores=None, recent_items=None, sources=None):
+                 recency_scores=None, recent_items=None, sources=None,
+                 empty_state_label="Recent", empty_state_limit=15):
         super().__init__(parent)
 
         # Add Cmd+W shortcut to close dialog
@@ -155,9 +156,15 @@ class QuickSearchDialog(QDialog):
         # recently used — breaks ties within a match tier. Items absent
         # from this dict sort last within their tier (score treated as 0).
         self.recency_scores = recency_scores or {}
-        # issue #242: (item_type, display_text, payload) tuples shown, most
-        # recent first, before the user has typed anything.
+        # (item_type, display_text, payload) tuples shown before the user
+        # has typed anything — originally just "recently opened" (issue
+        # #242), generalized so Command Palette can list every available
+        # command up front instead (issue: palette showed nothing until
+        # you typed, so there was no way to browse what's there). Label
+        # and how many to show without a query are caller-controlled.
         self.recent_items = self._normalize(recent_items or [])
+        self.empty_state_label = empty_state_label
+        self.empty_state_limit = empty_state_limit
         self.setWindowTitle("Quick Search")
         self.setMinimumWidth(700)
         self.setMinimumHeight(500)
@@ -300,11 +307,14 @@ class QuickSearchDialog(QDialog):
         else:
             source_items = self.all_items
 
-        # Nothing typed yet: show recently-used items (issue #242) instead
-        # of an empty "type to search" prompt, when the caller supplied any.
+        # Nothing typed yet: show the caller's default items (recently-used
+        # for Quick Search issue #242, every command for the Command
+        # Palette) instead of an empty "type to search" prompt, when the
+        # caller supplied any.
         if len(search_text) < 1:
             if self.recent_items:
-                self._render_results(self.recent_items[:15], "Recent")
+                self._render_results(
+                    self.recent_items, self.empty_state_label, limit=self.empty_state_limit)
             else:
                 self.count_label.setText("Type to search...")
             return
@@ -346,14 +356,15 @@ class QuickSearchDialog(QDialog):
         item_type, display_text, payload, source_idx, extra = entry
         return self.recency_scores.get((item_type, display_text), 0)
 
-    def _render_results(self, matching_items, section_label):
+    def _render_results(self, matching_items, section_label, limit=15):
         """Populate results_list from *matching_items* (already ordered),
-        capped to 15, and update count_label. *section_label* (e.g.
-        "Recent") is shown instead of the usual result count when given.
-        Each row's type/shortcut badge is painted by QuickSearchItemDelegate
-        (issue #245) from the full tuple stored in Qt.UserRole; item text
-        is just the plain label (+ connection suffix)."""
-        for item_type, display_text, payload, source_idx, extra in matching_items[:15]:
+        capped to *limit*, and update count_label. *section_label* (e.g.
+        "Recent", or Command Palette's "All Commands") is shown instead of
+        the usual result count when given. Each row's type/shortcut badge
+        is painted by QuickSearchItemDelegate (issue #245) from the full
+        tuple stored in Qt.UserRole; item text is just the plain label
+        (+ connection suffix)."""
+        for item_type, display_text, payload, source_idx, extra in matching_items[:limit]:
             # issue #243: disambiguate which connection a result came from,
             # only when this dialog is actually searching more than one.
             suffix = ""
@@ -364,10 +375,10 @@ class QuickSearchDialog(QDialog):
             self.results_list.addItem(item)
 
         total_count = len(matching_items)
-        shown_count = min(total_count, 15)
+        shown_count = min(total_count, limit)
         if section_label:
             self.count_label.setText(section_label if total_count else "Type to search...")
-        elif total_count > 15:
+        elif total_count > limit:
             self.count_label.setText(f"Showing top {shown_count} of {total_count} results")
         elif total_count > 0:
             self.count_label.setText(f"{total_count} result{'s' if total_count != 1 else ''}")

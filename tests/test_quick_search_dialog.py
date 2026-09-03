@@ -97,6 +97,31 @@ def test_empty_query_shows_recent_items():
     assert dialog.count_label.text() == "Recent"
 
 
+def test_empty_state_label_and_limit_are_customizable():
+    # Command Palette reuses this mechanism to list every command up
+    # front, not just a handful of "recent" ones.
+    items = [("command", f"cmd_{i}", None) for i in range(20)]
+    dialog = QuickSearchDialog(
+        items, recent_items=items, empty_state_label="All Commands",
+        empty_state_limit=len(items),
+    )
+
+    dialog.filter_items("")
+
+    assert dialog.results_list.count() == 20
+    assert dialog.count_label.text() == "All Commands"
+
+
+def test_empty_state_still_defaults_to_recent_with_cap_15():
+    items = [("table", f"t_{i}", None) for i in range(20)]
+    dialog = QuickSearchDialog(items, recent_items=items)
+
+    dialog.filter_items("")
+
+    assert dialog.results_list.count() == 15
+    assert dialog.count_label.text() == "Recent"
+
+
 def test_empty_query_without_recent_items_shows_prompt():
     dialog = QuickSearchDialog([("table", "orders", None)])
     dialog.filter_items("")

@@ -78,7 +78,13 @@ def show_command_palette(menu_bar, parent=None):
             extra["reason"] = act.statusTip() or _GENERIC_DISABLED_REASON
         items.append(("command", key.split(":", 1)[1], key, 0, extra))
 
-    dialog = QuickSearchDialog(items, parent)
+    # Show every command up front (grouped by menu, in menu order) rather
+    # than an empty "type to search" prompt — otherwise there's no way to
+    # browse what's available without already knowing what to type for.
+    dialog = QuickSearchDialog(
+        items, parent, recent_items=items,
+        empty_state_label="All Commands", empty_state_limit=len(items),
+    )
     dialog.setWindowTitle("Command Palette")
     dialog.search_input.setPlaceholderText("Type a command…")
 
