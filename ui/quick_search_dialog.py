@@ -4,10 +4,111 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QLabel
+    QLabel,
+    QStyle,
+    QStyledItemDelegate,
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeyEvent, QShortcut, QKeySequence
+from PySide6.QtCore import Qt, Signal, QRect, QSize
+from PySide6.QtGui import QKeyEvent, QShortcut, QKeySequence, QColor, QFont, QFontMetrics
+
+
+class QuickSearchItemDelegate(QStyledItemDelegate):
+    """Paints each row's type as a colored badge (and a command's keyboard
+    shortcut, when it has one) on the right, instead of the old "[Type]"
+    text prefix (issue #245). Modeled on ui/sql_completer.py's
+    SuggestionDelegate badge-drawing approach for a consistent visual
+    language across the app's two popups — not the same class, since that
+    delegate is tightly coupled to SuggestionItem's PK/FK glyph data, which
+    doesn't apply here. A full custom paint() bypasses this dialog's QSS
+    item styling, so backgrounds are hardcoded to match it, same as
+    SuggestionDelegate already does for its own dialog."""
+
+    ROW_H = 32
+    BADGE_H = 18
+    BADGE_W_PAD = 7
+    LEFT_PAD = 10
+
+    # (background, foreground) per item_type, reusing SuggestionDelegate's
+    # palette where the type overlaps; history/command are new here.
+    _BADGE = {
+        "table": (QColor("#1e4a3a"), QColor("#4ec9b0")),
+        "view": (QColor("#1e3a4a"), QColor("#6ab7ff")),
+        "column": (QColor("#1e3a4a"), QColor("#9cdcfe")),
+        "function": (QColor("#4a3a1e"), QColor("#dcdcaa")),
+        "snippet": (QColor("#1a3a1a"), QColor("#89d185")),
+        "history": (QColor("#2a2a3a"), QColor("#9aa5ce")),
+        "command": (QColor("#3a1e4a"), QColor("#c586c0")),
+    }
+    _DEFAULT_BADGE = (QColor("#333333"), QColor("#cccccc"))
+    # issue #246: badge colors for a contextually-disabled row, overriding
+    # whatever its item_type's own badge color would otherwise be.
+    _DISABLED_BADGE = (QColor("#3a3a3a"), QColor("#777777"))
+
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), self.ROW_H)
+
+    def paint(self, painter, option, index):
+        painter.save()
+
+        entry = index.data(Qt.UserRole) or ("", "", "", 0, {})
+        item_type, display_text, payload, source_idx, extra = entry
+        # issue #246: a contextually-unavailable command stays in the list
+        # (rather than being hidden, as before) but reads as unselectable —
+        # greyed badge/text, plus its reason appended to the label.
+        disabled = bool(extra.get("disabled"))
+
+        rect = option.rect
+        is_selected = bool(option.state & QStyle.State_Selected) and not disabled
+        bg = QColor("#0066cc") if is_selected else QColor("#2b2b2b")
+        painter.fillRect(rect, bg)
+
+        # ── Badge (right) ──────────────────────────────────────────────
+        badge_font = QFont(option.font)
+        badge_font.setPointSize(10)
+        badge_font.setBold(False)
+        painter.setFont(badge_font)
+        bfm = QFontMetrics(badge_font)
+
+        badge_text = QuickSearchDialog.TYPE_LABELS.get(item_type, item_type.title())
+        badge_total_w = bfm.horizontalAdvance(badge_text) + self.BADGE_W_PAD * 2
+        badge_x = rect.right() - badge_total_w - 10
+        badge_y = rect.top() + (rect.height() - self.BADGE_H) // 2
+        badge_rect = QRect(badge_x, badge_y, badge_total_w, self.BADGE_H)
+
+        bg_c, fg_c = self._DISABLED_BADGE if disabled else self._BADGE.get(item_type, self._DEFAULT_BADGE)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(bg_c)
+        painter.drawRoundedRect(badge_rect, 3, 3)
+        painter.setPen(fg_c)
+        painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
+
+        # ── Shortcut, just left of the badge (Command Palette rows only) ──
+        text_right = badge_x
+        shortcut = extra.get("shortcut")
+        if shortcut:
+            shortcut_w = bfm.horizontalAdvance(shortcut) + 12
+            shortcut_rect = QRect(badge_x - shortcut_w, badge_y, shortcut_w, self.BADGE_H)
+            painter.setPen(QColor("#555555") if disabled else QColor("#999999"))
+            painter.drawText(shortcut_rect, Qt.AlignCenter, shortcut)
+            text_right = shortcut_rect.left()
+
+        # ── Label text (left) — a disabled row appends its reason ────────
+        text_font = QFont(option.font)
+        text_font.setPointSize(13)
+        painter.setFont(text_font)
+        painter.setPen(QColor("#777777") if disabled else QColor("#ffffff"))
+        text_rect = QRect(
+            rect.left() + self.LEFT_PAD, rect.top(),
+            text_right - rect.left() - self.LEFT_PAD - 8, rect.height(),
+        )
+        label = index.data(Qt.DisplayRole) or ""
+        if disabled and extra.get("reason"):
+            label = f"{label}  —  {extra['reason']}"
+        fm = QFontMetrics(text_font)
+        elided = fm.elidedText(label, Qt.ElideRight, text_rect.width())
+        painter.drawText(text_rect, Qt.AlignVCenter, elided)
+
+        painter.restore()
 
 
 class QuickSearchDialog(QDialog):
@@ -24,9 +125,17 @@ class QuickSearchDialog(QDialog):
         "snippet": "Snippet",
     }
 
-    item_selected = Signal(str, str, str)  # (item_type, display_text, payload)
+    # (item_type, display_text, payload, source_idx) — source_idx is which
+    # entry in `sources` this item came from (issue #243: cross-connection
+    # search). Existing single-source callers pass plain 3-tuples, which
+    # _normalize() below fills in as source_idx 0.
+    item_selected = Signal(str, str, str, int)
 
-    def __init__(self, all_items, parent=None):
+    # Prefix that switches Quick Search to column-only results (issue #241)
+    COLUMN_FILTER_PREFIX = "c:"
+
+    def __init__(self, all_items, parent=None, column_items=None,
+                 recency_scores=None, recent_items=None, sources=None):
         super().__init__(parent)
 
         # Add Cmd+W shortcut to close dialog
@@ -34,7 +143,21 @@ class QuickSearchDialog(QDialog):
         close_shortcut.activated.connect(self.reject)
 
 
-        self.all_items = all_items  # List of (item_type, display_text, payload) tuples
+        # issue #243: which connection each item came from, by index — only
+        # meaningful (and only shown) when a caller searches more than one
+        # connection at once. Single-connection callers leave this empty.
+        self.sources = sources or []
+        self.all_items = self._normalize(all_items)
+        # Columns are kept out of the default result set (issue #241) but
+        # stay searchable via the explicit "c:" prefix below.
+        self.column_items = self._normalize(column_items or [])
+        # issue #242: {(item_type, display_text): score}, higher = more
+        # recently used — breaks ties within a match tier. Items absent
+        # from this dict sort last within their tier (score treated as 0).
+        self.recency_scores = recency_scores or {}
+        # issue #242: (item_type, display_text, payload) tuples shown, most
+        # recent first, before the user has typed anything.
+        self.recent_items = self._normalize(recent_items or [])
         self.setWindowTitle("Quick Search")
         self.setMinimumWidth(700)
         self.setMinimumHeight(500)
@@ -80,7 +203,23 @@ class QuickSearchDialog(QDialog):
         """)
         
         self.init_ui()
-        
+
+    @staticmethod
+    def _normalize(items):
+        """Pads every entry out to the full (item_type, display_text,
+        payload, source_idx, extra) shape: plain 3-tuples (item_type,
+        display_text, payload) get source_idx 0 (issue #243) and extra {}
+        (issue #245); 4-tuples get extra {}."""
+        normalized = []
+        for e in items:
+            if len(e) == 3:
+                normalized.append((*e, 0, {}))
+            elif len(e) == 4:
+                normalized.append((*e, {}))
+            else:
+                normalized.append(e)
+        return normalized
+
     def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -89,7 +228,8 @@ class QuickSearchDialog(QDialog):
         # Search input
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText(
-            "Search tables, columns, views, functions, history, snippets...")
+            "Search tables, views, functions, history, snippets... "
+            f"({self.COLUMN_FILTER_PREFIX} to search columns)")
         self.search_input.textChanged.connect(self.filter_items)
         self.search_input.installEventFilter(self)  # Install event filter for arrow keys
         layout.addWidget(self.search_input)
@@ -101,12 +241,15 @@ class QuickSearchDialog(QDialog):
         
         # Results list
         self.results_list = QListWidget()
+        self.results_list.setItemDelegate(QuickSearchItemDelegate(self.results_list))
         self.results_list.itemDoubleClicked.connect(self.on_item_selected)
         self.results_list.itemActivated.connect(self.on_item_selected)  # Enter key
         layout.addWidget(self.results_list)
         
         # Help text
-        help_text = QLabel("⏎ Enter to open  |  Esc to close  |  ↑↓ to navigate")
+        help_text = QLabel(
+            "⏎ Enter to open  |  Esc to close  |  ↑↓ to navigate  |  "
+            f"{self.COLUMN_FILTER_PREFIX} for columns")
         help_text.setStyleSheet("color: #666; font-size: 11px; margin: 5px; text-align: center;")
         help_text.setAlignment(Qt.AlignCenter)
         layout.addWidget(help_text)
@@ -148,19 +291,31 @@ class QuickSearchDialog(QDialog):
         self.results_list.clear()
         search_text = search_text.lower().strip()
 
-        # Allow 1+ characters for search (improved from 2)
+        # "c:<text>" searches columns only (issue #241) — they're excluded
+        # from the default result set below since they otherwise swamp
+        # table/view matches by sheer volume.
+        if search_text.startswith(self.COLUMN_FILTER_PREFIX):
+            search_text = search_text[len(self.COLUMN_FILTER_PREFIX):].strip()
+            source_items = self.column_items
+        else:
+            source_items = self.all_items
+
+        # Nothing typed yet: show recently-used items (issue #242) instead
+        # of an empty "type to search" prompt, when the caller supplied any.
         if len(search_text) < 1:
-            self.count_label.setText("Type to search...")
+            if self.recent_items:
+                self._render_results(self.recent_items[:15], "Recent")
+            else:
+                self.count_label.setText("Type to search...")
             return
 
-        matching_items = []
         exact_matches = []
         starts_with_matches = []
         contains_matches = []
         fuzzy_matches = []
 
-        for entry in self.all_items:
-            item_type, display_text, payload = entry
+        for entry in source_items:
+            item_type, display_text, payload, source_idx, extra = entry
             display_lower = display_text.lower()
 
             # Prioritize exact matches
@@ -176,26 +331,49 @@ class QuickSearchDialog(QDialog):
             elif self.fuzzy_match(search_text, display_lower):
                 fuzzy_matches.append(entry)
 
-        # Combine in priority order
-        matching_items = exact_matches + starts_with_matches + contains_matches + fuzzy_matches
+        # Within each tier, break ties by recency (issue #242) — the tier
+        # itself (exact > starts-with > contains > fuzzy) still dominates,
+        # this only reorders items that already matched equally well.
+        tiers = [exact_matches, starts_with_matches, contains_matches, fuzzy_matches]
+        if self.recency_scores:
+            for tier in tiers:
+                tier.sort(key=self._recency_of, reverse=True)
 
-        # Limit to 15 results for best UX (like Spotlight)
-        for item_type, display_text, payload in matching_items[:15]:
-            label = self.TYPE_LABELS.get(item_type, item_type.title())
-            item = QListWidgetItem(f"[{label}]  {display_text}")
-            item.setData(Qt.UserRole, (item_type, display_text, payload))
+        matching_items = [e for tier in tiers for e in tier]
+        self._render_results(matching_items, None)
+
+    def _recency_of(self, entry):
+        item_type, display_text, payload, source_idx, extra = entry
+        return self.recency_scores.get((item_type, display_text), 0)
+
+    def _render_results(self, matching_items, section_label):
+        """Populate results_list from *matching_items* (already ordered),
+        capped to 15, and update count_label. *section_label* (e.g.
+        "Recent") is shown instead of the usual result count when given.
+        Each row's type/shortcut badge is painted by QuickSearchItemDelegate
+        (issue #245) from the full tuple stored in Qt.UserRole; item text
+        is just the plain label (+ connection suffix)."""
+        for item_type, display_text, payload, source_idx, extra in matching_items[:15]:
+            # issue #243: disambiguate which connection a result came from,
+            # only when this dialog is actually searching more than one.
+            suffix = ""
+            if len(self.sources) > 1 and 0 <= source_idx < len(self.sources):
+                suffix = f"  ({self.sources[source_idx]})"
+            item = QListWidgetItem(f"{display_text}{suffix}")
+            item.setData(Qt.UserRole, (item_type, display_text, payload, source_idx, extra))
             self.results_list.addItem(item)
-        
-        # Update count
+
         total_count = len(matching_items)
         shown_count = min(total_count, 15)
-        if total_count > 15:
+        if section_label:
+            self.count_label.setText(section_label if total_count else "Type to search...")
+        elif total_count > 15:
             self.count_label.setText(f"Showing top {shown_count} of {total_count} results")
         elif total_count > 0:
             self.count_label.setText(f"{total_count} result{'s' if total_count != 1 else ''}")
         else:
             self.count_label.setText("No results found")
-        
+
         # Select first item
         if self.results_list.count() > 0:
             self.results_list.setCurrentRow(0)
@@ -214,8 +392,14 @@ class QuickSearchDialog(QDialog):
     
     def on_item_selected(self, item):
         """Handle item selection"""
-        item_type, display_text, payload = item.data(Qt.UserRole)
-        self.item_selected.emit(item_type, display_text, payload or "")
+        item_type, display_text, payload, source_idx, extra = item.data(Qt.UserRole)
+        if extra.get("disabled"):
+            # issue #246: a contextually-unavailable command stays visible
+            # (greyed out, with its reason) but can't actually be triggered
+            # from here — Enter/double-click on it is a no-op, dialog stays
+            # open, same as pressing it would do nothing if it were hidden.
+            return
+        self.item_selected.emit(item_type, display_text, payload or "", source_idx)
         self.accept()
     
     def keyPressEvent(self, event: QKeyEvent):

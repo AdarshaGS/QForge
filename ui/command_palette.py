@@ -24,10 +24,11 @@ _PERMANENT_KEEPALIVE = []
 
 
 def _collect_actions(menu_bar):
-    """{key: QAction} for every enabled, non-separator, leaf action under
-    *menu_bar* — skips disabled actions so a command that would currently
-    no-op (e.g. no active connection) isn't offered. See _PERMANENT_KEEPALIVE
-    above for why every `.actions()` list this touches is kept forever."""
+    """{key: QAction} for every non-separator, leaf action under *menu_bar*.
+    Disabled actions are included too (issue #246) — see
+    show_command_palette() for how they're shown greyed out with a reason
+    instead of omitted, as they were before. See _PERMANENT_KEEPALIVE above
+    for why every `.actions()` list this touches is kept forever."""
     actions = {}
     top_actions = menu_bar.actions()
     _PERMANENT_KEEPALIVE.append(top_actions)
@@ -39,7 +40,7 @@ def _collect_actions(menu_bar):
         menu_actions = menu.actions()
         _PERMANENT_KEEPALIVE.append(menu_actions)
         for act in menu_actions:
-            if act.isSeparator() or not act.isEnabled():
+            if act.isSeparator():
                 continue
             text = act.text().replace("&", "").strip()
             if not text:
@@ -48,12 +49,34 @@ def _collect_actions(menu_bar):
     return actions
 
 
+# Shown for a disabled action with no specific statusTip() of its own set
+# (issue #246) — most disabled actions in this app are transient
+# (no-op-if-no-connection lambdas that stay enabled) rather than truly
+# disabled, so this generic fallback is expected to be rare in practice.
+_GENERIC_DISABLED_REASON = "Currently unavailable"
+
+
 def show_command_palette(menu_bar, parent=None):
     action_by_key = _collect_actions(menu_bar)
     if not action_by_key:
         return
 
-    items = [("command", key.split(":", 1)[1], key) for key in action_by_key]
+    items = []
+    for key, act in action_by_key.items():
+        extra = {}
+        # issue #245: show the action's own shortcut in the palette row,
+        # if it has one — QAction already carries it, it just wasn't
+        # passed through before.
+        shortcut = act.shortcut().toString()
+        if shortcut:
+            extra["shortcut"] = shortcut
+        # issue #246: a disabled action is still shown, greyed out, with a
+        # reason — rather than silently omitted as before, which left no
+        # way to tell "doesn't exist" from "unavailable right now".
+        if not act.isEnabled():
+            extra["disabled"] = True
+            extra["reason"] = act.statusTip() or _GENERIC_DISABLED_REASON
+        items.append(("command", key.split(":", 1)[1], key, 0, extra))
 
     dialog = QuickSearchDialog(items, parent)
     dialog.setWindowTitle("Command Palette")

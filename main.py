@@ -20,6 +20,7 @@ from services.license_manager import license_manager
 from ui.command_palette import show_command_palette
 from ui.connection_dialog import ConnectionDialog
 from ui.connection_panel import ConnectionPanel
+from ui.quick_search_dialog import QuickSearchDialog
 from ui.license_dialog import LicenseActionWorker, LicenseDialog
 from ui.theme_manager import ThemeManager
 from ui.perf_overlay import PerfOverlayWidget
@@ -458,6 +459,39 @@ class MainWindow(QMainWindow):
         panel = self._current_panel()
         self.setWindowTitle(f"QForge — {panel.label}" if panel else "QForge")
 
+    # ─── Cross-connection Quick Search (issue #243) ────────────────────────────
+
+    def show_quick_search(self):
+        """With one connection open, defer entirely to its own Quick Search
+        (unchanged UX). With several, search all of them at once — each
+        result is tagged with which connection it came from, and selecting
+        one switches to that connection's tab before acting on it."""
+        if len(self._panels) <= 1:
+            if self._panels:
+                self._panels[0].show_quick_search()
+            return
+
+        sources = [panel.label for panel in self._panels]
+        all_items = []
+        column_items = []
+        for idx, panel in enumerate(self._panels):
+            all_items += [(t, d, p, idx) for t, d, p in panel._gather_quick_search_items()]
+            column_items += [(t, d, p, idx) for t, d, p in panel._gather_column_items()]
+
+        if not all_items and not column_items:
+            QMessageBox.information(self, "No Items", "Nothing to search yet")
+            return
+
+        dialog = QuickSearchDialog(all_items, self, column_items=column_items, sources=sources)
+        dialog.item_selected.connect(self._on_quick_search_cross_panel)
+        dialog.exec()
+
+    def _on_quick_search_cross_panel(self, item_type, display_text, payload, source_idx):
+        if not (0 <= source_idx < len(self._panels)):
+            return
+        self.conn_tab_bar.setCurrentIndex(source_idx)
+        self._panels[source_idx]._on_quick_search(item_type, display_text, payload)
+
     # ─── Open connection ──────────────────────────────────────────────────────
 
     def _prompt_new_connection(self, allow_cancel_quit: bool = False):
@@ -835,9 +869,7 @@ class MainWindow(QMainWindow):
 
         act = view_menu.addAction("Quick Search")
         act.setShortcut("Ctrl+P")
-        act.triggered.connect(
-            lambda: self._current_panel() and self._current_panel().show_quick_search()
-        )
+        act.triggered.connect(self.show_quick_search)
 
         act = view_menu.addAction("Command Palette")
         act.setShortcut("Ctrl+Shift+P")
@@ -913,6 +945,12 @@ class MainWindow(QMainWindow):
         )
 
         act = db_menu.addAction("Refresh Databases")
+        # issue #246: the Command Palette shows *why* a disabled action is
+        # unavailable rather than omitting it outright — statusTip() is
+        # empty by default (unlike toolTip(), which defaults to the
+        # action's own text), so setting it here is what makes this a real
+        # reason instead of the palette's generic fallback.
+        act.setStatusTip("A database refresh is already running")
 
         def _refresh_databases():
             panel = self._current_panel()

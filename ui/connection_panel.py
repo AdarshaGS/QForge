@@ -539,6 +539,13 @@ class ConnectionPanel(QWidget):
         self._available_dbs: list[str] = []
         self._available_schemas: list[str] = []
 
+        # Quick Search recency signal (issue #242): monotonic counter per
+        # table/view name, bumped on every open_table_view() call. In-memory
+        # only (resets each session, like the rest of this panel's state) —
+        # capped so it can't grow unbounded over a very long session.
+        self._recent_table_opens: dict[str, int] = {}
+        self._recent_open_counter = 0
+
         # Schema sidebar category filter (All Tables / Views / Functions) —
         # a flat, single-category-at-a-time list styled after a categorized
         # sidebar with live counts, rather than a nested Tables/Views/
@@ -671,15 +678,18 @@ class ConnectionPanel(QWidget):
         self.table_search.textChanged.connect(self.filter_tables)
         left_layout.addWidget(self.table_search)
 
-        # ── Schema / Queries / History toggle ──────────────────────────
-        # Order is Schema, Queries, History (issue #130) — Queries sits
+        # ── Tables / Queries / History toggle ──────────────────────────
+        # Order is Tables, Queries, History (issue #130) — Queries sits
         # ahead of History since it's the more actively-used workflow.
+        # Labeled "Tables" (issue #240): "Schema" read ambiguously next to
+        # "Queries"/"History", as if it meant a schema-selector rather than
+        # the tree of tables/views/functions it actually shows.
         sidebar_toggle = QWidget()
         toggle_layout = QHBoxLayout(sidebar_toggle)
         toggle_layout.setContentsMargins(0, 0, 0, 0)
         toggle_layout.setSpacing(0)
 
-        self._schema_btn = QPushButton("Schema")
+        self._schema_btn = QPushButton("Tables")
         self._schema_btn.setCheckable(True)
         self._schema_btn.setChecked(True)
         self._schema_btn.setFlat(True)
@@ -1734,12 +1744,28 @@ class ConnectionPanel(QWidget):
             self.config.get("id", ""), is_dark=(self.current_theme == "dark"), parent=self)
         dlg.exec_()
 
+    _MAX_RECENT_TABLE_OPENS = 200
+
+    def _record_recent_table_open(self, table_name: str):
+        """Bump *table_name*'s Quick Search recency score (issue #242).
+        Capped so a very long session opening many distinct tables can't
+        grow this dict without bound — drops the least-recently-touched
+        entries first, same spirit as QueryHistory's own cap-and-prune."""
+        self._recent_open_counter += 1
+        self._recent_table_opens[table_name] = self._recent_open_counter
+        if len(self._recent_table_opens) > self._MAX_RECENT_TABLE_OPENS:
+            oldest = sorted(self._recent_table_opens, key=self._recent_table_opens.get)
+            for name in oldest[:len(self._recent_table_opens) - self._MAX_RECENT_TABLE_OPENS]:
+                del self._recent_table_opens[name]
+
     def open_table_view(self, table_name: str, silent: bool = False, force_new: bool = False):
         """Open a table view; re-focus if already open. *silent* suppresses
         the Free-tier tab-cap prompt for callers restoring a saved session
         rather than acting on a click (issue #154). *force_new* skips the
         re-focus check so "Open in New Tab" always creates a fresh tab
         instead of jumping to an existing one for the same table (issue #179)."""
+        self._record_recent_table_open(table_name)
+
         if not force_new:
             for i in range(self.tabs.count()):
                 w = self.tabs.widget(i)
@@ -3149,15 +3175,14 @@ class ConnectionPanel(QWidget):
     # ─── Quick search ─────────────────────────────────────────────────────────
 
     def _gather_quick_search_items(self):
-        """Build the full (item_type, display_text, payload) list for the
-        command palette: schema items plus columns, recent query history,
-        and SQL snippets. Rebuilt on every open since history/snippets
-        change independently of schema reloads."""
+        """Build the default (item_type, display_text, payload) list for the
+        command palette: schema items, recent query history, and SQL
+        snippets. Rebuilt on every open since history/snippets change
+        independently of schema reloads. Columns are deliberately excluded
+        (issue #241): they used to dominate this list by sheer volume,
+        diluting table/view search — see _gather_column_items() for the
+        explicit "c:"-prefixed column search instead."""
         items = [(item_type, name, None) for item_type, name in self.all_schema_items]
-
-        for table, cols in self._column_cache.items():
-            for col in cols:
-                items.append(("column", f"{table}.{col}", col))
 
         for entry in self.query_history.get_recent_queries(limit=100):
             query = entry.get("query", "").strip()
@@ -3170,12 +3195,57 @@ class ConnectionPanel(QWidget):
 
         return items
 
+    def _gather_column_items(self):
+        """Column-only items for Quick Search's "c:" filter (issue #241)."""
+        items = []
+        for table, cols in self._column_cache.items():
+            for col in cols:
+                items.append(("column", f"{table}.{col}", col))
+        return items
+
+    def _gather_recency_scores(self):
+        """{(item_type, display_text): score} for Quick Search tie-breaking
+        (issue #242) — higher score means more recently used. Table/view
+        opens use the monotonic counter from _record_recent_table_open();
+        history entries use their position in the already-newest-first
+        history list, since that ordering *is* their recency."""
+        scores = {}
+        for name, counter in self._recent_table_opens.items():
+            item_type = "view" if name in self.all_views else "table"
+            scores[(item_type, name)] = counter
+
+        recent_queries = self.query_history.get_recent_queries(limit=100)
+        for idx, entry in enumerate(recent_queries):
+            query = entry.get("query", "").strip()
+            if query:
+                display_text = query.replace("\n", " ")[:80]
+                scores[("history", display_text)] = len(recent_queries) - idx
+        return scores
+
+    def _gather_recent_items(self, limit=8):
+        """(item_type, display_text, payload) tuples for the "Recent" list
+        shown when Quick Search opens with nothing typed (issue #242):
+        the most recently opened tables/views, newest first."""
+        recent_names = sorted(
+            self._recent_table_opens, key=self._recent_table_opens.get, reverse=True
+        )[:limit]
+        items = []
+        for name in recent_names:
+            item_type = "view" if name in self.all_views else "table"
+            items.append((item_type, name, None))
+        return items
+
     def show_quick_search(self):
         items = self._gather_quick_search_items()
-        if not items:
+        column_items = self._gather_column_items()
+        if not items and not column_items:
             QMessageBox.information(self, "No Items", "Nothing to search yet")
             return
-        dialog = QuickSearchDialog(items, self)
+        dialog = QuickSearchDialog(
+            items, self, column_items=column_items,
+            recency_scores=self._gather_recency_scores(),
+            recent_items=self._gather_recent_items(),
+        )
         dialog.item_selected.connect(self._on_quick_search)
         dialog.exec()
 
