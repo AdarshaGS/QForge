@@ -21,6 +21,7 @@ import string
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from typing import Callable
 
 import pandas as pd
 from faker import Faker
@@ -296,3 +297,186 @@ def build_insert_sql(df: pd.DataFrame, table_name: str, dialect: str = "mysql",
     if df.empty:
         return ""
     return _to_sql_inserts(df, table_name, dialect=dialect, batch_kib=batch_kib)
+
+
+# ===========================================================================
+# Dependency-ordered multi-table generation (issue #215)
+# ===========================================================================
+# Still pure Python — the caller (ui/connection_panel.py) does every DB read
+# (bulk FK map, per-table schema, existing row counts, PK offsets) up front
+# and hands it in already-fetched; this module only ever reasons about the
+# in-memory shape of that data. `external_pool_fn` is deliberately the same
+# two-arg (ref_table, ref_column) -> list[value] shape as the existing
+# ConnectionPanel._sample_fk_values, so a caller can pass that method straight
+# through with no wrapping.
+
+@dataclass
+class DependencyChain:
+    tables: list                # ancestors-first, root last
+    external_edges: dict = field(default_factory=dict)  # table -> set of its own FK column names that must fall back to live sampling (self-ref or a broken cycle)
+    truncated: bool = False     # hit max_tables during discovery
+
+
+def build_dependency_chain(all_fks: dict, root: str, max_tables: int = 25) -> DependencyChain:
+    """Walk *all_fks* (the shape `DbService.get_all_foreign_keys()` already
+    returns: {table: [{"column","ref_table","ref_column"}, ...]}) from
+    *root* to find every ancestor table it (transitively) depends on via
+    FK, then order them parents-first.
+
+    A self-referencing FK (ref_table == table) always falls back to live
+    sampling — it can never be resolved purely by ordering. A genuine
+    multi-table cycle is broken deterministically (the edge whose
+    dependent table name sorts last loses) rather than raising, so this
+    always returns a usable order."""
+    # ---- BFS discovery -----------------------------------------------------
+    discovered = {root}
+    frontier = [root]
+    while frontier and len(discovered) < max_tables:
+        table = frontier.pop(0)
+        for fk in all_fks.get(table, []):
+            ref = fk.get("ref_table")
+            if not ref or ref == table or ref in discovered:
+                continue
+            if len(discovered) >= max_tables:
+                break
+            discovered.add(ref)
+            frontier.append(ref)
+    truncated = bool(frontier) and len(discovered) >= max_tables
+
+    # ---- Classify edges: internal (both ends discovered) vs external ------
+    external_edges: dict = {t: set() for t in discovered}
+    edges = []  # (dependent_table, ref_table, column) — ref_table must precede dependent_table
+    for table in discovered:
+        for fk in all_fks.get(table, []):
+            ref, column = fk.get("ref_table"), fk.get("column")
+            if not ref or not column:
+                continue
+            if ref == table or ref not in discovered:
+                external_edges[table].add(column)
+            else:
+                edges.append((table, ref, column))
+
+    # ---- Kahn's algorithm, breaking any remaining cycle deterministically -
+    remaining = set(discovered)
+    indegree = {t: 0 for t in discovered}
+    for dependent, ref, _col in edges:
+        indegree[dependent] += 1
+
+    ordered = []
+    ready = sorted(t for t in remaining if indegree[t] == 0)
+    live_edges = list(edges)
+    while remaining:
+        if not ready:
+            # Genuine cycle among what's left — drop the edge whose
+            # dependent table name sorts last, demote that column to
+            # external sampling, and retry.
+            cyclic_edges = [e for e in live_edges if e[0] in remaining and e[1] in remaining]
+            dependent, ref, column = max(cyclic_edges, key=lambda e: e[0])
+            live_edges.remove((dependent, ref, column))
+            external_edges[dependent].add(column)
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                ready = [dependent]
+            continue
+        table = ready.pop(0)
+        ordered.append(table)
+        remaining.discard(table)
+        for dependent, ref, _col in live_edges:
+            if ref == table and dependent in remaining:
+                indegree[dependent] -= 1
+                if indegree[dependent] == 0:
+                    ready.append(dependent)
+        ready.sort()
+
+    return DependencyChain(tables=ordered, external_edges=external_edges, truncated=truncated)
+
+
+@dataclass
+class TablePlan:
+    table: str
+    columns: list
+    primary_keys: list
+    foreign_keys: list
+    generated_columns: list = field(default_factory=list)
+    row_count: int = 0          # 0 means "reuse existing rows, don't generate"
+    pk_offset: int = None       # MAX(existing pk) + 1, pre-fetched by the caller
+
+
+def _internal_target_columns(chain: DependencyChain, plans: dict) -> dict:
+    """For every table in the chain, which of its own columns are the
+    *target* of another (generated) table's internal FK — i.e. must have
+    an explicit, known-in-memory value rather than being "omit"-ted."""
+    targets: dict = {t: set() for t in chain.tables}
+    for table in chain.tables:
+        plan = plans.get(table)
+        if not plan or plan.row_count <= 0:
+            continue
+        ext_cols = chain.external_edges.get(table, set())
+        for fk in plan.foreign_keys:
+            if fk.get("column") in ext_cols:
+                continue
+            ref = fk.get("ref_table")
+            if ref in targets:
+                targets[ref].add(fk.get("ref_column"))
+    return targets
+
+
+def generate_chain_dataframes(chain: DependencyChain, plans: dict,
+                               external_pool_fn: Callable) -> dict:
+    """Build one DataFrame per table in *chain.tables* that has
+    `plans[table].row_count > 0`, ancestors first, wiring each parent's
+    freshly-generated (not-yet-inserted) key values forward as the pool
+    for any child FK column that targets it. A table with `row_count == 0`
+    is skipped entirely (its dependents fall back to `external_pool_fn`,
+    exactly today's `_sample_fk_values`-style live sampling)."""
+    internal_targets = _internal_target_columns(chain, plans)
+    dataframes: dict = {}
+
+    for table in chain.tables:
+        plan = plans.get(table)
+        if not plan or plan.row_count <= 0:
+            continue
+
+        lone_pk = plan.primary_keys[0] if len(plan.primary_keys) == 1 else None
+        fk_map = {fk["column"]: fk for fk in plan.foreign_keys}
+        ext_cols = chain.external_edges.get(table, set())
+        generated_set = set(plan.generated_columns)
+        my_targets = internal_targets.get(table, set())
+
+        specs: dict = {}
+        for col in plan.columns:
+            name = col["Field"]
+            if name in generated_set:
+                continue
+            is_pk = name == lone_pk
+            is_fk = name in fk_map
+            generator = infer_generator(col, is_pk=is_pk, is_fk=is_fk)
+            include = generator != "omit"
+            options = {}
+            if name in my_targets and generator == "omit":
+                # A lone integer PK some descendant needs to reference —
+                # force it into memory instead of leaving it to the DB.
+                offset = plan.pk_offset if plan.pk_offset is not None else 1
+                generator, include = "integer", True
+                options = {"min": offset, "max": max(offset, offset + plan.row_count - 1)}
+            specs[name] = ColumnSpec(generator=generator, include=include, options=options)
+
+        fk_pools: dict = {}
+        for name, fk in fk_map.items():
+            spec = specs.get(name)
+            if not spec or not spec.include or spec.generator != "foreign_key":
+                continue
+            ref_table, ref_column = fk["ref_table"], fk["ref_column"]
+            if name in ext_cols:
+                fk_pools[name] = external_pool_fn(ref_table, ref_column)
+                continue
+            parent_df = dataframes.get(ref_table)
+            if parent_df is not None and ref_column in parent_df.columns:
+                fk_pools[name] = parent_df[ref_column].tolist()
+            else:
+                # Parent was a "reuse" table (never generated) — sample it live.
+                fk_pools[name] = external_pool_fn(ref_table, ref_column)
+
+        dataframes[table] = generate_dataframe(plan.columns, plan.row_count, specs, fk_pools)
+
+    return dataframes

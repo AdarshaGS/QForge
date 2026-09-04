@@ -29,6 +29,7 @@ from PySide6.QtGui import QShortcut, QKeySequence, QCursor, QFont
 
 from services.db_service import DbService
 from services import query_cost
+from services import mock_data_generator as mock_gen
 from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
 from services.schema_snapshot import fetch_schema_snapshot
@@ -2576,7 +2577,11 @@ class ConnectionPanel(QWidget):
         (issue #77's "Foreign-key references" generator) — a SELECT, so it
         works even on a read-only connection. Never raises; MockDataDialog
         treats a failed/empty sample as "no valid FK values available" and
-        warns instead of blocking generation entirely."""
+        warns instead of blocking generation entirely. Also reused as-is
+        for issue #215's multi-table generation: it's exactly the shape
+        `generate_chain_dataframes`'s `external_pool_fn` needs (ref_table,
+        ref_column) -> list[value], for any ancestor edge that falls back
+        to live sampling instead of freshly generated in-memory values."""
         db_type = self.db_service.db_type
         table_sql = _quote_identifier(ref_table, db_type)
         col_sql = _quote_identifier(ref_column, db_type)
@@ -2586,6 +2591,52 @@ class ConnectionPanel(QWidget):
         )
         return df.iloc[:, 0].dropna().tolist()
 
+    def _schema_for_table(self, table_name: str) -> tuple:
+        """(columns, primary_keys, foreign_keys, generated_columns) for
+        *table_name* — the same four calls show_mock_data_generator always
+        made for the root table, factored out so issue #215's ancestor
+        panel can fetch the same shape lazily, per ancestor, only once the
+        user actually opts into "Include dependent tables"."""
+        return (
+            self.db_service.get_columns(table_name),
+            self.db_service.get_primary_keys(table_name),
+            self.db_service.get_foreign_keys(table_name),
+            self.db_service.get_generated_columns(table_name),
+        )
+
+    def _existing_row_count(self, table_name: str) -> int:
+        """Best-effort "does this ancestor table already have rows"
+        check for issue #215's reuse-vs-generate default. Prefers the
+        cheap stats-based estimate; only pays for a real read on the rare
+        dialect/version where that estimate isn't available. Never
+        raises — an unknown count is treated as 0 (safe default: generate
+        fresh rather than silently produce an empty FK pool)."""
+        try:
+            estimate = self.db_service.get_estimated_row_count(table_name)
+            if estimate is not None:
+                return estimate
+            table_sql = _quote_identifier(table_name, self.db_service.db_type)
+            df = self.db_service.execute_query(f"SELECT 1 FROM {table_sql} LIMIT 1", max_rows=1)  # nosec B608
+            return len(df)
+        except Exception:
+            return 0
+
+    def _pk_offset(self, table_name: str, column: str) -> int:
+        """MAX(existing value) + 1 for *column* in *table_name* — issue
+        #215's generated ancestor rows start above this so they can never
+        collide with real data already in the table. Never raises; 1 is a
+        safe default (an empty/unreadable table has nothing to collide
+        with)."""
+        try:
+            table_sql = _quote_identifier(table_name, self.db_service.db_type)
+            col_sql = _quote_identifier(column, self.db_service.db_type)
+            df = self.db_service.execute_query(
+                f"SELECT COALESCE(MAX({col_sql}), 0) + 1 FROM {table_sql}", max_rows=1  # nosec B608
+            )
+            return int(df.iloc[0, 0])
+        except Exception:
+            return 1
+
     def show_mock_data_generator(self, table_name: str):
         """Opens the Mock Data Generator (issue #77). Environment/read-only
         safety gating happens up front, before the dialog even opens —
@@ -2594,7 +2645,14 @@ class ConnectionPanel(QWidget):
         Protection tables; Staging requires an explicit confirmation first.
         _guard_write below is the existing backstop (mainly re-covers
         read-only if state changed mid-flow) — no extra_reason is passed to
-        it so Staging isn't asked to confirm a second time."""
+        it so Staging isn't asked to confirm a second time.
+
+        Issue #215: also offers to generate the table's FK ancestor chain
+        (parents-before-children) when one exists — see
+        services.mock_data_generator.build_dependency_chain. A single
+        cheap bulk get_all_foreign_keys() call decides whether that offer
+        is even shown; a table with no ancestors pays nothing extra and
+        behaves exactly as before."""
         connection_name = self.config.get("name", "Connection")
         env = environment.normalize(self.config.get("environment"))
         read_only = bool(self.config.get("read_only"))
@@ -2610,9 +2668,18 @@ class ConnectionPanel(QWidget):
             QMessageBox.critical(self, "Error", f"Could not load schema for {table_name}:\n{ex}")
             return
 
+        try:
+            all_fks = self.db_service.get_all_foreign_keys()
+            dependency_chain = mock_gen.build_dependency_chain(all_fks, table_name)
+        except Exception:
+            dependency_chain = None  # best-effort — dialog falls back to single-table behavior
+
         dialog = MockDataDialog(
             table_name, columns, primary_keys, foreign_keys, generated_columns,
-            dialect=self.db_service.db_type, fk_sampler=self._sample_fk_values, parent=self,
+            dialect=self.db_service.db_type, fk_sampler=self._sample_fk_values,
+            dependency_chain=dependency_chain, schema_fetcher=self._schema_for_table,
+            existing_row_count_fetcher=self._existing_row_count, pk_offset_fetcher=self._pk_offset,
+            parent=self,
         )
         if not dialog.exec():
             return
@@ -2633,6 +2700,10 @@ class ConnectionPanel(QWidget):
                 return
             for stmt in query_classifier.split_statements(sql):
                 self.db_service.execute_update(stmt)
+
+            for gen_table, pk_column in dialog.generated_pk_columns():
+                self.db_service.bump_sequence_for_column(gen_table, pk_column)
+
             QMessageBox.information(self, "Success", f"Mock data inserted into {table_name}.")
 
             for i in range(self.tabs.count()):

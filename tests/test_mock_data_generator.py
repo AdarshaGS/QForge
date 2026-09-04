@@ -149,3 +149,118 @@ def test_build_insert_sql_empty_dataframe_returns_empty_string():
     specs = {"id": gen.ColumnSpec(generator="omit", include=False)}
     df = gen.generate_dataframe(columns, 5, specs)
     assert gen.build_insert_sql(df, "users") == ""
+
+
+# ─── Dependency chain (issue #215) ─────────────────────────────────────────
+
+def _fk(column, ref_table, ref_column="id"):
+    return {"column": column, "ref_table": ref_table, "ref_column": ref_column}
+
+
+def test_build_dependency_chain_orders_parents_before_children():
+    all_fks = {
+        "orders": [_fk("customer_id", "customers")],
+        "customers": [],
+    }
+    chain = gen.build_dependency_chain(all_fks, "orders")
+    assert chain.tables == ["customers", "orders"]
+    assert chain.external_edges == {"customers": set(), "orders": set()}
+    assert not chain.truncated
+
+
+def test_build_dependency_chain_diamond_shared_grandparent_appears_once():
+    all_fks = {
+        "line_items": [_fk("order_id", "orders"), _fk("product_id", "products")],
+        "orders": [_fk("customer_id", "customers")],
+        "products": [_fk("supplier_id", "customers")],  # shares "customers" as a common ancestor
+        "customers": [],
+    }
+    chain = gen.build_dependency_chain(all_fks, "line_items")
+    assert chain.tables.count("customers") == 1
+    assert chain.tables.index("customers") < chain.tables.index("orders")
+    assert chain.tables.index("customers") < chain.tables.index("products")
+    assert chain.tables.index("orders") < chain.tables.index("line_items")
+    assert chain.tables.index("products") < chain.tables.index("line_items")
+
+
+def test_build_dependency_chain_self_reference_falls_back_to_external():
+    all_fks = {"employees": [_fk("manager_id", "employees")]}
+    chain = gen.build_dependency_chain(all_fks, "employees")
+    assert chain.tables == ["employees"]
+    assert chain.external_edges["employees"] == {"manager_id"}
+
+
+def test_build_dependency_chain_breaks_genuine_cycle_deterministically():
+    all_fks = {
+        "a": [_fk("b_id", "b")],
+        "b": [_fk("a_id", "a")],
+    }
+    chain = gen.build_dependency_chain(all_fks, "a")
+    assert set(chain.tables) == {"a", "b"}
+    # exactly one edge must have been demoted to external to break the cycle
+    total_external = sum(len(cols) for cols in chain.external_edges.values())
+    assert total_external == 1
+
+
+def test_build_dependency_chain_truncates_at_max_tables():
+    all_fks = {f"t{i}": [_fk("parent_id", f"t{i+1}")] for i in range(10)}
+    all_fks["t10"] = []
+    chain = gen.build_dependency_chain(all_fks, "t0", max_tables=3)
+    assert len(chain.tables) <= 3
+    assert chain.truncated
+
+
+def test_build_dependency_chain_no_ancestors_returns_root_only():
+    chain = gen.build_dependency_chain({"standalone": []}, "standalone")
+    assert chain.tables == ["standalone"]
+    assert not chain.truncated
+
+
+# ─── Multi-table generation (issue #215) ───────────────────────────────────
+
+def _plan(table, columns, pk=None, fks=None, row_count=0, pk_offset=None):
+    return gen.TablePlan(
+        table=table, columns=columns,
+        primary_keys=[pk] if pk else [],
+        foreign_keys=fks or [], generated_columns=[],
+        row_count=row_count, pk_offset=pk_offset,
+    )
+
+
+def test_generate_chain_dataframes_child_pool_is_subset_of_parent_keys():
+    all_fks = {"orders": [_fk("customer_id", "customers")], "customers": []}
+    chain = gen.build_dependency_chain(all_fks, "orders")
+    plans = {
+        "customers": _plan("customers", [_col("id", "int(11)"), _col("name", "varchar(50)")],
+                            pk="id", row_count=5, pk_offset=1),
+        "orders": _plan("orders", [_col("id", "int(11)"), _col("customer_id", "int(11)")],
+                         pk="id", fks=[_fk("customer_id", "customers")],
+                         row_count=10, pk_offset=1),
+    }
+    dataframes = gen.generate_chain_dataframes(chain, plans, external_pool_fn=lambda t, c: [])
+    assert len(dataframes["customers"]) == 5
+    assert len(dataframes["orders"]) == 10
+    parent_ids = set(dataframes["customers"]["id"].tolist())
+    child_fk_values = set(dataframes["orders"]["customer_id"].dropna().tolist())
+    assert child_fk_values <= parent_ids
+
+
+def test_generate_chain_dataframes_reused_table_skipped_falls_back_to_external():
+    all_fks = {"orders": [_fk("customer_id", "customers")], "customers": []}
+    chain = gen.build_dependency_chain(all_fks, "orders")
+    plans = {
+        "customers": _plan("customers", [_col("id", "int(11)")], pk="id", row_count=0),  # reuse — has real data
+        "orders": _plan("orders", [_col("id", "int(11)"), _col("customer_id", "int(11)")],
+                         pk="id", fks=[_fk("customer_id", "customers")],
+                         row_count=10, pk_offset=1),
+    }
+    calls = []
+
+    def external_pool_fn(ref_table, ref_column):
+        calls.append((ref_table, ref_column))
+        return [101, 102]
+
+    dataframes = gen.generate_chain_dataframes(chain, plans, external_pool_fn=external_pool_fn)
+    assert "customers" not in dataframes
+    assert calls == [("customers", "id")]
+    assert set(dataframes["orders"]["customer_id"].tolist()) <= {101, 102}

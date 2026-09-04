@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from services import mock_data_generator as gen
+from services.mock_data_generator import DependencyChain, TablePlan
 
 _PREVIEW_STYLE = (
     "font-family: monospace; font-size: 12px; "
@@ -128,7 +129,9 @@ class MockDataDialog(QDialog):
     def __init__(self, table_name: str, columns: list[dict],
                  primary_keys: list[str], foreign_keys: list[dict],
                  generated_columns: list[str], dialect: str = "mysql",
-                 fk_sampler=None, parent=None):
+                 fk_sampler=None, dependency_chain: DependencyChain = None,
+                 schema_fetcher=None, existing_row_count_fetcher=None,
+                 pk_offset_fetcher=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Generate Mock Data — {table_name}")
         self.setMinimumSize(700, 560)
@@ -138,6 +141,24 @@ class MockDataDialog(QDialog):
         self._fk_sampler = fk_sampler
         self._fk_pool_cache: dict[tuple, list] = {}
         self._last_sql = ""
+
+        # Issue #215 — dependency-ordered multi-table generation. Only
+        # offered when the caller found ancestors beyond the root table;
+        # ancestor metadata is fetched lazily (only once the user actually
+        # checks the box below) so opening this dialog for a table with no
+        # ancestors — the common case — pays nothing extra over today.
+        self._dependency_chain = dependency_chain
+        self._schema_fetcher = schema_fetcher
+        self._existing_row_count_fetcher = existing_row_count_fetcher
+        self._pk_offset_fetcher = pk_offset_fetcher
+        self._ancestor_tables: list[str] = (
+            dependency_chain.tables[:-1] if dependency_chain and len(dependency_chain.tables) > 1 else []
+        )
+        self._ancestor_plans: dict[str, TablePlan] = {}
+        self._ancestor_row_spins: dict[str, QSpinBox] = {}
+        self._ancestor_reuse: dict[str, bool] = {}
+        self._ancestor_panel_built = False
+        self._generated_pk_columns: list[tuple] = []
         # Include state to restore for a column when its generator is
         # switched away from "omit" — set only while "omit" is active, so a
         # column the user had already excluded for its own reason (not
@@ -148,6 +169,8 @@ class MockDataDialog(QDialog):
         self._columns = [c for c in columns if c["Field"] not in generated_set]
         self._fk_map = {fk["column"]: fk for fk in foreign_keys}
         lone_pk = primary_keys[0] if len(primary_keys) == 1 else None
+
+        self._primary_keys = primary_keys
 
         self._specs: dict[str, gen.ColumnSpec] = {}
         for col in self._columns:
@@ -169,6 +192,25 @@ class MockDataDialog(QDialog):
         top_row.addWidget(self._row_count_spin)
         top_row.addStretch()
         layout.addLayout(top_row)
+
+        if self._ancestor_tables:
+            self._include_deps_check = QCheckBox(
+                f"Include dependent tables ({len(self._ancestor_tables)} table"
+                f"{'s' if len(self._ancestor_tables) != 1 else ''} this one depends on)"
+            )
+            self._include_deps_check.toggled.connect(self._toggle_include_dependents)
+            layout.addWidget(self._include_deps_check)
+
+            self._ancestor_panel = QTableWidget(0, 3)
+            self._ancestor_panel.setHorizontalHeaderLabels(["Table", "Status", "Rows"])
+            self._ancestor_panel.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            self._ancestor_panel.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+            self._ancestor_panel.setMaximumHeight(150)
+            self._ancestor_panel.setVisible(False)
+            layout.addWidget(self._ancestor_panel)
+        else:
+            self._include_deps_check = None
+            self._ancestor_panel = None
 
         layout.addWidget(self._build_column_grid())
 
@@ -306,19 +348,112 @@ class MockDataDialog(QDialog):
 
     # ─── Generate / preview ────────────────────────────────────────────────
 
-    def _fk_pool(self, name: str) -> list:
-        fk = self._fk_map.get(name)
-        if not fk or not self._fk_sampler:
+    def _sample_external(self, ref_table: str, ref_column: str) -> list:
+        """Cached live sample of *ref_table.ref_column* — shared by the
+        single-table path (`_fk_pool`) and, for issue #215, by chain mode's
+        `generate_chain_dataframes(external_pool_fn=...)` for any ancestor
+        edge that isn't resolved by an in-memory generated pool (a reused
+        ancestor, a self-reference, or a broken-cycle fallback). One cache
+        keyed by (ref_table, ref_column) means a table sampled for the
+        root's own FK column and again as a chain ancestor only ever hits
+        the database once."""
+        if not self._fk_sampler:
             return []
-        key = (fk["ref_table"], fk["ref_column"])
+        key = (ref_table, ref_column)
         if key not in self._fk_pool_cache:
             try:
-                self._fk_pool_cache[key] = self._fk_sampler(fk["ref_table"], fk["ref_column"])
+                self._fk_pool_cache[key] = self._fk_sampler(ref_table, ref_column)
             except Exception:
                 self._fk_pool_cache[key] = []
         return self._fk_pool_cache[key]
 
+    def _fk_pool(self, name: str) -> list:
+        fk = self._fk_map.get(name)
+        if not fk:
+            return []
+        return self._sample_external(fk["ref_table"], fk["ref_column"])
+
+    # ─── Multi-table (dependency chain) generation (issue #215) ────────────
+
+    def _toggle_include_dependents(self, checked: bool):
+        if checked and not self._ancestor_panel_built:
+            self._build_ancestor_panel()
+        self._ancestor_panel.setVisible(checked)
+        self._regenerate()
+
+    def _build_ancestor_panel(self):
+        """Fetch each ancestor table's schema + existing row count once,
+        lazily — only reached when the user actually checks "Include
+        dependent tables". A table with existing rows defaults to
+        "reuse" (row_count=0, sampled live like today's single-table FK
+        pool); an empty one defaults to generating the same row count as
+        the root table, editable per the user's confirmed preference."""
+        self._ancestor_panel_built = True
+        root_row_count = self._row_count_spin.value()
+        self._ancestor_panel.setRowCount(len(self._ancestor_tables))
+
+        for row, table in enumerate(self._ancestor_tables):
+            self._ancestor_panel.setItem(row, 0, QTableWidgetItem(table))
+            try:
+                columns, primary_keys, foreign_keys, generated_columns = self._schema_fetcher(table)
+                existing = self._existing_row_count_fetcher(table) if self._existing_row_count_fetcher else 0
+            except Exception:
+                columns, primary_keys, foreign_keys, generated_columns, existing = [], [], [], [], 0
+
+            reuse = existing > 0
+            status = f"{existing:,} existing rows — will reuse" if reuse else "empty — will generate"
+            self._ancestor_panel.setItem(row, 1, QTableWidgetItem(status))
+
+            if reuse:
+                self._ancestor_panel.setItem(row, 2, QTableWidgetItem("—"))
+                self._ancestor_plans[table] = TablePlan(
+                    table=table, columns=columns, primary_keys=primary_keys,
+                    foreign_keys=foreign_keys, generated_columns=generated_columns,
+                    row_count=0,
+                )
+            else:
+                spin = QSpinBox()
+                spin.setRange(0, _MAX_ROW_COUNT)
+                spin.setValue(root_row_count)
+                spin.valueChanged.connect(lambda _v, t=table: self._on_ancestor_row_count_changed(t))
+                self._ancestor_panel.setCellWidget(row, 2, spin)
+                self._ancestor_row_spins[table] = spin
+                self._ancestor_plans[table] = TablePlan(
+                    table=table, columns=columns, primary_keys=primary_keys,
+                    foreign_keys=foreign_keys, generated_columns=generated_columns,
+                    row_count=root_row_count,
+                    pk_offset=self._pk_offset_for(table, primary_keys),
+                )
+
+    def _pk_offset_for(self, table: str, primary_keys: list) -> int | None:
+        if len(primary_keys) != 1 or not self._pk_offset_fetcher:
+            return None
+        try:
+            return self._pk_offset_fetcher(table, primary_keys[0])
+        except Exception:
+            return None
+
+    def _on_ancestor_row_count_changed(self, table: str):
+        plan = self._ancestor_plans.get(table)
+        if plan is not None:
+            plan.row_count = self._ancestor_row_spins[table].value()
+        self._regenerate()
+
+    def generated_pk_columns(self) -> list:
+        """[(table, pk_column), ...] for every table this dialog generated
+        fresh rows for (chain mode only) with a single-column PK. The
+        caller bumps each one's DB sequence after insert (issue #215;
+        Postgres-only, a safe no-op elsewhere) so a later auto-assigned
+        insert can't collide with the explicit values just written."""
+        return self._generated_pk_columns
+
     def _regenerate(self):
+        if self._include_deps_check is not None and self._include_deps_check.isChecked():
+            self._regenerate_chain()
+        else:
+            self._regenerate_single()
+
+    def _regenerate_single(self):
         row_count = self._row_count_spin.value()
         fk_pools = {
             name: self._fk_pool(name)
@@ -349,6 +484,64 @@ class MockDataDialog(QDialog):
         self._populate_preview(df)
         self._last_sql = gen.build_insert_sql(df, self._table_name, dialect=self._dialect)
         self._sql_view.setPlainText(self._last_sql or "-- No columns selected to insert.")
+        self._generated_pk_columns = []
+
+    def _regenerate_chain(self):
+        chain = self._dependency_chain
+        root_row_count = self._row_count_spin.value()
+        plans = dict(self._ancestor_plans)
+        plans[self._table_name] = TablePlan(
+            table=self._table_name, columns=self._columns,
+            primary_keys=self._primary_keys, foreign_keys=list(self._fk_map.values()),
+            generated_columns=[], row_count=root_row_count,
+        )
+
+        dataframes = gen.generate_chain_dataframes(chain, plans, external_pool_fn=self._sample_external)
+
+        root_df = dataframes.get(self._table_name)
+        if root_df is not None:
+            self._populate_preview(root_df)
+            extra = [t for t in chain.tables if t != self._table_name and dataframes.get(t) is not None]
+            if extra:
+                current = self._tabs.tabText(0)
+                self._tabs.setTabText(
+                    0, f"{current}  (+{len(extra)} ancestor table{'s' if len(extra) != 1 else ''})"
+                )
+
+        sql_parts = []
+        self._generated_pk_columns = []
+        for table in chain.tables:
+            df = dataframes.get(table)
+            if df is None or df.empty:
+                continue
+            sql_parts.append(gen.build_insert_sql(df, table, dialect=self._dialect))
+            plan = plans.get(table)
+            if plan and len(plan.primary_keys) == 1:
+                self._generated_pk_columns.append((table, plan.primary_keys[0]))
+
+        self._last_sql = "\n\n".join(p for p in sql_parts if p)
+        self._sql_view.setPlainText(self._last_sql or "-- No columns selected to insert.")
+
+        notes = []
+        if chain.truncated:
+            notes.append("dependency chain was too large — only part of it is included")
+        if any(chain.external_edges.values()):
+            notes.append(
+                "some references use existing data instead of freshly generated "
+                "rows (self-referencing or circular foreign keys)"
+            )
+        for table, plan in plans.items():
+            df = dataframes.get(table)
+            if df is None or plan.row_count <= 0:
+                continue
+            not_null_cols = {c["Field"] for c in plan.columns if c.get("Null") == "NO"}
+            for fk in plan.foreign_keys:
+                col = fk["column"]
+                if col in df.columns and col in not_null_cols and df[col].isna().any():
+                    notes.append(
+                        f"'{table}.{col}' references an empty table — the insert will fail (NOT NULL)"
+                    )
+        self._warning_label.setText("⚠ " + "; ".join(notes) if notes else "")
 
     def _populate_preview(self, df):
         # QTableWidgetItem construction, not DataFrame generation, is what

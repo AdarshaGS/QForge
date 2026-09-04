@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
 
+from services.mock_data_generator import build_dependency_chain
 from ui.mock_data_dialog import _MAX_ROW_COUNT, _PREVIEW_ROW_CAP, MockDataDialog
 
 _app = QApplication.instance() or QApplication([])
@@ -111,3 +112,118 @@ def test_preview_grid_never_renders_more_than_the_cap():
     # The full row count still makes it into the generated SQL — only the
     # on-screen grid is capped.
     assert dlg.get_sql().count("INSERT INTO") == requested
+
+
+# ─── Dependency-ordered multi-table generation (issue #215) ───────────────
+
+def test_no_ancestor_panel_when_table_has_no_dependencies():
+    dlg = _make_dialog()
+    assert dlg._include_deps_check is None
+    assert dlg._ancestor_panel is None
+
+
+def test_ancestor_checkbox_and_panel_appear_when_dependencies_exist():
+    chain = build_dependency_chain(
+        {"orders": [{"column": "customer_id", "ref_table": "customers", "ref_column": "id"}],
+         "customers": []},
+        "orders",
+    )
+    dlg = MockDataDialog(
+        "orders",
+        [_col("id", "int(11)", nullable="NO"), _col("customer_id", "int(11)")],
+        ["id"], [{"column": "customer_id", "ref_table": "customers", "ref_column": "id"}], [],
+        dialect="mysql", dependency_chain=chain,
+        schema_fetcher=lambda t: ([_col("id", "int(11)", nullable="NO")], ["id"], [], []),
+        existing_row_count_fetcher=lambda t: 0,
+        pk_offset_fetcher=lambda t, c: 1,
+        parent=None,
+    )
+    assert dlg._include_deps_check is not None
+    assert dlg._ancestor_panel is not None
+    assert dlg._ancestor_panel.isVisible() is False  # opt-in, unchecked by default
+    assert dlg.generated_pk_columns() == []  # single-table path until the box is checked
+
+
+def test_checking_include_dependents_generates_parent_rows_and_wires_fk_pool():
+    chain = build_dependency_chain(
+        {"orders": [{"column": "customer_id", "ref_table": "customers", "ref_column": "id"}],
+         "customers": []},
+        "orders",
+    )
+    dlg = MockDataDialog(
+        "orders",
+        [_col("id", "int(11)", nullable="NO"), _col("customer_id", "int(11)")],
+        ["id"], [{"column": "customer_id", "ref_table": "customers", "ref_column": "id"}], [],
+        dialect="mysql", dependency_chain=chain,
+        schema_fetcher=lambda t: ([_col("id", "int(11)", nullable="NO")], ["id"], [], []),
+        existing_row_count_fetcher=lambda t: 0,  # empty — will generate
+        pk_offset_fetcher=lambda t, c: 1,
+        parent=None,
+    )
+    dlg._row_count_spin.setValue(5)
+    dlg._include_deps_check.setChecked(True)
+
+    sql = dlg.get_sql()
+    assert sql.index("`customers`") < sql.index("`orders`")  # parent INSERT precedes child's
+    # Both tables were generated with a lone integer PK — bumping both
+    # sequences post-insert is idempotent/harmless even for the root,
+    # which nothing in this chain actually references.
+    assert dlg.generated_pk_columns() == [("customers", "id"), ("orders", "id")]
+
+
+def test_ancestor_with_existing_rows_defaults_to_reuse_not_generate():
+    chain = build_dependency_chain(
+        {"orders": [{"column": "customer_id", "ref_table": "customers", "ref_column": "id"}],
+         "customers": []},
+        "orders",
+    )
+    sampled = []
+
+    def fk_sampler(ref_table, ref_column, limit=200):
+        sampled.append((ref_table, ref_column))
+        return [7, 8, 9]
+
+    dlg = MockDataDialog(
+        "orders",
+        [_col("id", "int(11)", nullable="NO"), _col("customer_id", "int(11)")],
+        ["id"], [{"column": "customer_id", "ref_table": "customers", "ref_column": "id"}], [],
+        dialect="mysql", fk_sampler=fk_sampler, dependency_chain=chain,
+        schema_fetcher=lambda t: ([_col("id", "int(11)", nullable="NO")], ["id"], [], []),
+        existing_row_count_fetcher=lambda t: 42,  # already has real data — reuse it
+        pk_offset_fetcher=lambda t, c: 1,
+        parent=None,
+    )
+    dlg._include_deps_check.setChecked(True)
+
+    sql = dlg.get_sql()
+    assert "`customers`" not in sql  # no fresh rows generated for the reused ancestor
+    # Sampled once and cached — the root's own initial regenerate (at
+    # dialog construction, before the checkbox is checked) and chain mode's
+    # fallback for the reused ancestor share one cache entry, not two queries.
+    assert sampled == [("customers", "id")]
+    assert dlg.generated_pk_columns() == [("orders", "id")]  # root only — customers was reused, not generated
+
+
+def test_chain_mode_warns_when_not_null_fk_column_has_empty_pool():
+    chain = build_dependency_chain(
+        {"orders": [{"column": "customer_id", "ref_table": "customers", "ref_column": "id"}],
+         "customers": []},
+        "orders",
+    )
+    dlg = MockDataDialog(
+        "orders",
+        [_col("id", "int(11)", nullable="NO"), _col("customer_id", "int(11)", nullable="NO")],
+        ["id"], [{"column": "customer_id", "ref_table": "customers", "ref_column": "id"}], [],
+        dialect="mysql", dependency_chain=chain,
+        schema_fetcher=lambda t: ([_col("id", "int(11)", nullable="NO")], ["id"], [], []),
+        existing_row_count_fetcher=lambda t: 0,
+        pk_offset_fetcher=lambda t, c: 1,
+        parent=None,
+    )
+    # Force the ancestor's own row count to 0 via its spinner — nothing to
+    # populate the child's FK pool with, and the column is NOT NULL.
+    dlg._include_deps_check.setChecked(True)
+    dlg._ancestor_row_spins["customers"].setValue(0)
+
+    assert "customer_id" in dlg._warning_label.text()
+    assert "NOT NULL" in dlg._warning_label.text()

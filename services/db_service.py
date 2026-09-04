@@ -846,6 +846,34 @@ class DbService:
             pass
         return []
 
+    def bump_sequence_for_column(self, table_name: str, column: str) -> None:
+        """After inserting rows with an explicit value for an
+        identity/serial column (issue #215's dependency-ordered mock data
+        generation gives a parent table's PK explicit values so children
+        can reference them before the parent is committed), make sure the
+        column's sequence won't hand out a colliding value on the next
+        auto-assigned insert.
+
+        Postgres only: unlike MySQL's AUTO_INCREMENT, an explicit INSERT
+        into a serial/identity column does *not* advance its backing
+        sequence, so a later auto-assigned insert could collide with a
+        value we just wrote. MySQL self-adjusts its AUTO_INCREMENT
+        counter up on an explicit higher value, so nothing to do there.
+        Never raises — this is a best-effort correctness nicety, not
+        something that should block the generation flow it runs after."""
+        if self.db_type != "postgresql":
+            return
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT setval(pg_get_serial_sequence(%s, %s), "
+                f"(SELECT COALESCE(MAX({self._q(column)}), 1) FROM {self._q(table_name)}))",  # nosec B608 -- identifiers quoted/escaped via self._q(); table/column names are parameterized separately for pg_get_serial_sequence()
+                (table_name, column),
+            )
+            cursor.close()
+        except Exception:
+            pass
+
     def content_select_list(self, table_name: str) -> str:
         """Column list for a content-export `SELECT`, with generated
         columns excluded (issue #160) — they can't appear in the INSERT
