@@ -25,20 +25,21 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QWidget,
 )
 
-from services.erd_model import build_erd_graph, fetch_table_indexes
+from services.erd_model import build_erd_graph, build_erd_graph_from_snapshot, fetch_table_indexes
 from services.entitlements import Edition, Feature, Limit, entitlements
 from ui.upgrade_dialog import UpgradeDialog
-from utils import erd_layout
+from utils import erd_layout, schema_cache
 
-_HEADER_H = 26
-_ROW_H = 18
+_HEADER_H = 30
+_ROW_H = 20
 _NODE_W = 220
-_PAD = 6
+_PAD = 8
 _ROW_GAP_X = 100
 _ROW_GAP_Y = 100
 _MARK_SIZE = 9
 _MINIMAP_W = 200
 _MINIMAP_H = 130
+_CARD_RADIUS = 8
 
 # Per-table header color cycle (light, dark) — keyed by a stable hash of the
 # table name so colors don't reshuffle between reloads.
@@ -62,6 +63,33 @@ def _header_color(table_name: str, is_dark: bool) -> QColor:
     idx = int(hashlib.sha1(table_name.encode(), usedforsecurity=False).hexdigest(), 16) % len(_HEADER_PALETTE)
     light, dark = _HEADER_PALETTE[idx]
     return QColor(dark if is_dark else light)
+
+
+def _rounded_top_path(rect: QRectF, radius: float) -> QPainterPath:
+    """Rect path with only the top-left/top-right corners rounded — used
+    for the header band so it matches the card's outer curve up top while
+    its bottom edge (an interior seam against the body) stays flat."""
+    x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+    path = QPainterPath()
+    path.moveTo(x, y + h)
+    path.lineTo(x, y + radius)
+    path.arcTo(x, y, radius * 2, radius * 2, 180, -90)
+    path.lineTo(x + w - radius, y)
+    path.arcTo(x + w - radius * 2, y, radius * 2, radius * 2, 90, -90)
+    path.lineTo(x + w, y + h)
+    path.closeSubpath()
+    return path
+
+
+class _HeaderItem(QGraphicsRectItem):
+    """Header band shaped with rounded top corners to match the card
+    outline (see _TableNodeItem.paint)."""
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(self.pen())
+        painter.setBrush(self.brush())
+        painter.drawPath(_rounded_top_path(self.rect(), _CARD_RADIUS))
 
 
 class _CollapseToggle(QGraphicsSimpleTextItem):
@@ -120,7 +148,9 @@ class _TableNodeItem(QGraphicsRectItem):
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
         self.setCursor(Qt.OpenHandCursor)
 
-        header = QGraphicsRectItem(0, 0, _NODE_W, _HEADER_H, self)
+        self._shadow_color = QColor(0, 0, 0, 70 if is_dark else 40)
+
+        header = _HeaderItem(0, 0, _NODE_W, _HEADER_H, self)
         header.setBrush(QBrush(header_color))
         header.setPen(QPen(header_color))
         header.setAcceptedMouseButtons(Qt.NoButton)
@@ -130,11 +160,11 @@ class _TableNodeItem(QGraphicsRectItem):
         f.setBold(True)
         title.setFont(f)
         title.setBrush(QBrush(header_fg))
-        title.setPos(_PAD, 5)
+        title.setPos(_PAD, (_HEADER_H - 16) / 2)
         title.setAcceptedMouseButtons(Qt.NoButton)
 
         self._toggle = _CollapseToggle(self, header_fg)
-        self._toggle.setPos(_NODE_W - 18, 4)
+        self._toggle.setPos(_NODE_W - 18, (_HEADER_H - 18) / 2)
 
         self._column_items = []
         y = _HEADER_H
@@ -148,11 +178,28 @@ class _TableNodeItem(QGraphicsRectItem):
             cf.setBold(col.is_primary_key)
             text.setFont(cf)
             text.setBrush(QBrush(body_fg))
-            text.setPos(_PAD, y + 2)
+            text.setPos(_PAD, y + (_ROW_H - 16) / 2)
             text.setAcceptedMouseButtons(Qt.NoButton)
             self.column_y[col.name] = y + _ROW_H / 2
             self._column_items.append(text)
             y += _ROW_H
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing)
+        # Flat offset rect for elevation instead of QGraphicsDropShadowEffect:
+        # that effect rasterizes+blurs every node on every repaint with no
+        # cache mode set, which made dragging/panning a schema of more than
+        # a few tables visibly hang.
+        shadow_rect = self.rect().translated(0, 3)
+        shadow_path = QPainterPath()
+        shadow_path.addRoundedRect(shadow_rect, _CARD_RADIUS, _CARD_RADIUS)
+        painter.fillPath(shadow_path, self._shadow_color)
+
+        painter.setPen(self.pen())
+        painter.setBrush(self.brush())
+        path = QPainterPath()
+        path.addRoundedRect(self.rect(), _CARD_RADIUS, _CARD_RADIUS)
+        painter.drawPath(path)
 
     def set_highlighted(self, on: bool):
         self.selected = on
@@ -323,7 +370,9 @@ class _ErdView(QGraphicsView):
     nothing is under the cursor, so clicking a node still selects/drags it
     instead of panning."""
 
-    _PAN_SPEED = 0.9  # < 1 damps drag-to-pan so large diagrams don't fly by
+    _PAN_SPEED = 0.6  # < 1 damps drag-to-pan so large diagrams don't fly by
+    _MAX_PAN_STEP = 60  # px/event cap so a fast flick can't send the view overshooting
+    _ZOOM_STEP = 0.08  # scale change per "notch" (angleDelta of 120)
 
     resized = Signal()
     view_changed = Signal()
@@ -336,7 +385,15 @@ class _ErdView(QGraphicsView):
         self._pan_start = None
 
     def wheelEvent(self, event):
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        # Scale the step by delta magnitude (clamped to one notch) instead of
+        # a flat 1.15x/event: a mouse wheel's ±120-per-notch gets the full
+        # step, while a trackpad's smaller, more frequent deltas zoom
+        # proportionally gentler rather than jumping the same amount.
+        notch = max(-120, min(120, delta)) / 120.0
+        factor = 1.0 + notch * self._ZOOM_STEP
         self.scale(factor, factor)
         self.view_changed.emit()
 
@@ -358,10 +415,12 @@ class _ErdView(QGraphicsView):
         if self._panning:
             delta = event.pos() - self._pan_start
             self._pan_start = event.pos()
+            dx = max(-self._MAX_PAN_STEP, min(self._MAX_PAN_STEP, delta.x()))
+            dy = max(-self._MAX_PAN_STEP, min(self._MAX_PAN_STEP, delta.y()))
             self.horizontalScrollBar().setValue(
-                self.horizontalScrollBar().value() - round(delta.x() * self._PAN_SPEED))
+                self.horizontalScrollBar().value() - round(dx * self._PAN_SPEED))
             self.verticalScrollBar().setValue(
-                self.verticalScrollBar().value() - round(delta.y() * self._PAN_SPEED))
+                self.verticalScrollBar().value() - round(dy * self._PAN_SPEED))
             self.view_changed.emit()
             event.accept()
             return
@@ -635,14 +694,8 @@ class ErdDialog(QDialog):
     # ConnectionPanel._spawn_schema_fetch) ──────────────────────────────
 
     def _reload(self):
-        self.status_label.setText("⏳ Loading schema metadata…")
-        self.scene.clear()
-        self._nodes = {}
-        self._edges = []
-        self._selected_node = None
         self._graph = None
         self._index_cache = {}
-        self.inspector.clear()
 
         config = dict(self._config)
         sig_done = self._graph_loaded
@@ -653,6 +706,18 @@ class ErdDialog(QDialog):
         max_tables = None
         if entitlements.edition() is Edition.FREE:
             max_tables = entitlements.limit(Limit.ER_DIAGRAM_TABLES)
+
+        # Same cache-then-refresh pattern as ConnectionPanel.load_schema:
+        # the schema browser already fetched and cached this connection's
+        # metadata in one bulk round-trip (utils.schema_cache) — paint the
+        # diagram from that disk cache instantly, no network wait, then
+        # still run the live fetch below to refresh it (silently) with
+        # cardinality marks and anything that changed since it was cached.
+        cached = schema_cache.load(config.get("id", ""), config.get("database", ""))
+        if cached and cached.get("tables"):
+            self._on_graph_loaded(build_erd_graph_from_snapshot(cached, max_tables=max_tables))
+        else:
+            self.status_label.setText("⏳ Loading schema metadata…")
 
         def _worker():
             try:
@@ -668,6 +733,7 @@ class ErdDialog(QDialog):
     def _on_graph_loaded(self, graph):
         self._graph = graph
         if not graph.tables:
+            self._clear_scene()
             self.status_label.setText("No tables found.")
             return
         self.status_label.setText(
@@ -721,7 +787,22 @@ class ErdDialog(QDialog):
 
     # ── layout + rendering ───────────────────────────────────────────
 
+    def _clear_scene(self):
+        self.scene.clear()
+        self._nodes = {}
+        self._edges = []
+        self._selected_node = None
+        self.inspector.clear()
+
     def _build_scene(self, graph):
+        # _on_graph_loaded can run twice per _reload() — once painting the
+        # schema_cache snapshot instantly, once when the live refresh lands
+        # — so this must clear whatever it drew last time itself rather
+        # than relying on a single clear() back in _reload(); otherwise the
+        # second pass adds a second full set of nodes on top of the first
+        # (invisible until you drag one and reveal the duplicate beneath).
+        self._clear_scene()
+
         # Dependency-free stand-in for a real force-directed layout (no
         # networkx in requirements.txt): keep tables in their natural
         # (discovery) order and flow them into an even grid — roughly

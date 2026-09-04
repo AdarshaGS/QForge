@@ -1699,7 +1699,12 @@ class ConnectionPanel(QWidget):
                          focus_table=focus_table)
         dlg.open_table.connect(self.open_table_view)
         dlg.view_structure.connect(self._show_table_structure)
-        dlg.exec_()
+        # Non-modal: it's a read-only viewer, so it shouldn't block the SQL
+        # editor/rest of the app the way exec_() (app-modal) would.
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def open_schema_compare(self):
         """Open the read-only Schema Compare dialog (issue #68), preselecting

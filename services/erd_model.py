@@ -86,38 +86,24 @@ def build_erd_graph(config: dict, table_names: list = None, max_tables: int = No
         if not graph.total_tables_available:
             graph.total_tables_available = len(names)
 
-        fk_by_table = {}
-        for name in names:
-            try:
-                columns = db.get_columns(name)
-            except Exception as ex:
-                logger.debug(f"ERD: failed to read columns for {name}: {ex}")
-                continue
+        # Bulk, single-round-trip metadata (same calls services/schema_snapshot.py
+        # already uses for the schema browser/autocomplete) instead of a
+        # get_columns()/get_primary_keys()/get_foreign_keys() loop per table —
+        # that was up to 3 round trips PER TABLE, which is what made opening
+        # a diagram feel like a hang on anything but a tiny schema.
+        try:
+            column_details = db.get_all_column_details()
+        except Exception as ex:
+            logger.debug(f"ERD: failed to read column details: {ex}")
+            column_details = {}
 
-            try:
-                pk_cols = set(db.get_primary_keys(name))
-            except Exception as ex:
-                logger.debug(f"ERD: failed to read primary keys for {name}: {ex}")
-                pk_cols = set()
+        try:
+            fks_by_table = db.get_all_foreign_keys()
+        except Exception as ex:
+            logger.debug(f"ERD: failed to read foreign keys: {ex}")
+            fks_by_table = {}
 
-            try:
-                fks = db.get_foreign_keys(name)
-            except Exception as ex:
-                logger.debug(f"ERD: failed to read foreign keys for {name}: {ex}")
-                fks = []
-            fk_by_table[name] = fks
-            fk_cols = {fk["column"] for fk in fks}
-
-            table = ErdTable(name=name)
-            for col in columns:
-                col_name = col.get("Field", "")
-                table.columns.append(ErdColumn(
-                    name=col_name,
-                    data_type=str(col.get("Type", "") or ""),
-                    is_primary_key=col_name in pk_cols,
-                    is_foreign_key=col_name in fk_cols,
-                ))
-            graph.tables[name] = table
+        graph.tables, fk_by_table = _tables_from_metadata(names, column_details, fks_by_table)
 
         # Cardinality (1:1 vs 1:N) needs each FK source table's unique
         # indexes. Scoped to tables that actually have an outgoing FK (a
@@ -152,6 +138,77 @@ def build_erd_graph(config: dict, table_names: list = None, max_tables: int = No
         return graph
     finally:
         db.disconnect()
+
+
+def _tables_from_metadata(names: list, column_details: dict, fks_by_table: dict) -> tuple:
+    """Shared by build_erd_graph and build_erd_graph_from_snapshot: turn
+    {table: [{name, type, key}, ...]} column details + {table: [{column,
+    ref_table, ref_column}, ...]} foreign keys into {table: ErdTable}.
+    Returns (tables, fk_by_table) — the latter still keyed by *names* only,
+    for the caller's cardinality/relationship pass.
+    """
+    tables = {}
+    fk_by_table = {}
+    for name in names:
+        columns = column_details.get(name)
+        if columns is None:
+            logger.debug(f"ERD: no column details for {name}")
+            continue
+
+        fks = fks_by_table.get(name, [])
+        fk_by_table[name] = fks
+        fk_cols = {fk["column"] for fk in fks}
+
+        table = ErdTable(name=name)
+        for col in columns:
+            table.columns.append(ErdColumn(
+                name=col["name"],
+                data_type=str(col.get("type", "") or ""),
+                is_primary_key=col.get("key") == "PRI",
+                is_foreign_key=col["name"] in fk_cols,
+            ))
+        tables[name] = table
+    return tables, fk_by_table
+
+
+def build_erd_graph_from_snapshot(snapshot: dict, max_tables: int = None) -> ErdGraph:
+    """Build an ErdGraph from an already-fetched schema snapshot (the shape
+    utils.schema_cache stores/loads: tables/column_details/foreign_keys) —
+    no database round-trip at all. This is the instant-paint half of
+    ErdDialog's cache-then-refresh (see ui/erd_dialog.py._reload), the same
+    pattern ConnectionPanel._apply_cached_schema already uses for the schema
+    browser: a connection/database the user already has open elsewhere
+    reopens the diagram from disk instantly instead of re-querying metadata
+    it just fetched.
+
+    ponytail: relationships always render as one-to-many here — cardinality
+    needs each source table's unique indexes, which aren't part of the
+    cached snapshot. build_erd_graph()'s live refresh (always run right
+    after this) redraws with the correct marks moments later; cache indexes
+    too if that brief flicker ever becomes annoying.
+    """
+    graph = ErdGraph()
+    names = list(snapshot.get("tables") or [])
+    graph.total_tables_available = len(names)
+    if max_tables is not None and len(names) > max_tables:
+        names = sorted(names)[:max_tables]
+
+    column_details = snapshot.get("column_details") or {}
+    fks_by_table = snapshot.get("foreign_keys") or {}
+    graph.tables, fk_by_table = _tables_from_metadata(names, column_details, fks_by_table)
+
+    for source_table, fks in fk_by_table.items():
+        for fk in fks:
+            target_table = fk.get("ref_table")
+            if target_table in graph.tables:
+                graph.relationships.append(ErdRelationship(
+                    source_table=source_table,
+                    source_column=fk.get("column", ""),
+                    target_table=target_table,
+                    target_column=fk.get("ref_column", ""),
+                    is_one_to_one=False,
+                ))
+    return graph
 
 
 def _is_unique_single_column(indexes: list, column: str) -> bool:
