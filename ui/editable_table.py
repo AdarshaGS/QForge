@@ -289,6 +289,11 @@ class EditableTableWidget(QTableWidget):
         self.original_data = None
         self.filtered_data = None  # Store filtered version
         self.column_filters = {}  # Store filter text for each column
+        # "Search any column" quick filter: unlike column_filters (AND'd
+        # together, one substring per column), this one substring must
+        # appear in *some* column of the row. AND'd with column_filters —
+        # a row must satisfy both to show.
+        self.quick_filter_text = ""
         self.modified_rows = set()    # rows with at least one changed cell
         self.modified_cells = set()   # (row, col) of individually changed cells
         self.new_rows = set()         # newly inserted rows
@@ -519,6 +524,7 @@ class EditableTableWidget(QTableWidget):
         self.new_rows.clear()
         self.deleted_rows.clear()
         self.column_filters.clear()
+        self.quick_filter_text = ""
         self._sort_col = -1
         self._sort_asc = True
         self.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
@@ -914,16 +920,24 @@ class EditableTableWidget(QTableWidget):
                 del self.column_filters[column_index]
         else:
             self.column_filters[column_index] = filter_text.lower()
-        
+
         self._apply_all_filters()
-    
+
+    def set_quick_filter(self, filter_text: str):
+        """"Search any column" live filter — a row shows if *filter_text*
+        appears in any of its columns, case-insensitive. AND'd with any
+        active per-column filters (apply_column_filter), same as those are
+        AND'd with each other."""
+        self.quick_filter_text = (filter_text or "").strip().lower()
+        self._apply_all_filters()
+
     def _apply_all_filters(self):
         """Apply all active column filters"""
         if self.original_data is None or self.original_data.empty:
             return
-        
+
         filtered = self.original_data.copy()
-        
+
         # Apply each column filter
         for col_idx, filter_text in self.column_filters.items():
             if col_idx < len(filtered.columns):
@@ -931,16 +945,25 @@ class EditableTableWidget(QTableWidget):
                 filtered = filtered[
                     filtered[col_name].map(str).str.lower().str.contains(filter_text, na=False)
                 ]
-        
+
+        if self.quick_filter_text and not filtered.empty:
+            needle = self.quick_filter_text
+            mask = filtered.apply(
+                lambda row: needle in " ".join(row.map(str)).lower(), axis=1)
+            filtered = filtered[mask]
+
         self.filtered_data = filtered
         self._display_data(filtered)
         self.filter_changed.emit()
-    
+
     def get_filter_status(self):
         """Get current filter status"""
+        parts = []
         if self.column_filters:
-            return f"{len(self.column_filters)} column filter(s) active"
-        return ""
+            parts.append(f"{len(self.column_filters)} column filter(s) active")
+        if self.quick_filter_text:
+            parts.append(f'search: "{self.quick_filter_text}"')
+        return " · ".join(parts)
     
     def on_item_changed(self, item):
         """Track when an item is modified, push an undo step, and paint

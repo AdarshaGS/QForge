@@ -342,6 +342,16 @@ class TableViewWidget(QWidget):
             pass
         self.data_table.horizontalHeader().sectionClicked.connect(self.on_column_header_clicked)
 
+        # "Search any column" quick filter — live, client-side, over the
+        # currently loaded page (distinct from any server-side WHERE-clause
+        # filter panel this widget may also offer, which acts across the
+        # whole table, not just the loaded page).
+        self.quick_search = QLineEdit()
+        self.quick_search.setPlaceholderText("🔍 Search all columns…")
+        self.quick_search.setClearButtonEnabled(True)
+        self.quick_search.textChanged.connect(self.data_table.set_quick_filter)
+        table_layout.addWidget(self.quick_search)
+
         table_layout.addWidget(self.data_table)
 
         # Bottom controls - row count center, pager right

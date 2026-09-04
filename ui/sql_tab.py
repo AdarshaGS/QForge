@@ -797,6 +797,15 @@ class SqlTab(QWidget):
         # takes the space instead.
         self.result_table.hide()
 
+        # "Search any column" quick filter — live, client-side, over the
+        # currently displayed result page. Visibility mirrors result_table's
+        # own — hidden here, shown/hidden alongside it everywhere below.
+        self.quick_search = QLineEdit()
+        self.quick_search.setPlaceholderText("🔍 Search all columns…")
+        self.quick_search.setClearButtonEnabled(True)
+        self.quick_search.textChanged.connect(self.result_table.set_quick_filter)
+        self.quick_search.hide()
+
         # ── Pagination bar ─────────────────────────────────────────────
         self._pagination_bar = QWidget()
         self._pagination_bar.hide()
@@ -850,6 +859,7 @@ class SqlTab(QWidget):
 
         bottom_layout.addWidget(self._error_card_scroll)
         bottom_layout.addWidget(self._empty_state)
+        bottom_layout.addWidget(self.quick_search)
         bottom_layout.addWidget(self.result_table)
         bottom_layout.addWidget(self._pagination_bar)
         bottom_widget.setLayout(bottom_layout)
@@ -1601,17 +1611,20 @@ class SqlTab(QWidget):
                 # A genuine SELECT that matched nothing — show the empty-
                 # state illustration instead of a blank grid (issue #178).
                 self.result_table.hide()
+                self.quick_search.hide()
                 self._pagination_bar.hide()
                 self._empty_state.show()
             else:
                 self._empty_state.hide()
                 self.result_table.show()
+                self.quick_search.show()
                 self._pagination_bar.show()
                 self._refresh_result_view()
             self._expand_result_area()
         else:
             self._empty_state.hide()
             self.result_table.hide()
+            self.quick_search.hide()
             self._pagination_bar.hide()
             self._collapse_result_area()
 
@@ -1678,6 +1691,7 @@ class SqlTab(QWidget):
         if len(df.columns) > 0:
             self._update_filter_columns(list(df.columns))
         self.result_table.show()
+        self.quick_search.show()
         self._refresh_result_view()
         self._expand_result_area()
 
@@ -2057,6 +2071,7 @@ class SqlTab(QWidget):
         self.result_table.setRowCount(0)
         self.result_table.setColumnCount(0)
         self.result_table.hide()
+        self.quick_search.hide()
         self._pagination_bar.hide()
         self._empty_state.hide()
         self._result_actions_bar.hide()
@@ -2099,6 +2114,7 @@ class SqlTab(QWidget):
         self.result_table.setRowCount(0)
         self.result_table.setColumnCount(0)
         self.result_table.hide()
+        self.quick_search.hide()
         self._pagination_bar.hide()
         self._error_card_scroll.hide()
         self._empty_state.hide()
@@ -2420,6 +2436,7 @@ class SqlTab(QWidget):
         self._result_page = 0
         self._refresh_result_view()
         self.result_table.show()
+        self.quick_search.show()
 
         # Update status
         total = len(self.original_df) if self.original_df is not None else 0
@@ -2433,6 +2450,7 @@ class SqlTab(QWidget):
             self._result_page = 0
             self._refresh_result_view()
             self.result_table.show()
+            self.quick_search.show()
             self.status_label.setPlainText(f"{len(self.original_df)} rows")
             self.status_label.setFixedHeight(28)
         
