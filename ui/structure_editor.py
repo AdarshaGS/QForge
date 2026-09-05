@@ -414,6 +414,25 @@ class StructureEditorDialog(QDialog):
 
         return "\n".join(statements)
     
+    def get_dropped_columns(self) -> list:
+        """Column names present in self.existing_columns but no longer in
+        the grid — the same existing-vs-grid diff generate_alter_sql() uses
+        to decide which DROP COLUMN statements to emit, exposed so a caller
+        can warn about DROP COLUMN impact (issue #236) before executing."""
+        if self.is_new_table:
+            return []
+        current_names = set()
+        for row in range(self.columns_table.rowCount()):
+            item = self.columns_table.item(row, 0)
+            if item and item.text().strip():
+                current_names.add(item.text().strip())
+        dropped = []
+        for col in self.existing_columns:
+            name = str(col.get('Field', col.get('column_name', col.get('name', ''))))
+            if name and name not in current_names:
+                dropped.append(name)
+        return dropped
+
     def preview_sql(self):
         """Show SQL preview"""
         try:

@@ -43,6 +43,7 @@ class Feature(Enum):
     SCHEMA_COMPARE = "schema_compare"
     ADVANCED_ERD = "advanced_erd"
     DATA_COMPARE = "data_compare"
+    IMPACT_ANALYSIS = "impact_analysis"
 
 
 class Entitlements:

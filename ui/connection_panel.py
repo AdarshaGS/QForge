@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QMessageBox, QInputDialog,
     QMenu, QProgressDialog, QPushButton, QLabel,
     QListWidget, QListWidgetItem, QStackedWidget,
-    QApplication,
+    QApplication, QProgressBar,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QCursor, QFont
 
@@ -48,6 +48,7 @@ from ui.erd_dialog import ErdDialog
 from ui.schema_compare_dialog import SchemaCompareDialog
 from ui.data_compare_dialog import DataCompareDialog
 from ui.mock_data_dialog import MockDataDialog
+from ui.dependency_dialog import ImpactAnalysisDialog, DatabaseImpactDialog, impact_warning_text
 from ui import query_guard_dialog
 from ui.upgrade_dialog import require_pro, require_under_limit
 from services.entitlements import Feature, Limit, entitlements
@@ -63,6 +64,7 @@ from utils.df_export import (
 )
 from services import query_classifier
 from services import table_organization
+from services import dependency_analyzer
 
 logger = get_logger()
 
@@ -105,13 +107,16 @@ class _QueryWorker(QObject):
     errored    = Signal(str,   float)    # (error_message, elapsed_seconds)
     cancelled  = Signal()
     cost_ready = Signal(object)          # CostEstimate — best-effort, may never fire
+    profile_ready = Signal(object)       # QueryProfile — only when auto_profile=True, best-effort
 
-    def __init__(self, db_service, query: str, cancel_flag, multi: bool = False):
+    def __init__(self, db_service, query: str, cancel_flag, multi: bool = False,
+                 auto_profile: bool = False):
         super().__init__()
         self._db    = db_service
         self._q     = query
         self._flag  = cancel_flag
         self._multi = multi
+        self._auto_profile = auto_profile
 
     def _maybe_emit_cost(self, stmt: str):
         """Best-effort pre-run cost estimate for the status-bar badge —
@@ -124,6 +129,25 @@ class _QueryWorker(QObject):
             if query_classifier.classify(stmt).is_write:
                 return
             self.cost_ready.emit(query_cost.estimate_cost(self._db, stmt))
+        except Exception:
+            pass
+
+    def _maybe_emit_profile(self, stmt: str):
+        """Opt-in (auto_profile=True — the SQL editor's "Auto-profile"
+        toggle) post-run profile — genuinely re-executes *stmt* for real
+        via EXPLAIN ANALYZE, on top of the real run that already happened
+        just above. Only reached for a single, non-write statement — the
+        same scope _maybe_emit_cost uses — so this never doubles a write's
+        side effects or a multi-statement script's total execution count.
+        Emitted after `done`, so the result grid is never held up waiting
+        for a second execution the user may not even be watching for."""
+        try:
+            from services import query_classifier
+            if query_classifier.classify(stmt).is_write:
+                return
+            profile = query_cost.build_profile(self._db, stmt)
+            if not profile.error and profile.supported:
+                self.profile_ready.emit(profile)
         except Exception:
             pass
 
@@ -158,6 +182,8 @@ class _QueryWorker(QObject):
                     self.cancelled.emit()
                 else:
                     self.done.emit(df, elapsed)
+                    if self._auto_profile and stmts and not self._flag.is_set():
+                        self._maybe_emit_profile(stmts[0])
         except Exception as ex:
             elapsed = time.time() - t0
             if self._flag.is_set():
@@ -492,6 +518,7 @@ class ConnectionPanel(QWidget):
     _q_errored    = Signal(object, str,    float)  # (tab, message, elapsed)
     _q_cancelled  = Signal(object)                 # (tab,)
     _q_cost_ready = Signal(object, object)         # (tab, CostEstimate)
+    _q_profile_ready = Signal(object, object)      # (tab, QueryProfile)
     # ── Public observability signals ─────────────────────────────────────
     # 'idle' / 'running' / 'disconnected' / 'connecting'
     health_changed = Signal(str)
@@ -557,13 +584,15 @@ class ConnectionPanel(QWidget):
         self._category_icon_emoji = {"tables": "\U0001F5C3", "views": "\U0001F441", "functions": "ƒ"}
         self._icon_cache = {}
 
-        # Schema-loading progress indicator (issue #57) — ticks the elapsed
-        # time on whichever top-level tree row represents an in-flight
-        # fetch (first-time "Loading…" or a stale-cache "refreshing…" row),
-        # so it reads as visibly active rather than a frozen placeholder.
+        # Schema-loading progress indicator (issue #57, upgraded to a
+        # progress bar in #263) — ticks elapsed time into the progress bar
+        # at the top of the sidebar for an in-flight fetch (first-time load
+        # or a stale-cache refresh), so it reads as visibly active rather
+        # than a frozen placeholder.
         self._schema_load_timer = None
         self._schema_load_start = 0.0
-        self._schema_status_item = None
+        self._schema_loading = False
+        self._schema_loading_stale = False
         self._schema_tables_seen = 0
         self._schema_retry_item = None
         self._schema_fetch_t0 = None  # perf_metrics: set by _spawn_schema_fetch, read by _on_schema_loaded
@@ -576,6 +605,7 @@ class ConnectionPanel(QWidget):
         self._q_errored.connect(self._on_query_errored, Qt.QueuedConnection)
         self._q_cancelled.connect(self._on_query_cancelled, Qt.QueuedConnection)
         self._q_cost_ready.connect(self._on_query_cost_ready, Qt.QueuedConnection)
+        self._q_profile_ready.connect(self._on_query_profile_ready, Qt.QueuedConnection)
         self._schema_done.connect(self._on_schema_loaded, Qt.QueuedConnection)
         self._schema_error.connect(self._on_schema_error, Qt.QueuedConnection)
         self._schema_fast.connect(self._on_schema_tables_ready, Qt.QueuedConnection)
@@ -721,6 +751,32 @@ class ConnectionPanel(QWidget):
         # ── Stacked: page 0 = schema tree, page 1 = queries, page 2 = history ──
         self._sidebar_stack = QStackedWidget()
 
+        schema_page = QWidget()
+        schema_page_layout = QVBoxLayout(schema_page)
+        schema_page_layout.setContentsMargins(0, 0, 0, 0)
+        schema_page_layout.setSpacing(0)
+
+        # Issue #263: a slim progress bar above the tree replaces the old
+        # ticking-text tree row for "in-flight fetch" — indeterminate (busy)
+        # range, since the total amount of schema work isn't known up
+        # front. Qt's QProgressBar renders no text at all in busy mode
+        # (text()/setFormat() are silently ignored once min==max==0), so
+        # the elapsed-time/table-count ticker lives in a label under the
+        # bar instead of being drawn over it.
+        self._schema_progress_bar = QProgressBar()
+        self._schema_progress_bar.setRange(0, 0)
+        self._schema_progress_bar.setTextVisible(False)
+        self._schema_progress_bar.setFixedHeight(4)
+        self._schema_progress_bar.hide()
+        schema_page_layout.addWidget(self._schema_progress_bar)
+
+        self._schema_loading_label = QLabel("")
+        self._schema_loading_label.setContentsMargins(8, 3, 8, 3)
+        self._schema_loading_label.hide()
+        schema_page_layout.addWidget(self._schema_loading_label)
+
+        self._style_schema_progress_bar(self.current_theme == "dark")
+
         self.schema_tree = QTreeWidget()
         self.schema_tree.setHeaderHidden(True)
         self.schema_tree.setIndentation(15)
@@ -728,7 +784,8 @@ class ConnectionPanel(QWidget):
         self.schema_tree.itemClicked.connect(self._on_item_clicked)
         self.schema_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.schema_tree.customContextMenuRequested.connect(self._show_context_menu)
-        self._sidebar_stack.addWidget(self.schema_tree)   # index 0
+        schema_page_layout.addWidget(self.schema_tree)
+        self._sidebar_stack.addWidget(schema_page)   # index 0
 
         # Queries panel (favorite + saved queries — issue #130)
         queries_panel = QWidget()
@@ -771,6 +828,8 @@ class ConnectionPanel(QWidget):
         self._history_list = QListWidget()
         self._history_list.setWordWrap(False)
         self._history_list.itemDoubleClicked.connect(self._use_history_item)
+        self._history_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._history_list.customContextMenuRequested.connect(self._show_history_context_menu)
         hp_layout.addWidget(self._history_list)
 
         clear_hist_btn = QPushButton("Clear History")
@@ -1022,16 +1081,15 @@ class ConnectionPanel(QWidget):
         cached = schema_cache.load(
             self.config.get("id", ""), self.config.get("database", ""))
         if not self._apply_cached_schema(cached):
-            # Issue #57: a first-time connect had nothing but a static
+            # Issue #57/#263: a first-time connect had nothing but a static
             # "Loading…" row for however long the fetch took — easy to
-            # mistake for a frozen app on a large schema. Tick elapsed time
-            # (mirrors the Run button's own "⏳ 0.0s" ticker) so it visibly
-            # keeps moving, and upgrade the text with a table count the
-            # moment that's known (_on_schema_tables_ready, ahead of the
-            # slower dbs/views/functions round-trips per issue #16).
-            loading_item = QTreeWidgetItem(["⏳ Loading schema…"])
-            self.schema_tree.addTopLevelItem(loading_item)
-            self._start_schema_loading_indicator(loading_item)
+            # mistake for a frozen app on a large schema. The progress bar
+            # above the tree ticks elapsed time into its own text (mirrors
+            # the Run button's own "⏳ 0.0s" ticker) so it visibly keeps
+            # moving, and upgrades that text with a table count the moment
+            # it's known (_on_schema_tables_ready, ahead of the slower
+            # dbs/views/functions round-trips per issue #16).
+            self._start_schema_loading_indicator()
 
         self._notify_schema_refresh = notify
         self._spawn_schema_fetch(dict(self.config))
@@ -1039,9 +1097,9 @@ class ConnectionPanel(QWidget):
     def _apply_cached_schema(self, cached: dict | None) -> bool:
         """Populate the tree/autocomplete from a cached snapshot (issue
         #71) immediately; True on a hit. When the cache is past its
-        freshness window (issue #72), flags it in the tree — the marker
-        disappears on its own the moment the live background refresh
-        (_on_schema_loaded) rebuilds the tree with current data."""
+        freshness window (issue #72), the progress bar reappears in its
+        "refreshing" wording — it disappears on its own the moment the live
+        background refresh (_on_schema_loaded) completes."""
         if not cached:
             return False
         self._on_schema_tables_ready(
@@ -1049,17 +1107,20 @@ class ConnectionPanel(QWidget):
             cached.get("column_details", {}), cached.get("foreign_keys", {}))
         self._on_schema_loaded(cached)
         if schema_cache.is_stale(cached):
-            stale_item = QTreeWidgetItem(["⏱ Cached schema (stale) — refreshing…"])
-            self.schema_tree.insertTopLevelItem(0, stale_item)
-            self._start_schema_loading_indicator(stale_item)
+            self._start_schema_loading_indicator(stale=True)
         return True
 
-    def _start_schema_loading_indicator(self, item: QTreeWidgetItem):
-        """Attach a live elapsed-time ticker to *item* (already inserted in
-        the tree) for the duration of the in-flight fetch (issue #57)."""
-        self._schema_status_item = item
+    def _start_schema_loading_indicator(self, stale: bool = False):
+        """Show the sidebar's progress bar with a live elapsed-time ticker
+        for the duration of the in-flight fetch (issue #57), in its busy/
+        indeterminate mode since the total amount of schema work isn't
+        known up front."""
+        self._schema_loading = True
+        self._schema_loading_stale = stale
         self._schema_tables_seen = 0
         self._schema_load_start = time.time()
+        self._schema_progress_bar.show()
+        self._schema_loading_label.show()
         if self._schema_load_timer is None:
             from PySide6.QtCore import QTimer
             self._schema_load_timer = QTimer(self)
@@ -1069,20 +1130,23 @@ class ConnectionPanel(QWidget):
         self._schema_load_timer.start()
 
     def _tick_schema_loading(self):
-        if self._schema_status_item is None:
+        if not self._schema_loading:
             return
         elapsed = time.time() - self._schema_load_start
         if self._schema_tables_seen:
-            text = (f"⏳ {self._schema_tables_seen:,} table(s) found — "
-                    f"loading details… {elapsed:.1f}s")
+            text = f"{self._schema_tables_seen:,} table(s) found — loading details… {elapsed:.1f}s"
+        elif self._schema_loading_stale:
+            text = f"Cached schema (stale) — refreshing… {elapsed:.1f}s"
         else:
-            text = f"⏳ Loading schema… {elapsed:.1f}s"
-        self._schema_status_item.setText(0, text)
+            text = f"Loading schema… {elapsed:.1f}s"
+        self._schema_loading_label.setText(text)
 
     def _stop_schema_loading_indicator(self):
         if self._schema_load_timer is not None:
             self._schema_load_timer.stop()
-        self._schema_status_item = None
+        self._schema_loading = False
+        self._schema_progress_bar.hide()
+        self._schema_loading_label.hide()
 
     def _spawn_schema_fetch(self, conf: dict):
         """Fetch schema on a daemon thread using a *dedicated* connection
@@ -1166,7 +1230,7 @@ class ConnectionPanel(QWidget):
         # Issue #57: surface the table count on the loading indicator the
         # moment it's known, rather than leaving it a bare "Loading…" for
         # the remainder of the (slower) dbs/views/functions round-trips.
-        if self._schema_status_item is not None:
+        if self._schema_loading:
             self._schema_tables_seen = len(tables)
             self._tick_schema_loading()
 
@@ -1598,12 +1662,36 @@ class ConnectionPanel(QWidget):
         menu = QMenu(self)
 
         # ── Navigation ──────────────────────────────────────────────────
-        open_new_tab_action = menu.addAction("📋 Open in New Tab")
-        structure_action = menu.addAction("🔍 Open Structure")
-        edit_action = menu.addAction("✏️ Edit Structure")
+        open_new_tab_action = menu.addAction("Open in New Tab")
+        structure_action = menu.addAction("Open Structure")
+        edit_action = menu.addAction("Edit Structure")
         diagram_action = None
         if not is_view:
-            diagram_action = menu.addAction("🗺️ Show Diagram")
+            diagram_action = menu.addAction("Show Diagram")
+
+        # Impact Analysis (issue #236): Table first/default — analyzing the
+        # already-selected table is the common case and needs no further
+        # choice. Column needs one (which column?), listed as its own
+        # submenu of this table's columns rather than a second dialog.
+        # Database needs none either (it's not scoped to this table at
+        # all) but sits alongside Table/Column for a single, compact entry
+        # point rather than three separate top-level menu rows.
+        impact_menu = menu.addMenu("Impact Analysis")
+        impact_table_action = impact_menu.addAction("Table")
+        impact_column_menu = impact_menu.addMenu("Column")
+        impact_column_actions = {}
+        try:
+            table_columns = self.db_service.get_columns(table_name)
+        except Exception:
+            table_columns = []
+        for col in table_columns:
+            col_name = col.get("Field") if isinstance(col, dict) else str(col)
+            if col_name:
+                impact_column_actions[impact_column_menu.addAction(col_name)] = col_name
+        impact_column_menu.setEnabled(bool(impact_column_actions))
+        impact_menu.addSeparator()
+        impact_database_action = impact_menu.addAction("Database")
+
         menu.addSeparator()
 
         # ── Copy ─────────────────────────────────────────────────────────
@@ -1612,12 +1700,12 @@ class ConnectionPanel(QWidget):
         menu.addSeparator()
 
         # ── Organization ────────────────────────────────────────────────
-        pin_action = menu.addAction("📌 Unpin from Top" if pinned else "📌 Pin to Top")
-        favorite_action = menu.addAction("⭐ Remove from Favorites" if favorite else "⭐ Add to Favorites")
+        pin_action = menu.addAction("Unpin from Top" if pinned else "Pin to Top")
+        favorite_action = menu.addAction("Remove from Favorites" if favorite else "Add to Favorites")
         menu.addSeparator()
 
         # ── Export submenu ──────────────────────────────────────────────
-        export_menu = menu.addMenu("📤 Export")
+        export_menu = menu.addMenu("Export")
         export_action = export_menu.addAction("Export Table…")
         export_sql_action = export_menu.addAction("Export Table as SQL")
         export_cols_action = export_menu.addAction("Export Table with Column Selection…")
@@ -1626,16 +1714,16 @@ class ConnectionPanel(QWidget):
         # ── Import submenu ──────────────────────────────────────────────
         import_action = None
         if not is_view:
-            import_menu = menu.addMenu("📥 Import")
+            import_menu = menu.addMenu("Import")
             import_action = import_menu.addAction("Import Data…")
 
         # ── New submenu ─────────────────────────────────────────────────
-        new_menu = menu.addMenu("🆕 New")
+        new_menu = menu.addMenu("New")
         new_table_action = new_menu.addAction("New Table…")
         new_view_action = new_menu.addAction("New View…")
 
         # ── Copy Script As submenu ──────────────────────────────────────
-        script_menu = menu.addMenu("📄 Copy Script As")
+        script_menu = menu.addMenu("Copy Script As")
         copy_create_action = script_menu.addAction("CREATE Table")
         copy_insert_action = script_menu.addAction("INSERT Data")
         menu.addSeparator()
@@ -1646,13 +1734,13 @@ class ConnectionPanel(QWidget):
         mock_data_action = None
         if not is_view:
             clone_action = menu.addAction("Clone")
-            mock_data_action = menu.addAction("🧪 Generate Mock Data…")
-        refresh_action = menu.addAction("🔄 Refresh Schema")
+            mock_data_action = menu.addAction("Generate Mock Data…")
+        refresh_action = menu.addAction("Refresh Schema")
         refresh_action.setShortcut(QKeySequence("Ctrl+Shift+R"))  # mirrors the real global binding below
         menu.addSeparator()
         if not is_view:
-            truncate_action = menu.addAction("⚠️ Truncate…")
-        delete_action = menu.addAction(f"🗑️ Delete {'View' if is_view else 'Table'}…")
+            truncate_action = menu.addAction("Truncate…")
+        delete_action = menu.addAction(f"Delete {'View' if is_view else 'Table'}…")
 
         action = menu.exec_(self.schema_tree.mapToGlobal(position))
         if action is None:
@@ -1665,6 +1753,12 @@ class ConnectionPanel(QWidget):
             self.show_alter_table_editor(table_name)
         elif diagram_action is not None and action == diagram_action:
             self.open_erd_view(focus_table=table_name)
+        elif action == impact_table_action:
+            self._find_table_usages(table_name)
+        elif action == impact_database_action:
+            self._find_database_usages()
+        elif action in impact_column_actions:
+            self._find_column_usages(table_name, impact_column_actions[action])
         elif action == copy_name_action:
             self._copy_table_name(table_name)
         elif action == copy_full_name_action:
@@ -1723,6 +1817,40 @@ class ConnectionPanel(QWidget):
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+
+    def _find_table_usages(self, table_name: str):
+        """Issue #236 — lists foreign keys referencing *table_name* plus
+        views/functions/procedures whose definition mentions it
+        (services/dependency_analyzer.py, schema-metadata driven — not
+        text-search over saved queries)."""
+        if not require_pro(Feature.IMPACT_ANALYSIS, "Impact Analysis", self):
+            return
+        report = dependency_analyzer.find_table_dependents(self.db_service, table_name)
+        dlg = ImpactAnalysisDialog(report, parent=self)
+        dlg.open_table.connect(self.open_table_view)
+        dlg.exec_()
+
+    def _find_column_usages(self, table_name: str, column_name: str):
+        """Column-scoped sibling of _find_table_usages (issue #236),
+        triggered from a table tab's Structure > Columns context menu."""
+        if not require_pro(Feature.IMPACT_ANALYSIS, "Impact Analysis", self):
+            return
+        report = dependency_analyzer.find_column_dependents(self.db_service, table_name, column_name)
+        dlg = ImpactAnalysisDialog(report, parent=self)
+        dlg.open_table.connect(self.open_table_view)
+        dlg.exec_()
+
+    def _find_database_usages(self):
+        """Database-scoped sibling of _find_table_usages (issue #236) —
+        one dependency report per table, computed from a single shared
+        bulk catalog fetch (services/dependency_analyzer.
+        find_database_dependents) rather than a per-table round-trip."""
+        if not require_pro(Feature.IMPACT_ANALYSIS, "Impact Analysis", self):
+            return
+        reports = dependency_analyzer.find_database_dependents(self.db_service)
+        dlg = DatabaseImpactDialog(reports, parent=self)
+        dlg.open_table.connect(self.open_table_view)
+        dlg.exec_()
 
     def open_schema_compare(self):
         """Open the read-only Schema Compare dialog (issue #68), preselecting
@@ -1818,6 +1946,9 @@ class ConnectionPanel(QWidget):
             tv.data_table.filter_by_value.connect(_on_filter_chip)
             tv.data_table.navigate_fk.connect(_on_fk_nav)
             tv.data_table.show_structure.connect(_on_show_structure)
+        tv.find_table_usages_signal.connect(self._find_table_usages)
+        tv.find_column_usages_signal.connect(self._find_column_usages)
+        tv.find_database_usages_signal.connect(self._find_database_usages)
 
         def _on_dirty(is_dirty, widget=tv):
             real_idx = self.tabs.indexOf(widget)
@@ -1899,6 +2030,7 @@ class ConnectionPanel(QWidget):
         count = self.tabs.count() + 1
         idx = self.tabs.addTab(tab, f"Tab {count}")
         tab.run_btn.clicked.connect(lambda: self._run_query_in_tab(tab))
+        tab.run_all_requested.connect(lambda: self._run_query_in_tab(tab, run_all=True))
         tab.begin_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "BEGIN"))
         tab.commit_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "COMMIT"))
         tab.rollback_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "ROLLBACK"))
@@ -2009,10 +2141,11 @@ class ConnectionPanel(QWidget):
         # Load FK map so right-click "Go to …" works in the result grid
         self._wire_result_fk(tab, table_name)
         cost = getattr(tab, '_last_cost_estimate', None)
-        self.query_history.add_query(
+        tab._last_history_entry_id = self.query_history.add_query(
             query, self.config["name"], len(df), elapsed,
             cost_score=cost.score if cost and not cost.error else None,
             cost_label=cost.label if cost and not cost.error else None,
+            cost_detail=query_cost.estimate_to_dict(cost),
         )
         if self._sidebar_stack.currentIndex() == 2:
             self._reload_history_list(self._history_search.text())
@@ -2038,10 +2171,21 @@ class ConnectionPanel(QWidget):
         if hasattr(tab, '_query_thread'):
             tab._query_thread.quit()
         query = getattr(tab, '_last_query', '')
-        select_results = [(lbl, obj) for lbl, obj in results if isinstance(obj, pd.DataFrame)]
+        select_results = [(lbl, obj) for lbl, obj, _ in results if isinstance(obj, pd.DataFrame)]
 
         total_rows = sum(len(df) for _, df in select_results)
-        self.query_history.add_query(query, self.config["name"], total_rows, elapsed)
+        # Roll every statement's own plan-only estimate up into one score
+        # for the history row — the worst statement wins, same "worst issue
+        # decides the label" logic score_issues()/label_for() already use
+        # within a single estimate's own issue list.
+        costs = [cost for _, _, cost in results if cost is not None]
+        worst_cost = max(costs, key=lambda c: c.score) if costs else None
+        self.query_history.add_query(
+            query, self.config["name"], total_rows, elapsed,
+            cost_score=worst_cost.score if worst_cost else None,
+            cost_label=worst_cost.label if worst_cost else None,
+            cost_detail=query_cost.estimate_to_dict(worst_cost),
+        )
         if self._sidebar_stack.currentIndex() == 2:
             self._reload_history_list(self._history_search.text())
 
@@ -2050,12 +2194,14 @@ class ConnectionPanel(QWidget):
             # branch isn't reached: the worker only takes this multi-
             # statement path for 2+ statements — kept as a defensive
             # fallback rather than assumed unreachable).
-            label, obj = results[0]
+            label, obj, cost = results[0]
+            tab._last_cost_estimate = cost
             if isinstance(obj, Exception):
                 tab.show_error(str(obj), query=label, elapsed=elapsed)
             elif isinstance(obj, pd.DataFrame):
                 tab.load_dataframe(obj, self._extract_table_name(query))
                 tab.update_status(len(obj), elapsed, truncated=obj.attrs.get("truncated", False))
+                tab.set_cost_estimate(cost)
             else:
                 tab.update_status(obj or 0, elapsed)
         else:
@@ -2063,10 +2209,13 @@ class ConnectionPanel(QWidget):
             # already renders a DataFrame or an Exception per tab — a write
             # (an int affected-row count) gets wrapped in a one-row summary
             # DataFrame so it reuses that same rendering with no UI changes.
+            # Its cost estimate travels alongside so the tab can show that
+            # statement's own badge when its sub-tab is selected.
             display_results = [
                 (label, obj if isinstance(obj, (pd.DataFrame, Exception))
-                       else pd.DataFrame({"result": [f"{obj} row(s) affected"]}))
-                for label, obj in results
+                       else pd.DataFrame({"result": [f"{obj} row(s) affected"]}),
+                 cost)
+                for label, obj, cost in results
             ]
             tab.load_multi_results(display_results, elapsed)
 
@@ -2114,6 +2263,21 @@ class ConnectionPanel(QWidget):
         tab._last_cost_estimate = estimate
         if hasattr(tab, 'set_cost_estimate'):
             tab.set_cost_estimate(estimate)
+
+    def _on_query_profile_ready(self, tab, profile):
+        """Receives worker `profile_ready` signal via bridge — only fires
+        when the tab's Auto-profile toggle was on for this run. Arrives
+        after _on_query_done (the worker only starts profiling once the
+        real run's `done` has already been emitted), so tab.
+        _last_history_entry_id is already set by the time this needs it;
+        a no-op if that entry has since aged out of the history cap."""
+        entry_id = getattr(tab, '_last_history_entry_id', None)
+        if not entry_id:
+            return
+        self.query_history.update_entry(
+            entry_id, profile_detail=query_cost.profile_to_dict(profile))
+        if self._sidebar_stack.currentIndex() == 2:
+            self._reload_history_list(self._history_search.text())
 
     # ── Parameterised query helpers ────────────────────────────────────────────
 
@@ -2177,7 +2341,7 @@ class ConnectionPanel(QWidget):
             query = query.replace(f"{{{{{name}}}}}", le.text())
         return query
 
-    def _run_query_in_tab(self, tab, override_query: str = None):
+    def _run_query_in_tab(self, tab, override_query: str = None, run_all: bool = False):
         """Execute the SQL in `tab` on a background thread; Cancel actually
         stops it. *override_query* (set by the Begin/Commit/Rollback
         buttons) bypasses the editor content and the format/param-prompt
@@ -2185,22 +2349,31 @@ class ConnectionPanel(QWidget):
         handling, and worker dispatch as typed SQL — a single code path so
         transaction control can't accidentally skip the write guard.
 
-        With no text selected, Run always executes every statement in the
-        editor, not just the one under the cursor — a script with several
-        statements is expected to run all of them. Each one still runs
-        independently via DbService.execute_multi_query, so a statement
-        that fails doesn't stop the ones after it, and every statement's
-        own outcome shows up as its own "Query N" tab in the results
-        (_on_query_multi_done). To run just one statement manually, select
-        its text before hitting Run."""
+        Plain Run (the Run button / Ctrl+Return) scopes to the selection,
+        or the statement the cursor is inside if nothing is selected
+        (`SqlTab.get_query()`'s selection → statement-at-cursor →
+        whole-text fallback chain) — matching DataGrip/DBeaver/TablePlus'
+        convention, and what a script with the cursor on one particular
+        statement should do.
+
+        *run_all=True* (Ctrl+Shift+Return / `SqlTab.run_all_requested`) is
+        the deliberate, explicit way to run every statement in the editor
+        regardless of selection or cursor — for an intentional multi-
+        statement script, not as Run's silent default (a user previously
+        relied on that silent default and got confused when only the
+        cursor's statement ran; making "run everything" its own clearly
+        separate action fixes that confusion without also making the
+        common case — one statement, cursor somewhere in the editor —
+        run every statement in the file). Each statement still runs
+        independently via DbService.execute_multi_query, so one failing
+        doesn't stop the rest, and each gets its own "Query N" tab in the
+        results (_on_query_multi_done)."""
         if override_query is not None:
             query = override_query
+        elif run_all:
+            query = tab.editor.toPlainText().strip()
         else:
-            cursor = tab.editor.textCursor()
-            if cursor.hasSelection():
-                query = cursor.selectedText().replace(' ', '\n').strip()
-            else:
-                query = tab.editor.toPlainText().strip()
+            query = tab.get_query().strip()
         if not query:
             return
         if self._connecting:
@@ -2235,6 +2408,7 @@ class ConnectionPanel(QWidget):
         tab._query_running = True
         tab._last_query    = query
         tab._last_cost_estimate = None
+        tab._last_history_entry_id = None
         if hasattr(tab, 'clear_cost_estimate'):
             tab.clear_cost_estimate()
         if hasattr(tab, 'clear_for_run'):
@@ -2295,7 +2469,8 @@ class ConnectionPanel(QWidget):
                 return
         tab._active_query_db = query_db
 
-        worker = _QueryWorker(query_db, query, tab._cancel_flag)
+        auto_profile = getattr(tab, 'auto_profile_chk', None) is not None and tab.auto_profile_chk.isChecked()
+        worker = _QueryWorker(query_db, query, tab._cancel_flag, auto_profile=auto_profile)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -2317,6 +2492,8 @@ class ConnectionPanel(QWidget):
             lambda: self._q_cancelled.emit(tab))
         worker.cost_ready.connect(
             lambda estimate: self._q_cost_ready.emit(tab, estimate))
+        worker.profile_ready.connect(
+            lambda profile: self._q_profile_ready.emit(tab, profile))
 
         # Safely (re)connect Cancel button — Cancel kills on the dedicated connection
         cancel_slot = getattr(tab, '_cancel_slot', None)
@@ -2383,21 +2560,48 @@ class ConnectionPanel(QWidget):
                 return True
         return False
 
-    def open_query_analyzer(self, focus_cost_tab: bool = False):
+    def open_query_analyzer(self, focus_cost_tab: bool = False, query: str = None,
+                             cost_detail: dict = None, profile_detail: dict = None,
+                             history_entry_id: str = None):
         """Open the consolidated Analyze Query dialog (Cost & Profile +
-        Compare Queries), pre-populated with the current tab's query.
+        Compare Queries), pre-populated with *query* — or, when omitted,
+        the current tab's query (the original behavior, used by the
+        Database menu and the status-bar cost badge). *query* lets other
+        callers (e.g. the History panel's "View Cost & Profile" action)
+        seed the dialog with an arbitrary past query instead. *cost_detail*
+        /*profile_detail* are that query's stored query_cost.
+        estimate_to_dict()/profile_to_dict() output, if any — shown
+        immediately instead of the dialog's blank "run an analysis" state;
+        the Estimate Cost / Run Profile buttons still work as normal for a
+        live re-check against the database now. *history_entry_id*, when
+        given, makes a live Estimate/Profile run from inside the dialog
+        stick back onto that history entry — see _CostProfileTab.
         Free tier — no require_pro() gate, unlike Schema/Data Compare;
         this is a safety/education aid, not a power-user workflow."""
         if not self.db_service or not self.db_service.connection:
             QMessageBox.information(self, "Analyze Query", "Connect to a database first.")
             return
         from ui.query_analyzer_dialog import QueryAnalyzerDialog
-        tab = self.tabs.currentWidget()
-        query = tab.get_query().strip() if tab and hasattr(tab, 'get_query') else ""
-        dlg = QueryAnalyzerDialog(self.db_service, initial_query=query, parent=self)
+        if query is None:
+            tab = self.tabs.currentWidget()
+            query = tab.get_query().strip() if tab and hasattr(tab, 'get_query') else ""
+        dlg = QueryAnalyzerDialog(self.db_service, initial_query=query,
+                                   initial_cost_detail=cost_detail,
+                                   initial_profile_detail=profile_detail,
+                                   query_history=self.query_history,
+                                   history_entry_id=history_entry_id, parent=self)
         if focus_cost_tab:
             dlg.show_cost_tab()
         dlg.show()
+
+    def run_all_statements(self):
+        """Database menu / Ctrl+Shift+Return: run every statement in the
+        current tab regardless of selection or cursor position — see
+        _run_query_in_tab's run_all parameter for why this is a distinct
+        action from plain Run rather than Run's default behavior."""
+        tab = self.tabs.currentWidget()
+        if isinstance(tab, SqlTab):
+            self._run_query_in_tab(tab, run_all=True)
 
     @staticmethod
     def _extract_table_name(query: str):
@@ -2561,9 +2765,25 @@ class ConnectionPanel(QWidget):
                     return
                 if not self._guard_write(sql):
                     return
+
+                # Issue #236: silent check (no upgrade nag) — warn about
+                # any column this ALTER drops that other schema objects
+                # depend on.
+                impact = ""
+                if entitlements.is_enabled(Feature.IMPACT_ANALYSIS):
+                    texts = []
+                    for col in dialog.get_dropped_columns():
+                        report = dependency_analyzer.find_column_dependents(
+                            self.db_service, table_name, col)
+                        text = impact_warning_text(report)
+                        if text:
+                            texts.append(text)
+                    if texts:
+                        impact = "\n\n".join(texts) + "\n\n"
+
                 reply = QMessageBox.question(
                     self, "Alter Table",
-                    f"Execute the following SQL?\n\n{sql}",
+                    f"{impact}Execute the following SQL?\n\n{sql}",
                     QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.Yes:
                     for stmt in query_classifier.split_statements(sql):
@@ -3217,9 +3437,19 @@ class ConnectionPanel(QWidget):
         sql = f"DROP {kind} {quoted}"
         if not self._guard_write(sql):
             return
+
+        # Issue #236: silent check (no upgrade nag — this runs on every
+        # drop, not just an explicit Impact Analysis click).
+        impact = ""
+        if entitlements.is_enabled(Feature.IMPACT_ANALYSIS):
+            report = dependency_analyzer.find_table_dependents(self.db_service, table_name)
+            text = impact_warning_text(report)
+            if text:
+                impact = text + "\n\n"
+
         reply = QMessageBox.question(
             self, f"Delete {kind.title()}",
-            f"This permanently drops '{table_name}' and all its data. This cannot be undone.\n\n"
+            f"{impact}This permanently drops '{table_name}' and all its data. This cannot be undone.\n\n"
             f"Execute the following SQL?\n\n{sql}",
             QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
@@ -3378,7 +3608,22 @@ class ConnectionPanel(QWidget):
         elif index == 2:
             self._reload_history_list()
 
+    @staticmethod
+    def _history_cost_color(score: int) -> str:
+        """Mirrors SqlTab._cost_badge_color so the history row's cost tint
+        and the status-bar badge it came from agree on what "expensive"
+        looks like."""
+        if score == 0:
+            return "#30d158"
+        if score < 20:
+            return "#0A84FF"
+        if score < 50:
+            return "#ff9f0a"
+        return "#ff453a"
+
     def _reload_history_list(self, filter_text: str = ''):
+        from PySide6.QtGui import QBrush, QColor
+
         self._history_list.clear()
         entries = self.query_history.get_recent_queries(limit=100)
         ft = filter_text.lower()
@@ -3386,25 +3631,61 @@ class ConnectionPanel(QWidget):
             q = entry.get('query', '').strip()
             ts = entry.get('timestamp', '')
             rows = entry.get('rows', '')
+            cost_score = entry.get('cost_score')
+            cost_label = entry.get('cost_label')
             if ft and ft not in q.lower():
                 continue
             display = q.replace('\n', ' ')[:80]
+            tooltip = f'{ts}  |  {rows} rows'
+            if cost_label is not None:
+                display = f'●  {display}'
+                tooltip += f'  |  Cost: {cost_score} ({cost_label})'
+            if entry.get('profile_detail'):
+                tooltip += '  |  Profiled'
+            tooltip += f'\n\n{q}'
             item = QListWidgetItem(display)
-            item.setToolTip(f'{ts}  |  {rows} rows\n\n{q}')
-            item.setData(Qt.UserRole, q)
+            item.setToolTip(tooltip)
+            # The whole entry, not just the query text — _show_history_
+            # context_menu's "View Cost & Profile…" needs cost_detail too.
+            item.setData(Qt.UserRole, entry)
+            if cost_score is not None:
+                item.setForeground(QBrush(QColor(self._history_cost_color(cost_score))))
             self._history_list.addItem(item)
 
     def _filter_history_list(self, text: str):
         self._reload_history_list(filter_text=text)
 
     def _use_history_item(self, item: QListWidgetItem):
-        query = item.data(Qt.UserRole)
+        entry = item.data(Qt.UserRole) or {}
+        query = entry.get('query')
         if not query:
             return
         tab = self._active_sql_tab()
         if not tab:
             return
         tab.set_query(query)
+
+    def _show_history_context_menu(self, pos):
+        item = self._history_list.itemAt(pos)
+        if item is None:
+            return
+        entry = item.data(Qt.UserRole) or {}
+        query = entry.get('query')
+        if not query:
+            return
+        menu = QMenu(self)
+        load_action = menu.addAction("Load into Tab")
+        analyze_action = menu.addAction("View Cost && Profile…")
+        action = menu.exec(self._history_list.mapToGlobal(pos))
+        if action == load_action:
+            self._use_history_item(item)
+        elif action == analyze_action:
+            self.open_query_analyzer(
+                focus_cost_tab=True, query=query,
+                cost_detail=entry.get('cost_detail'),
+                profile_detail=entry.get('profile_detail'),
+                history_entry_id=entry.get('id'),
+            )
 
     def _clear_history(self):
         self.query_history.queries.clear()
@@ -3702,6 +3983,31 @@ class ConnectionPanel(QWidget):
         self.db_pill.setStyleSheet(style)
         self.schema_pill.setStyleSheet(style)
 
+    def _style_schema_progress_bar(self, is_dark: bool):
+        """QSS for the schema-loading progress bar + its status label — set
+        directly (not via the app-level theme stylesheet) like the
+        pill/toggle buttons above."""
+        if is_dark:
+            bg, text, chunk = "#2c2c2e", "#8e8e93", "#0A84FF"
+        else:
+            bg, text, chunk = "#f2f2f7", "#6e6e73", "#007AFF"
+        self._schema_progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {bg};
+                border: none;
+            }}
+            QProgressBar::chunk {{
+                background-color: {chunk};
+            }}
+        """)
+        self._schema_loading_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {bg};
+                color: {text};
+                font-size: 11px;
+            }}
+        """)
+
     @staticmethod
     def _toggle_style_for(is_dark: bool) -> str:
         """QSS for the Schema/Queries/History toggle buttons — set directly
@@ -3732,6 +4038,7 @@ class ConnectionPanel(QWidget):
     def update_theme(self, is_dark: bool):
         self.current_theme = "dark" if is_dark else "light"
         self._apply_pill_style()
+        self._style_schema_progress_bar(is_dark)
         # Schema tree item text color, and the category-row / sidebar-toggle
         # label colors below, are all set directly (not via the app-level
         # theme stylesheet), so each has to be explicitly refreshed here

@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QToolTip,
     QTabWidget,
+    QMenu,
     QProgressBar,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QCursor
@@ -116,6 +117,9 @@ class TableViewWidget(QWidget):
 
     execute_query_signal = Signal(object)  # Signal to execute query in query editor tab
     dirty_changed = Signal(bool)           # True = unsaved changes, False = clean
+    find_table_usages_signal = Signal(str)         # (table_name) — issue #236
+    find_column_usages_signal = Signal(str, str)   # (table_name, column_name) — issue #236
+    find_database_usages_signal = Signal()         # issue #236
 
     # Bridge signals for load_table_data()/commit_changes()'s background
     # threading.Thread workers (same pattern as SchemaCompareDialog/
@@ -208,6 +212,8 @@ class TableViewWidget(QWidget):
         self.view_tabs.addTab(self.structure_page, "Structure")
 
         self.col_tbl = _new_readonly_table(["Column", "Type", "Null", "Key", "Default"])
+        self.col_tbl.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.col_tbl.customContextMenuRequested.connect(self._show_column_context_menu)
         self.idx_tbl = _new_readonly_table(["Name", "Columns", "Unique", "Type"])
         self.fk_tbl = _new_readonly_table(["Column", "References Table", "References Column"])
         # Match columns per issue #53's spec: name always, type/key for Columns,
@@ -1165,6 +1171,35 @@ class TableViewWidget(QWidget):
     def show_structure_tab(self):
         """Switch to the Structure tab, loading it on first use."""
         self.view_tabs.setCurrentWidget(self.structure_page)
+
+    def _show_column_context_menu(self, position):
+        """Impact Analysis for the right-clicked column (issue #236) — the
+        actual lookup runs in ui/connection_panel.py, which owns the
+        (Pro-gated) dialogs; this widget only knows its own table/column
+        names, not entitlements or dialog wiring. Table is listed first/
+        default (analyzing the whole table is the common case); Column is
+        already known here (no picker needed, unlike the schema tree's
+        version of this menu); Database needs neither."""
+        row = self.col_tbl.rowAt(position.y())
+        if row < 0:
+            return
+        item = self.col_tbl.item(row, 0)
+        if not item or not item.text():
+            return
+        column_name = item.text()
+        menu = QMenu(self)
+        impact_menu = menu.addMenu("🔎 Impact Analysis")
+        table_action = impact_menu.addAction("Table")
+        column_action = impact_menu.addAction(f"Column ({column_name})")
+        impact_menu.addSeparator()
+        database_action = impact_menu.addAction("Database")
+        action = menu.exec_(self.col_tbl.viewport().mapToGlobal(position))
+        if action == table_action:
+            self.find_table_usages_signal.emit(self.table_name)
+        elif action == column_action:
+            self.find_column_usages_signal.emit(self.table_name, column_name)
+        elif action == database_action:
+            self.find_database_usages_signal.emit()
 
     def _on_view_tab_changed(self, index):
         widget = self.view_tabs.widget(index)

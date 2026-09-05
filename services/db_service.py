@@ -6,6 +6,7 @@ from utils import schema_cache
 from utils import perf_metrics
 from utils.df_export import _quote_identifier
 from services import query_classifier
+from services import query_cost
 
 logger = get_logger()
 
@@ -681,14 +682,18 @@ class DbService:
                 return self._execute_query_raw(query, max_rows)
             raise
 
-    def execute_multi_query(self, script: str, max_rows=None) -> list[tuple[str, object]]:
+    def execute_multi_query(self, script: str, max_rows=None) -> list[tuple[str, object, object]]:
         """Split *script* into statements, execute each. Returns list of
-        (label, DataFrame|int|Exception) tuples, one per statement: a
-        SELECT produces its result DataFrame, a write produces the
-        affected-row count (int, possibly 0), and a statement that raised
-        produces the Exception — the caller (ConnectionPanel.
+        (label, DataFrame|int|Exception, CostEstimate|None) tuples, one per
+        statement: a SELECT produces its result DataFrame, a write produces
+        the affected-row count (int, possibly 0), and a statement that
+        raised produces the Exception — the caller (ConnectionPanel.
         _on_query_multi_done) uses this to show every statement's own
-        outcome as its own result tab, not just the SELECTs.
+        outcome as its own result tab, not just the SELECTs. The cost slot
+        is a best-effort, plan-only EXPLAIN estimate (same one the single-
+        statement path emits for the status-bar badge) — None for writes,
+        for a statement whose own EXPLAIN failed, or for a read that itself
+        raised (nothing to estimate a plan for if it never got that far).
 
         Routes each statement by its real classification (not a first-
         keyword guess), so a write hidden behind a leading comment or
@@ -696,22 +701,29 @@ class DbService:
         therefore still passes through self._guard() — instead of silently
         being treated as a read.
         """
-        results: list[tuple[str, object]] = []
+        results: list[tuple[str, object, object]] = []
         stmts = query_classifier.split_statements(script)
         for stmt in stmts:
             label = stmt[:40].replace("\n", " ").strip() + ("…" if len(stmt) > 40 else "")
             if query_classifier.classify(stmt).is_write:
                 try:
                     affected = self.execute_update(stmt)
-                    results.append((label, affected))
+                    results.append((label, affected, None))
                 except Exception as ex:
-                    results.append((label, ex))
+                    results.append((label, ex, None))
             else:
+                cost = None
+                try:
+                    cost = query_cost.estimate_cost(self, stmt)
+                    if cost.error:
+                        cost = None
+                except Exception:
+                    cost = None
                 try:
                     df = self.execute_query(stmt, max_rows=max_rows)
-                    results.append((label, df))
+                    results.append((label, df, cost))
                 except Exception as ex:
-                    results.append((label, ex))
+                    results.append((label, ex, None))
         return results
 
     def get_foreign_keys(self, table_name: str) -> list[dict]:
@@ -1372,15 +1384,18 @@ class DbService:
         return {}
 
     def get_all_foreign_keys(self) -> dict:
-        """Return {table_name: [{column, ref_table, ref_column}, ...]} for
-        every table in one round-trip — the bulk sibling of
+        """Return {table_name: [{column, ref_table, ref_column, constraint}, ...]}
+        for every table in one round-trip — the bulk sibling of
         get_foreign_keys(table_name), used to power FK-aware JOIN completion
-        without an N+1 query per table."""
+        without an N+1 query per table. `constraint` (issue #236's Impact
+        Analysis "Constraint / Column" display) is the FK's real constraint
+        name from the catalog."""
         try:
             if self.db_type == "mysql":
                 cursor = self.connection.cursor()
                 cursor.execute("""
-                    SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+                    SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME,
+                           CONSTRAINT_NAME
                     FROM information_schema.KEY_COLUMN_USAGE
                     WHERE TABLE_SCHEMA = DATABASE()
                       AND REFERENCED_TABLE_NAME IS NOT NULL
@@ -1393,6 +1408,7 @@ class DbService:
                         "column": r["COLUMN_NAME"],
                         "ref_table": r["REFERENCED_TABLE_NAME"],
                         "ref_column": r["REFERENCED_COLUMN_NAME"],
+                        "constraint": r["CONSTRAINT_NAME"],
                     })
                 return result
 
@@ -1401,7 +1417,8 @@ class DbService:
                 cursor.execute("""
                     SELECT tc.table_name, kcu.column_name,
                            ccu.table_name  AS ref_table,
-                           ccu.column_name AS ref_column
+                           ccu.column_name AS ref_column,
+                           tc.constraint_name
                     FROM information_schema.table_constraints tc
                     JOIN information_schema.key_column_usage kcu
                          ON tc.constraint_name = kcu.constraint_name
@@ -1413,9 +1430,122 @@ class DbService:
                 result = {}
                 for r in rows:
                     result.setdefault(r[0], []).append(
-                        {"column": r[1], "ref_table": r[2], "ref_column": r[3]})
+                        {"column": r[1], "ref_table": r[2], "ref_column": r[3], "constraint": r[4]})
                 return result
 
+        except Exception:
+            pass
+        return {}
+
+    def get_view_definitions(self) -> dict:
+        """Return {view_name: definition_sql} for every view in one
+        round-trip — used by services/dependency_analyzer.py's usage search
+        (issue #236). {} on any dialect without catalog support, or on
+        failure — never raises."""
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT TABLE_NAME, VIEW_DEFINITION
+                    FROM information_schema.VIEWS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                """)
+                rows = cursor.fetchall()
+                cursor.close()
+                return {list(r.values())[0]: (list(r.values())[1] or "") for r in rows}
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT viewname, definition FROM pg_views
+                    WHERE schemaname = current_schema()
+                """)
+                rows = cursor.fetchall()
+                cursor.close()
+                return {r[0]: (r[1] or "") for r in rows}
+        except Exception:
+            pass
+        return {}
+
+    def _get_routine_definitions(self, mysql_routine_type: str, pg_prokind: str) -> dict:
+        """Return {name: definition_sql} for every routine of one kind
+        (MySQL: ROUTINE_TYPE 'FUNCTION'/'PROCEDURE'; Postgres: prokind
+        'f'/'p') in one round-trip — shared by get_function_definitions()/
+        get_procedure_definitions() below, used by
+        services/dependency_analyzer.py's usage search (issue #236)."""
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT ROUTINE_NAME, ROUTINE_DEFINITION
+                    FROM information_schema.ROUTINES
+                    WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = %s
+                """, (mysql_routine_type,))
+                rows = cursor.fetchall()
+                cursor.close()
+                return {list(r.values())[0]: (list(r.values())[1] or "") for r in rows}
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT p.proname, pg_get_functiondef(p.oid)
+                    FROM pg_proc p
+                    JOIN pg_namespace n ON p.pronamespace = n.oid
+                    WHERE n.nspname = current_schema() AND p.prokind = %s
+                """, (pg_prokind,))
+                rows = cursor.fetchall()
+                cursor.close()
+                return {r[0]: (r[1] or "") for r in rows}
+        except Exception:
+            pass
+        return {}
+
+    def get_function_definitions(self) -> dict:
+        """Functions only — the function-kind slice of
+        _get_routine_definitions(), split out (issue #236) so Impact
+        Analysis can group functions and procedures separately."""
+        return self._get_routine_definitions("FUNCTION", "f")
+
+    def get_procedure_definitions(self) -> dict:
+        """Procedures only — see get_function_definitions()."""
+        return self._get_routine_definitions("PROCEDURE", "p")
+
+    def get_trigger_definitions(self) -> dict:
+        """Return {trigger_name: definition_text} for every trigger in one
+        round-trip, used by services/dependency_analyzer.py's usage search
+        (issue #236). The definition text always includes the trigger's
+        own table (Postgres's pg_get_triggerdef() embeds "ON tablename"
+        natively; the MySQL branch prepends it manually since
+        ACTION_STATEMENT is just the trigger body) — so a trigger defined
+        *on* the table being searched for always matches, on top of any
+        other table/column mentioned inside its body. Postgres excludes
+        internal triggers (tgisinternal) — those back FK constraint
+        enforcement, already covered exactly by get_all_foreign_keys()."""
+        try:
+            if self.db_type == "mysql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_STATEMENT
+                    FROM information_schema.TRIGGERS
+                    WHERE TRIGGER_SCHEMA = DATABASE()
+                """)
+                rows = cursor.fetchall()
+                cursor.close()
+                result: dict = {}
+                for r in rows:
+                    r = dict(r)
+                    result[r["TRIGGER_NAME"]] = f"ON {r['EVENT_OBJECT_TABLE']} {r['ACTION_STATEMENT'] or ''}"
+                return result
+            elif self.db_type == "postgresql":
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT t.tgname, pg_get_triggerdef(t.oid)
+                    FROM pg_trigger t
+                    JOIN pg_class c ON t.tgrelid = c.oid
+                    JOIN pg_namespace n ON c.relnamespace = n.oid
+                    WHERE n.nspname = current_schema() AND NOT t.tgisinternal
+                """)
+                rows = cursor.fetchall()
+                cursor.close()
+                return {r[0]: (r[1] or "") for r in rows}
         except Exception:
             pass
         return {}
