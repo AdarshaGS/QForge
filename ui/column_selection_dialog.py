@@ -12,18 +12,27 @@ from PySide6.QtWidgets import (
 
 
 class ColumnSelectionDialog(QDialog):
-    """Lets the user pick which columns to include before exporting
-    (issue #142's "Export Table with Column Selection"). Styled after
-    ExportScopeDialog's table checklist."""
+    """Lets the user pick a subset of columns via a checklist. Originally
+    built for "Export Table with Column Selection" (issue #142), styled
+    after ExportScopeDialog's table checklist; also used for the data
+    grid's "Manage Columns" visibility toggle (issue #252) via the
+    *checked_columns*/*title*/*label* params below."""
 
-    def __init__(self, columns: list[str], parent=None):
+    def __init__(self, columns: list[str], parent=None, checked_columns=None,
+                 title: str = "Select Columns to Export", label: str = "Columns:",
+                 disabled_columns=None, disabled_tooltip: str = ""):
         super().__init__(parent)
-        self.setWindowTitle("Select Columns to Export")
+        self.setWindowTitle(title)
         self.setMinimumWidth(320)
+        # None (the export call site's default) means "everything starts
+        # checked" — checked_columns is only meaningful as an inclusion
+        # set once a caller passes one explicitly.
+        checked_columns = set(columns) if checked_columns is None else set(checked_columns)
+        disabled_columns = set(disabled_columns or ())
 
         self._checks: dict[str, QCheckBox] = {}
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Columns:"))
+        layout.addWidget(QLabel(label))
 
         select_row = QHBoxLayout()
         select_all_btn = QPushButton("Select All")
@@ -41,7 +50,11 @@ class ColumnSelectionDialog(QDialog):
         list_layout.setSpacing(2)
         for col in columns:
             cb = QCheckBox(col)
-            cb.setChecked(True)
+            cb.setChecked(col in checked_columns)
+            if col in disabled_columns:
+                cb.setEnabled(False)
+                if disabled_tooltip:
+                    cb.setToolTip(disabled_tooltip)
             self._checks[col] = cb
             list_layout.addWidget(cb)
         list_layout.addStretch()

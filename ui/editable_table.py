@@ -12,9 +12,11 @@ from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QStyle,
 )
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QBrush, QShortcut, QKeySequence, QCursor
+from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtGui import QColor, QBrush, QPalette, QShortcut, QKeySequence, QCursor
 import pandas as pd
 from utils.df_export import export_dataframe
 
@@ -126,6 +128,38 @@ class _NoEditDelegate(QStyledItemDelegate):
 
     def createEditor(self, parent, option, index):
         return None
+
+
+# Custom item-data role marking a cell as a real SQL NULL rather than a
+# genuine empty string — both display as "" via Qt.DisplayRole, so telling
+# them apart needs a role of its own (issue #182).
+_IS_NULL_ROLE = Qt.UserRole + 1
+_NULL_PLACEHOLDER_COLOR = QColor("#6b6b70")
+
+
+class _NullAwareDelegate(QStyledItemDelegate):
+    """Paints a cell flagged _IS_NULL_ROLE as a muted italic "NULL"
+    placeholder instead of a blank cell pixel-identical to a genuine empty
+    string (issue #182). Paint-only: item.text() — what copy/paste,
+    dirty-diffing, and get_changes() all read — is untouched, so editing/
+    saving semantics don't change; this only changes what's drawn when not
+    in edit mode."""
+
+    def paint(self, painter, option, index):
+        is_null = index.data(Qt.DisplayRole) == "" and index.data(_IS_NULL_ROLE)
+        if not is_null:
+            super().paint(painter, option, index)
+            return
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = "NULL"
+        opt.font.setItalic(True)
+        if not (opt.state & QStyle.State_Selected):
+            opt.palette.setColor(QPalette.Text, _NULL_PLACEHOLDER_COLOR)
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
 
 
 # ── Undo/redo command stack (issue #124) ────────────────────────────────
@@ -282,6 +316,7 @@ class EditableTableWidget(QTableWidget):
     
     filter_changed = Signal()  # Signal when filters change
     changes_made = Signal()  # Signal when data is modified
+    layout_changed = Signal()  # Column width/order/pinned-count changed (issue #182)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -338,6 +373,13 @@ class EditableTableWidget(QTableWidget):
         self._movable_before_freeze = None
         self._syncing_frozen_width = False
 
+        # Issue #252: hidden (display-only) real columns, tracked by name
+        # rather than logical index — a column's logical index is only
+        # stable within one load, and this set needs to survive a
+        # page/sort/filter refresh's full column rebuild (reapplied by
+        # apply_layout_state(), same as frozen/width/order state).
+        self._hidden_columns: set[str] = set()
+
         # Filler columns pad the grid horizontally to fill the viewport
         # past the real data (like TablePlus/a spreadsheet) — non-editable
         # via a per-column delegate rather than per-item flags, so blocking
@@ -349,6 +391,10 @@ class EditableTableWidget(QTableWidget):
         # (add/duplicate/delete/undo), and a per-row delegate assignment
         # doesn't shift when QTableWidget.insertRow()/removeRow() does,
         # so it would silently drift onto the wrong row.
+        # Issue #182: table-wide default delegate paints real SQL NULLs
+        # distinctly from genuine empty strings (both are "" via
+        # Qt.DisplayRole otherwise). Filler columns override this below.
+        self.setItemDelegate(_NullAwareDelegate(self))
         self._default_delegate = self.itemDelegate()
         self._no_edit_delegate = _NoEditDelegate(self)
         self._filler_col_range = range(0, 0)
@@ -377,6 +423,12 @@ class EditableTableWidget(QTableWidget):
         # Cmd+Backspace to delete selected row(s)
         self.delete_shortcut = QShortcut(QKeySequence("Ctrl+Backspace"), self)
         self.delete_shortcut.activated.connect(self.delete_selected_rows)
+
+        # Cmd+Shift+D to fill the selection down from its top row (issue
+        # #182) — Ctrl+D is already "Duplicate row" above, so fill-down
+        # gets its own binding rather than overloading that one.
+        self.fill_down_shortcut = QShortcut(QKeySequence("Ctrl+Shift+D"), self)
+        self.fill_down_shortcut.activated.connect(self.fill_down)
 
         # Issue #124: Cmd+Z / Cmd+Shift+Z undo/redo. Scoped to
         # WidgetWithChildrenShortcut (not the default WindowShortcut) so it
@@ -419,6 +471,15 @@ class EditableTableWidget(QTableWidget):
         hdr.setContextMenuPolicy(Qt.CustomContextMenu)
         hdr.customContextMenuRequested.connect(self._show_header_context_menu)
         hdr.sectionResized.connect(self._on_main_section_resized)
+
+        # Issue #182: column width/order persistence. A drag fires many
+        # sectionResized/sectionMoved events in a row — debounce them into
+        # one layout_changed emission instead of saving on every pixel.
+        self._layout_save_timer = QTimer(self)
+        self._layout_save_timer.setSingleShot(True)
+        self._layout_save_timer.timeout.connect(self.layout_changed.emit)
+        hdr.sectionResized.connect(self._schedule_layout_save)
+        hdr.sectionMoved.connect(self._schedule_layout_save)
 
         # Theme will be set by update_theme method
         self.current_theme = 'dark'
@@ -515,6 +576,7 @@ class EditableTableWidget(QTableWidget):
         # don't carry a stale freeze count over from whatever was loaded
         # before.
         self.set_frozen_columns(0)
+        self._hidden_columns = set()   # caller restores via apply_layout_state()
         self.original_data = dataframe.copy() if dataframe is not None else None
         self.filtered_data = dataframe.copy() if dataframe is not None else None
         self.table_name = table_name
@@ -594,6 +656,14 @@ class EditableTableWidget(QTableWidget):
         # cells), regardless of row count.
         total_cols = real_cols + self._EMPTY_PLACEHOLDER_COLUMNS
 
+        # Issue #252: a hidden column's Qt-level hidden flag is per-section
+        # state that survives setColumnCount()/clear() across a reload —
+        # start from a clean slate here; whoever loaded this data (e.g.
+        # apply_layout_state()) re-hides only the columns that should
+        # still be hidden.
+        for col in range(self.columnCount()):
+            self.setColumnHidden(col, False)
+
         self.setColumnCount(total_cols)
         self.setHorizontalHeaderLabels([str(col) for col in dataframe.columns])
         for col in range(real_cols, total_cols):
@@ -605,6 +675,15 @@ class EditableTableWidget(QTableWidget):
         for col in self._filler_col_range:
             self.setItemDelegateForColumn(col, self._no_edit_delegate)
 
+        # Type-aware alignment (issue #182): numeric columns read right-
+        # aligned, everything else left-aligned — computed once per column
+        # rather than re-inspecting the dtype on every cell.
+        col_alignment = [
+            (Qt.AlignRight | Qt.AlignVCenter) if pd.api.types.is_numeric_dtype(dataframe.dtypes.iloc[col])
+            else (Qt.AlignLeft | Qt.AlignVCenter)
+            for col in range(real_cols)
+        ]
+
         if dataframe.empty:
             # For empty tables, show column headers with placeholder rows
             # filling the grid (like TablePlus), not just a handful.
@@ -612,6 +691,7 @@ class EditableTableWidget(QTableWidget):
             for row in range(self._EMPTY_PLACEHOLDER_ROWS):
                 for col in range(real_cols):
                     item = QTableWidgetItem("")
+                    item.setTextAlignment(col_alignment[col])
                     self.setItem(row, col, item)
                     self._cell_snapshot[(row, col)] = ""
         else:
@@ -633,6 +713,9 @@ class EditableTableWidget(QTableWidget):
 
                     item = QTableWidgetItem(display_text)
                     item.setData(Qt.UserRole, dataframe.iloc[row, col])  # Store original value
+                    if is_na:
+                        item.setData(_IS_NULL_ROLE, True)
+                    item.setTextAlignment(col_alignment[col])
                     self.setItem(row, col, item)
                     self._cell_snapshot[(row, col)] = display_text
 
@@ -640,6 +723,7 @@ class EditableTableWidget(QTableWidget):
         hdr.setSectionResizeMode(QHeaderView.Interactive)
         hdr.setStretchLastSection(False)
         self._set_compact_column_widths(dataframe)
+        self._size_filler_columns()
         self._apply_sort_header_labels()
         
         # Reconnect signal
@@ -734,6 +818,8 @@ class EditableTableWidget(QTableWidget):
             if self._frozen_view is not None:
                 self._frozen_view.hide()
 
+        self._schedule_layout_save()
+
     def _sync_frozen_header_order(self):
         """Arrange the frozen view's header sections in the same
         left-to-right visual order as the main header, for the columns
@@ -756,10 +842,24 @@ class EditableTableWidget(QTableWidget):
         hdr = self.horizontalHeader()
         for logical in range(self.columnCount()):
             visual = hdr.visualIndex(logical)
+            # Issue #252: a user-hidden column occupying a visual slot
+            # within the frozen range must stay hidden in the overlay too
+            # — the overlay is a second, independent QTableView with its
+            # own hidden-column state, so without this it would reappear
+            # there even though hide_column() hid it on the main view.
+            header_item = self.horizontalHeaderItem(logical)
+            user_hidden = header_item is not None and header_item.text() in self._hidden_columns
             self._frozen_view.setColumnHidden(
-                logical, visual == -1 or visual >= self._frozen_col_count)
+                logical, user_hidden or visual == -1 or visual >= self._frozen_col_count)
 
     def _on_main_section_resized(self, logical, _old, new):
+        # Issue #253: a real column's width changing (drag-resize) can
+        # cross the fit/overflow boundary — re-fit the filler columns to
+        # match. Guarded to real columns only: _size_filler_columns()
+        # itself only ever resizes FILLER columns (logical >=
+        # _real_col_count), so this can't recurse into itself.
+        if logical < self._real_col_count:
+            self._size_filler_columns()
         if self._frozen_col_count <= 0 or self._frozen_view is None or self._syncing_frozen_width:
             self._update_frozen_geometry()
             return
@@ -771,6 +871,15 @@ class EditableTableWidget(QTableWidget):
 
     def _on_frozen_section_resized(self, logical, _old, new):
         if self._syncing_frozen_width or self._frozen_view is None:
+            return
+        # _apply_frozen_visibility() hides every non-frozen column in the
+        # overlay, and Qt fires this same sectionResized signal (to size 0)
+        # for each one hidden — without this guard that 0 propagated
+        # straight onto the corresponding MAIN-view column, silently
+        # zeroing the width of every column that isn't frozen (issue #182:
+        # found while persisting layout state across a freeze). Mirrors
+        # the equivalent guard already in _on_main_section_resized.
+        if self.horizontalHeader().visualIndex(logical) >= self._frozen_col_count:
             return
         self._syncing_frozen_width = True
         self.setColumnWidth(logical, new)
@@ -791,14 +900,92 @@ class EditableTableWidget(QTableWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._size_filler_columns()
         self._update_frozen_geometry()
 
+    # ── Column layout persistence (issue #182) ──────────────────────────
+    # This widget doesn't know which connection/database/table it's
+    # showing beyond a bare table_name, so it can't persist anything
+    # itself — it just reports/accepts a plain dict; TableViewWidget (which
+    # does know that context) owns reading/writing it via
+    # services/grid_layout.py.
+
+    def _schedule_layout_save(self, *args):
+        self._layout_save_timer.start(500)
+
+    def get_layout_state(self) -> dict:
+        """Current column order/widths/pinned-count/hidden-set, keyed by
+        column name (not index) so a saved layout still applies sensibly
+        after the query's column list changes shape."""
+        hdr = self.horizontalHeader()
+        order = []
+        widths = {}
+        for visual in range(self._real_col_count):
+            logical = hdr.logicalIndex(visual)
+            header_item = self.horizontalHeaderItem(logical)
+            if header_item is None:
+                continue
+            name = header_item.text()
+            order.append(name)
+            # A hidden column's sectionSize() reads 0 (that's how Qt
+            # remembers "hidden", not a real width) — recording that would
+            # make apply_layout_state() collapse it back to 0px instead of
+            # its real pre-hide width once shown again.
+            if name not in self._hidden_columns:
+                widths[name] = hdr.sectionSize(logical)
+        return {
+            "order": order, "widths": widths, "frozen": self._frozen_col_count,
+            "hidden": sorted(self._hidden_columns),
+        }
+
+    def apply_layout_state(self, state: dict):
+        """Restore a dict previously returned by get_layout_state(). Column
+        names no longer present in the current result set (the query or
+        the table's own schema changed since this was saved) are skipped
+        rather than raised on."""
+        if not state:
+            return
+        hdr = self.horizontalHeader()
+        name_to_logical = {}
+        for logical in range(self._real_col_count):
+            header_item = self.horizontalHeaderItem(logical)
+            if header_item is not None:
+                name_to_logical[header_item.text()] = logical
+
+        for name, width in (state.get("widths") or {}).items():
+            logical = name_to_logical.get(name)
+            if logical is not None and isinstance(width, int) and width > 0:
+                hdr.resizeSection(logical, width)
+
+        # Move each column to its saved visual slot in ascending target
+        # order — visualIndex() is re-read fresh each step since earlier
+        # moves in this same loop shift later columns' current positions.
+        for target_visual, name in enumerate(state.get("order") or []):
+            logical = name_to_logical.get(name)
+            if logical is None:
+                continue
+            current_visual = hdr.visualIndex(logical)
+            if current_visual != target_visual:
+                hdr.moveSection(current_visual, target_visual)
+
+        frozen = state.get("frozen")
+        if isinstance(frozen, int) and frozen > 0:
+            self.set_frozen_columns(min(frozen, self._real_col_count))
+
+        # Restored last: hide_column() refuses a column that's within the
+        # (now-restored) frozen range, so this needs the final freeze
+        # state settled first.
+        for name in state.get("hidden") or []:
+            self.hide_column(name)
+
     def _show_header_context_menu(self, position):
-        """Right-click a column header: freeze up through that column, or
-        unfreeze if a freeze is already active."""
+        """Right-click a column header: freeze up through that column,
+        unfreeze if a freeze is already active, or hide/show columns
+        (issue #252)."""
         hdr = self.horizontalHeader()
         logical = hdr.logicalIndexAt(position)
         menu = QMenu(self)
+        col_name = None
         if logical >= 0:
             visual = hdr.visualIndex(logical)
             header_item = self.horizontalHeaderItem(logical)
@@ -808,8 +995,105 @@ class EditableTableWidget(QTableWidget):
         if self._frozen_col_count > 0:
             menu.addAction("Unfreeze Columns").triggered.connect(
                 lambda: self.set_frozen_columns(0))
+
+        # Issue #252: column visibility. A frozen/pinned column can't be
+        # individually hidden — the pinned overlay is a second QTableView
+        # with its own independent hidden-column state (see
+        # _apply_frozen_visibility), so hiding a column only on the main
+        # view here would leave it still showing, pinned, in the overlay.
+        if (logical is not None and logical >= 0 and logical < self._real_col_count
+                and hdr.visualIndex(logical) >= self._frozen_col_count):
+            menu.addSeparator()
+            menu.addAction(f"🙈  Hide Column “{col_name}”").triggered.connect(
+                lambda: self.hide_column(col_name))
+        if self._hidden_columns:
+            menu.addSeparator()
+            for name in sorted(self._hidden_columns):
+                menu.addAction(f"👁  Show “{name}”").triggered.connect(
+                    lambda checked=False, n=name: self.show_column(n))
+            if len(self._hidden_columns) > 1:
+                menu.addAction("Show All Columns").triggered.connect(self.show_all_columns)
+
+        if self._real_col_count > 0:
+            menu.addSeparator()
+            menu.addAction("Manage Columns…").triggered.connect(self.manage_columns)
+
         if menu.actions():
             menu.exec_(hdr.mapToGlobal(position))
+
+    def _logical_index_for_column_name(self, col_name: str):
+        for c in range(self._real_col_count):
+            item = self.horizontalHeaderItem(c)
+            if item is not None and item.text() == col_name:
+                return c
+        return None
+
+    def hide_column(self, col_name: str):
+        """Hide a real column by name — display-only (issue #252): the
+        underlying data, copy/paste, export, get_changes()/SQL generation,
+        and row-value filtering are all untouched, the column just isn't
+        painted. No-op for a column that's currently frozen/pinned, doesn't
+        exist in the current result set, or is already hidden."""
+        logical = self._logical_index_for_column_name(col_name)
+        if logical is None or col_name in self._hidden_columns:
+            return
+        if self.horizontalHeader().visualIndex(logical) < self._frozen_col_count:
+            return
+        self._hidden_columns.add(col_name)
+        self.setColumnHidden(logical, True)
+        self._size_filler_columns()
+        self._schedule_layout_save()
+
+    def show_column(self, col_name: str):
+        """Reverse of hide_column()."""
+        if col_name not in self._hidden_columns:
+            return
+        logical = self._logical_index_for_column_name(col_name)
+        self._hidden_columns.discard(col_name)
+        if logical is not None:
+            self.setColumnHidden(logical, False)
+        self._size_filler_columns()
+        self._schedule_layout_save()
+
+    def show_all_columns(self):
+        for name in list(self._hidden_columns):
+            self.show_column(name)
+
+    def manage_columns(self):
+        """Checklist dialog to hide/show many columns in one go (issue
+        #252) — the header menu's per-column Hide/Show is one click per
+        column, tedious for a wide table."""
+        from ui.column_selection_dialog import ColumnSelectionDialog
+        names = []
+        for c in range(self._real_col_count):
+            item = self.horizontalHeaderItem(c)
+            if item is not None:
+                names.append(item.text())
+        if not names:
+            return
+
+        hdr = self.horizontalHeader()
+        frozen_names = {
+            names[hdr.logicalIndex(v)] for v in range(self._frozen_col_count)
+            if hdr.logicalIndex(v) < len(names)
+        } if self._frozen_col_count > 0 else set()
+        visible_names = [n for n in names if n not in self._hidden_columns]
+
+        dlg = ColumnSelectionDialog(
+            names, parent=self, checked_columns=visible_names,
+            title="Manage Columns", label="Visible columns:",
+            disabled_columns=frozen_names,
+            disabled_tooltip="Currently pinned — unpin to hide this column",
+        )
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+
+        selected = set(dlg.selected_columns())
+        for name in names:
+            if name in selected:
+                self.show_column(name)
+            elif name not in frozen_names:
+                self.hide_column(name)
 
     _COL_WIDTH_MIN = 60     # never narrower than this
     _COL_WIDTH_MAX = 300    # never wider than this without manual resize
@@ -820,11 +1104,14 @@ class EditableTableWidget(QTableWidget):
     # window height; upgrade to a dynamic viewport-height calculation if a
     # pathologically tall window ever needs more (issue #26).
     _EMPTY_PLACEHOLDER_ROWS = 50
-    # Same reasoning, horizontally: a fixed count of default-width filler
-    # columns (below) rather than measuring the viewport. 30 * _COL_WIDTH_DEF
-    # (120px) = 3600px, comfortably past real column width for any
-    # realistic window — these are blocked from editing by _NoEditDelegate
-    # in _display_data_impl, so a generous count costs nothing per-row.
+    # Same reasoning, horizontally: a generous fixed COUNT of filler
+    # columns, comfortably past real column width for any realistic
+    # window — these are blocked from editing by _NoEditDelegate in
+    # _display_data_impl, so a generous count costs nothing per-row. Their
+    # WIDTH, unlike the row count above, isn't fixed: _size_filler_columns()
+    # (issue #253) sizes however many of these are actually needed down to
+    # the real viewport width, so this count is just an upper bound on how
+    # wide a window this can fill without running out of filler columns.
     _EMPTY_PLACEHOLDER_COLUMNS = 30
 
     def _set_compact_column_widths(self, dataframe):
@@ -873,6 +1160,29 @@ class EditableTableWidget(QTableWidget):
             self.setMaximumWidth(hdr.length() + vheader_w + 2 * self.frameWidth() + scrollbar_w)
         else:
             self.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX — no columns, don't constrain
+
+    def _size_filler_columns(self):
+        """Shrink the filler columns (see _display_data_impl) so their
+        total width closes the gap between the real columns and the
+        viewport exactly — not the fixed _EMPTY_PLACEHOLDER_COLUMNS *
+        _COL_WIDTH_DEF budget _set_compact_column_widths just gave them,
+        which routinely overshoots a normal-sized viewport and turns that
+        overshoot into a spurious horizontal scrollbar (issue #253).
+        Real column widths are never touched here. Safe to call before the
+        widget has ever been shown: viewport().width() falls back to a
+        small/placeholder value then, under-filling until the resizeEvent
+        this same widget already gets once its real on-screen size is
+        known corrects it (mirrors how _update_frozen_geometry() already
+        relies on that same event for its own first-layout correction)."""
+        if not self._filler_col_range:
+            return
+        hdr = self.horizontalHeader()
+        real_w = sum(hdr.sectionSize(c) for c in range(self._real_col_count))
+        leftover = max(0, self.viewport().width() - real_w)
+        for col in self._filler_col_range:
+            width = min(self._COL_WIDTH_DEF, leftover)
+            hdr.resizeSection(col, width)
+            leftover -= width
 
     def keyPressEvent(self, event):
         """Cmd+Enter opens a detail popup for the current cell value."""
@@ -1445,6 +1755,11 @@ class EditableTableWidget(QTableWidget):
             duplicate_action = menu.addAction("Duplicate")
             duplicate_action.setShortcut("Ctrl+D")
             duplicate_action.triggered.connect(self.duplicate_row)
+            fill_down_action = menu.addAction("Fill Down")
+            fill_down_action.setShortcut("Ctrl+Shift+D")
+            fill_down_action.setEnabled(
+                any(r.bottomRow() > r.topRow() for r in self.selectedRanges()))
+            fill_down_action.triggered.connect(self.fill_down)
             menu.addSeparator()
 
             # ── Copy ──────────────────────────────────────────────────────────
@@ -1770,6 +2085,31 @@ class EditableTableWidget(QTableWidget):
         self._insert_row_with_values(row, values)
         self._push_history(_RowInsertCommand(row, values))
 
+    def fill_down(self):
+        """Fill each selected range downward with its topmost selected
+        row's values (Ctrl+Shift+D) — one undo step per call, same
+        batching as paste_from_clipboard. A no-op range (a single selected
+        row) is skipped."""
+        ranges = self.selectedRanges()
+        if not ranges:
+            return
+        self._begin_batch()
+        for rng in ranges:
+            top = rng.topRow()
+            if rng.bottomRow() <= top:
+                continue
+            last_col = min(rng.rightColumn(), self._real_col_count - 1)
+            for col in range(rng.leftColumn(), last_col + 1):
+                source_item = self.item(top, col)
+                if source_item is None:
+                    continue
+                value = source_item.text()
+                for row in range(top + 1, rng.bottomRow() + 1):
+                    item = self.item(row, col)
+                    if item is not None:
+                        item.setText(value)
+        self._end_batch()
+
     def export_selected(self):
         """Export visible table data to CSV / JSON / Excel / SQL — despite
         the name, this has always exported *all* rows (filtered/original),
@@ -1802,12 +2142,16 @@ class EditableTableWidget(QTableWidget):
         """Set current cell to NULL"""
         current = self.currentItem()
         if current:
+            # Flag first so the _NullAwareDelegate repaint triggered by
+            # setText() below already sees it as NULL, not blank.
+            current.setData(_IS_NULL_ROLE, True)
             current.setText("")
-    
+
     def set_cell_default(self):
         """Set cell to default value"""
         current = self.currentItem()
         if current:
+            current.setData(_IS_NULL_ROLE, False)
             original = current.data(Qt.UserRole)
             if original is not None:
                 current.setText(_cell_display_text(original))

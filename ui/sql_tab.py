@@ -55,6 +55,7 @@ _ERROR_NEAR_RE = _re.compile(r"near ['\"](.+?)['\"]", _re.IGNORECASE)
 # that a byte-size check alone wouldn't.
 _IMPORT_MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024  # 500 MiB
 _IMPORT_MAX_ROWS = 2_000_000
+_RAW_SQL_COLUMN = "Raw SQL"
 
 
 def _sql_error_location(message: str, query: str) -> tuple[int, int] | None:
@@ -501,7 +502,7 @@ class SqlTab(QWidget):
         filter_main_layout = QVBoxLayout(self.filter_container)
         filter_main_layout.setContentsMargins(5, 5, 5, 5)
         filter_main_layout.setSpacing(4)
-        
+
         # Filter rows container
         self.filter_rows_layout = QVBoxLayout()
         self.filter_rows_layout.setSpacing(3)
@@ -797,15 +798,6 @@ class SqlTab(QWidget):
         # takes the space instead.
         self.result_table.hide()
 
-        # "Search any column" quick filter — live, client-side, over the
-        # currently displayed result page. Visibility mirrors result_table's
-        # own — hidden here, shown/hidden alongside it everywhere below.
-        self.quick_search = QLineEdit()
-        self.quick_search.setPlaceholderText("🔍 Search all columns…")
-        self.quick_search.setClearButtonEnabled(True)
-        self.quick_search.textChanged.connect(self.result_table.set_quick_filter)
-        self.quick_search.hide()
-
         # ── Pagination bar ─────────────────────────────────────────────
         self._pagination_bar = QWidget()
         self._pagination_bar.hide()
@@ -859,7 +851,6 @@ class SqlTab(QWidget):
 
         bottom_layout.addWidget(self._error_card_scroll)
         bottom_layout.addWidget(self._empty_state)
-        bottom_layout.addWidget(self.quick_search)
         bottom_layout.addWidget(self.result_table)
         bottom_layout.addWidget(self._pagination_bar)
         bottom_widget.setLayout(bottom_layout)
@@ -882,6 +873,7 @@ class SqlTab(QWidget):
         from PySide6.QtGui import QShortcut, QKeySequence
         self.run_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
         self.run_shortcut.activated.connect(self.run_btn.click)
+
 
         # Add keyboard shortcuts for SQL formatting
         self.beautify_shortcut = QShortcut(QKeySequence("Ctrl+I"), self)
@@ -1611,20 +1603,17 @@ class SqlTab(QWidget):
                 # A genuine SELECT that matched nothing — show the empty-
                 # state illustration instead of a blank grid (issue #178).
                 self.result_table.hide()
-                self.quick_search.hide()
                 self._pagination_bar.hide()
                 self._empty_state.show()
             else:
                 self._empty_state.hide()
                 self.result_table.show()
-                self.quick_search.show()
                 self._pagination_bar.show()
                 self._refresh_result_view()
             self._expand_result_area()
         else:
             self._empty_state.hide()
             self.result_table.hide()
-            self.quick_search.hide()
             self._pagination_bar.hide()
             self._collapse_result_area()
 
@@ -1691,7 +1680,6 @@ class SqlTab(QWidget):
         if len(df.columns) > 0:
             self._update_filter_columns(list(df.columns))
         self.result_table.show()
-        self.quick_search.show()
         self._refresh_result_view()
         self._expand_result_area()
 
@@ -2071,7 +2059,6 @@ class SqlTab(QWidget):
         self.result_table.setRowCount(0)
         self.result_table.setColumnCount(0)
         self.result_table.hide()
-        self.quick_search.hide()
         self._pagination_bar.hide()
         self._empty_state.hide()
         self._result_actions_bar.hide()
@@ -2114,7 +2101,6 @@ class SqlTab(QWidget):
         self.result_table.setRowCount(0)
         self.result_table.setColumnCount(0)
         self.result_table.hide()
-        self.quick_search.hide()
         self._pagination_bar.hide()
         self._error_card_scroll.hide()
         self._empty_state.hide()
@@ -2298,13 +2284,18 @@ class SqlTab(QWidget):
         row_layout.setSpacing(4)
         
         # Column selector
+        # "Raw SQL" is a pseudo-column (not a real dataframe column) —
+        # picking it searches every column for the typed value instead of
+        # one specific column, replacing the old standalone "search all
+        # columns" box with a row in this same list.
         column_combo = QComboBox()
         column_combo.setObjectName("column_combo")
         column_combo.setMinimumWidth(120)
+        column_combo.addItem(_RAW_SQL_COLUMN)
         if self.current_df is not None and len(self.current_df.columns) > 0:
             column_combo.addItems(list(self.current_df.columns))
         row_layout.addWidget(column_combo)
-        
+
         # Operator selector
         operator_combo = QComboBox()
         operator_combo.setObjectName("operator_combo")
@@ -2317,7 +2308,7 @@ class SqlTab(QWidget):
         ])
         operator_combo.setMinimumWidth(120)
         row_layout.addWidget(operator_combo)
-        
+
         # Value input
         value_input = QLineEdit()
         value_input.setObjectName("value_input")
@@ -2326,7 +2317,16 @@ class SqlTab(QWidget):
         # Connect Return key to apply filters
         value_input.returnPressed.connect(self.apply_all_filters)
         row_layout.addWidget(value_input)
-        
+
+        def _on_column_changed(text):
+            is_raw_sql = text == _RAW_SQL_COLUMN
+            operator_combo.setEnabled(not is_raw_sql)
+            value_input.setPlaceholderText(
+                "Search all columns…" if is_raw_sql else "Enter value..."
+            )
+        column_combo.currentTextChanged.connect(_on_column_changed)
+        _on_column_changed(column_combo.currentText())
+
         row_layout.addStretch()
         
         # Remove button. No padding override previously meant the inherited
@@ -2389,7 +2389,21 @@ class SqlTab(QWidget):
             
             if not column or not value:
                 continue
-            
+
+            if column == _RAW_SQL_COLUMN:
+                if len(filtered_df.columns) == 0:
+                    continue
+                try:
+                    mask = pd.Series(False, index=filtered_df.index)
+                    for col in filtered_df.columns:
+                        mask |= filtered_df[col].map(str).str.contains(value, case=False, na=False)
+                    filtered_df = filtered_df[mask]
+                except Exception as e:
+                    from utils.logger import get_logger
+                    logger = get_logger()
+                    logger.error(f"Filter error: {str(e)}")
+                continue
+
             # Apply filter based on operator
             try:
                 col_s = filtered_df[column].map(str)
@@ -2436,7 +2450,6 @@ class SqlTab(QWidget):
         self._result_page = 0
         self._refresh_result_view()
         self.result_table.show()
-        self.quick_search.show()
 
         # Update status
         total = len(self.original_df) if self.original_df is not None else 0
@@ -2450,7 +2463,6 @@ class SqlTab(QWidget):
             self._result_page = 0
             self._refresh_result_view()
             self.result_table.show()
-            self.quick_search.show()
             self.status_label.setPlainText(f"{len(self.original_df)} rows")
             self.status_label.setFixedHeight(28)
         
@@ -2478,8 +2490,9 @@ class SqlTab(QWidget):
                 if column_combo:
                     current = column_combo.currentText()
                     column_combo.clear()
+                    column_combo.addItem(_RAW_SQL_COLUMN)
                     column_combo.addItems(columns)
-                    if current in columns:
+                    if current in columns or current == _RAW_SQL_COLUMN:
                         column_combo.setCurrentText(current)
     
     def get_query_at_cursor(self):

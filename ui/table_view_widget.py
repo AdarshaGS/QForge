@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QToolTip,
     QTabWidget,
+    QProgressBar,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QCursor
 from ui.advanced_filter_dialog import AdvancedFilterDialog
@@ -21,6 +22,8 @@ from ui.theme_manager import ThemeManager
 from ui.sql_tab import SqlTab
 from ui.edit_error_dialog import show_save_errors
 from services.db_service import DbService
+from services import grid_layout
+from services import preferences
 from utils.logger import get_logger
 from utils import perf_metrics
 import pandas as pd
@@ -28,6 +31,15 @@ import threading
 import time
 
 logger = get_logger()
+
+# Issue #251: user-configurable rows-per-page, persisted via
+# services/preferences.py. A closed preset list (rather than a free-typed
+# spinbox) keeps the persisted value always one of these, so the combo box
+# never has to fabricate an extra entry to show the current selection.
+_PAGE_SIZE_PREF_KEY = "table_page_size"
+_DEFAULT_PAGE_SIZE = 100
+_PAGE_SIZE_PRESETS = [100, 200, 500, 1000]
+_RAW_SQL_COLUMN = "Raw SQL"
 
 
 def _new_readonly_table(headers: list) -> QTableWidget:
@@ -145,7 +157,10 @@ class TableViewWidget(QWidget):
         # Pagination state
         self.current_page = 1          # 1-indexed
         self.total_rows = None         # total rows in the table (if known)
-        self.page_size = 100           # rows per page
+        # Issue #251: last-used value persists across sessions/tabs.
+        self.page_size = preferences.get(_PAGE_SIZE_PREF_KEY, _DEFAULT_PAGE_SIZE)
+        if self.page_size not in _PAGE_SIZE_PRESETS:
+            self.page_size = _DEFAULT_PAGE_SIZE
 
         self.init_ui()
 
@@ -221,6 +236,56 @@ class TableViewWidget(QWidget):
             self.view_tabs.setTabVisible(i, False)
 
         self.view_tabs.currentChanged.connect(self._on_view_tab_changed)
+
+        # Refresh/Filter/Columns toolbar, floated over the tab bar's own row
+        # at its top-right rather than costing a whole extra row of vertical
+        # space. Issue #262: an explicit Refresh button lives here too, next
+        # to Filter/Columns, so reloading the grid doesn't require knowing
+        # the Cmd+R/F5 shortcut.
+        #
+        # A free child of view_tabs, positioned by hand (_position_view_tab_tools,
+        # called from resizeEvent) rather than QTabWidget.setCornerWidget(): corner widgets turned
+        # out to have two real, hard-to-diagnose problems here — (1) their
+        # ownership isn't reliably recognized by PySide as a reparent, so a
+        # bare local var for the container got garbage-collected once
+        # init_ui() returned, corrupting the buttons parented to it (a
+        # segfault, not at the point of any Python call); (2) even once
+        # fixed, the corner slot's contents didn't reliably composite at
+        # all — confirmed by grabbing the container directly and seeing
+        # only its background, no buttons, matching what was reported from
+        # the real app too. A plain overlay child widget doesn't have
+        # either failure mode.
+        self._view_tab_tools = QWidget(self.view_tabs)
+        view_tab_tools = self._view_tab_tools
+        view_tab_tools_layout = QHBoxLayout(view_tab_tools)
+        view_tab_tools_layout.setContentsMargins(0, 0, 0, 0)
+        view_tab_tools_layout.setSpacing(4)
+        # Fixed HEIGHT only (comfortable next to the Data/Structure tabs) —
+        # width is left to the layout so the icon+label text isn't clipped
+        # the way a fixed square size would.
+        _TAB_TOOL_BTN_HEIGHT = 26
+        self.refresh_btn = QPushButton("↻ Refresh")
+        self.refresh_btn.setFixedHeight(_TAB_TOOL_BTN_HEIGHT)
+        self.refresh_btn.setToolTip("Refresh data (Cmd+R)")
+        self.refresh_btn.clicked.connect(self.refresh_current_view)
+        view_tab_tools_layout.addWidget(self.refresh_btn)
+
+        self.filter_toggle_btn = QPushButton("▽ Filter")
+        self.filter_toggle_btn.setCheckable(True)
+        self.filter_toggle_btn.setFixedHeight(_TAB_TOOL_BTN_HEIGHT)
+        self.filter_toggle_btn.setToolTip("Filter rows (Ctrl+F)")
+        self.filter_toggle_btn.clicked.connect(self.toggle_filter)
+        view_tab_tools_layout.addWidget(self.filter_toggle_btn)
+
+        self.columns_btn = QPushButton("▦ Columns")
+        self.columns_btn.setFixedHeight(_TAB_TOOL_BTN_HEIGHT)
+        self.columns_btn.setToolTip("Show/hide columns")
+        self.columns_btn.clicked.connect(lambda: self.data_table.manage_columns())
+        view_tab_tools_layout.addWidget(self.columns_btn)
+
+        view_tab_tools.adjustSize()
+        view_tab_tools.raise_()
+        self._position_view_tab_tools()
 
         # Top controls bar - only shown when filtering
         self.filter_container = QWidget()
@@ -299,32 +364,22 @@ class TableViewWidget(QWidget):
 
         layout.addWidget(self.filter_container)
 
-        # Data table with loading overlay
+        # Data table with a loading progress bar above it
         table_container = QWidget()
         table_layout = QVBoxLayout(table_container)
         table_layout.setContentsMargins(0, 0, 0, 0)
         table_layout.setSpacing(0)
 
-        # Loading overlay
-        self.loading_overlay = QWidget(table_container)
-        self.loading_overlay.setObjectName("loadingOverlay")
-        self.loading_overlay.setGeometry(table_container.rect())
-        self.loading_overlay.hide()
-
-        # Loading spinner label
-        self.loading_label = QLabel("Loading...", self.loading_overlay)
-        self.loading_label.setAlignment(Qt.AlignCenter)
-        self.loading_label.setStyleSheet("""
-            QLabel {
-                color: white;
-                font-size: 16px;
-                background: rgba(0, 0, 0, 150);
-                border-radius: 8px;
-                padding: 20px;
-            }
-        """)
-        # Center the label in the overlay
-        self.loading_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        # Issue #262: a slim progress bar above the grid replaces the old
+        # full-view dark "Loading..." overlay — indeterminate (busy) range
+        # since page loads/commits don't report real progress, and it no
+        # longer blocks the grid from view while a reload is in flight.
+        self.loading_progress_bar = QProgressBar()
+        self.loading_progress_bar.setRange(0, 0)
+        self.loading_progress_bar.setTextVisible(False)
+        self.loading_progress_bar.setFixedHeight(3)
+        self.loading_progress_bar.hide()
+        table_layout.addWidget(self.loading_progress_bar)
 
         # Data table
         from ui.editable_table import EditableTableWidget
@@ -342,15 +397,10 @@ class TableViewWidget(QWidget):
             pass
         self.data_table.horizontalHeader().sectionClicked.connect(self.on_column_header_clicked)
 
-        # "Search any column" quick filter — live, client-side, over the
-        # currently loaded page (distinct from any server-side WHERE-clause
-        # filter panel this widget may also offer, which acts across the
-        # whole table, not just the loaded page).
-        self.quick_search = QLineEdit()
-        self.quick_search.setPlaceholderText("🔍 Search all columns…")
-        self.quick_search.setClearButtonEnabled(True)
-        self.quick_search.textChanged.connect(self.data_table.set_quick_filter)
-        table_layout.addWidget(self.quick_search)
+        # Issue #182: persist column width/order/pinned-count per table.
+        # EditableTableWidget only reports/accepts layout state — it doesn't
+        # know the connection/database context needed to key the saved file.
+        self.data_table.layout_changed.connect(self._save_grid_layout)
 
         table_layout.addWidget(self.data_table)
 
@@ -387,6 +437,18 @@ class TableViewWidget(QWidget):
                 color: #ffffff;
             }
         """
+        # Issue #251: rows-per-page control, persisted across sessions.
+        self.page_size_combo = QComboBox()
+        self.page_size_combo.setToolTip("Rows per page")
+        self.page_size_combo.addItems([str(v) for v in _PAGE_SIZE_PRESETS])
+        self.page_size_combo.setCurrentText(str(self.page_size))
+        self.page_size_combo.setFixedWidth(70)
+        self.page_size_combo.setStyleSheet("font-size: 11px;")
+        # Connected after setCurrentText() above so restoring the saved
+        # value on tab-open doesn't itself trigger a reload.
+        self.page_size_combo.currentTextChanged.connect(self._on_page_size_changed)
+        bottom_controls.addWidget(self.page_size_combo)
+
         self.prev_btn = QPushButton("‹ Prev")
         self.prev_btn.clicked.connect(self.prev_page)
         self.prev_btn.setEnabled(False)
@@ -408,29 +470,22 @@ class TableViewWidget(QWidget):
         layout.addWidget(table_container)
         layout.addLayout(bottom_controls)
 
-    def _update_loading_overlay_geometry(self):
-        """Update loading overlay to cover the table container"""
-        if hasattr(self, 'loading_overlay') and self.loading_overlay:
-            # Find the table container parent
-            parent = self.loading_overlay.parent()
-            if parent:
-                self.loading_overlay.setGeometry(0, 0, parent.width(), parent.height())
-                # Center the loading label
-                if hasattr(self, 'loading_label') and self.loading_label:
-                    label_width = self.loading_label.width()
-                    label_height = self.loading_label.height()
-                    parent_width = parent.width()
-                    parent_height = parent.height()
-                    self.loading_label.setGeometry(
-                        (parent_width - label_width) // 2,
-                        (parent_height - label_height) // 2,
-                        label_width,
-                        label_height
-                    )
+    def _position_view_tab_tools(self):
+        """Keep the Filter/Columns overlay pinned to the tab bar's
+        top-right corner (see its construction comment in init_ui for why
+        this is a manually-positioned overlay rather than a
+        QTabWidget.setCornerWidget())."""
+        if not hasattr(self, '_view_tab_tools'):
+            return
+        tools = self._view_tab_tools
+        bar_h = self.view_tabs.tabBar().sizeHint().height()
+        x = self.view_tabs.width() - tools.width() - 8
+        y = max(0, (bar_h - tools.height()) // 2)
+        tools.move(x, y)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._update_loading_overlay_geometry()
+        self._position_view_tab_tools()
 
     def update_theme(self, is_dark=True):
         """Update filter container theme"""
@@ -440,16 +495,57 @@ class TableViewWidget(QWidget):
             style = ThemeManager.get_filter_container_style_light()
         self.filter_container.setStyleSheet(style)
 
+        # Filter/Columns toolbar (issue #252 follow-up). Two things this
+        # overrides that the app-wide QPushButton rule would otherwise win
+        # on: (1) background — a plain QWidget floated over the tab bar
+        # doesn't pick up the `QTabBar { background: RAISED }` rule (that
+        # selector only matches actual QTabBar instances), so without this
+        # it kept the generic `QWidget { background: BG }` rule instead, a
+        # visibly different color right next to the real tab bar; (2)
+        # padding — the global `QPushButton { padding: 5px 16px; }` rule
+        # isn't replaced by a per-widget stylesheet unless the same
+        # property is set again here, and 16px of horizontal padding alone
+        # exceeds these buttons' entire 26px fixed width, which was
+        # rendering the icon completely outside its own clipped content
+        # rect (invisible, not just low-contrast).
+        if hasattr(self, '_view_tab_tools'):
+            T = ThemeManager
+            raised, hover, blue = (T.D_RAISED, T.D_HOVER, T.D_BLUE) if is_dark else (T.L_RAISED, T.L_HOVER, T.L_BLUE)
+            text2 = T.D_TEXT2 if is_dark else T.L_TEXT2
+            text = T.D_TEXT if is_dark else T.L_TEXT
+            self._view_tab_tools.setStyleSheet(f"background: {raised};")
+            icon_btn_style = f"""
+                QPushButton {{
+                    background: transparent;
+                    color: {text2};
+                    border: none;
+                    border-radius: 5px;
+                    padding: 0 8px;
+                    font-size: 12px;
+                }}
+                QPushButton:hover {{ background: {hover}; color: {text}; }}
+                QPushButton:checked {{ color: {blue}; }}
+            """
+            self.refresh_btn.setStyleSheet(icon_btn_style)
+            self.filter_toggle_btn.setStyleSheet(icon_btn_style)
+            self.columns_btn.setStyleSheet(icon_btn_style)
+
         # Update data table theme
         if hasattr(self, 'data_table'):
             self.data_table.update_theme(is_dark)
 
-        # Update loading overlay theme
-        if hasattr(self, 'loading_overlay'):
-            self.loading_overlay.setStyleSheet("""
-                QWidget#loadingOverlay {
-                    background-color: rgba(0, 0, 0, 180);
-                }
+        # Update loading progress bar theme
+        if hasattr(self, 'loading_progress_bar'):
+            T = ThemeManager
+            bg, blue = (T.D_RAISED, T.D_BLUE) if is_dark else (T.L_RAISED, T.L_BLUE)
+            self.loading_progress_bar.setStyleSheet(f"""
+                QProgressBar {{
+                    background-color: {bg};
+                    border: none;
+                }}
+                QProgressBar::chunk {{
+                    background-color: {blue};
+                }}
             """)
 
     def on_column_header_clicked(self, logical_index: int):
@@ -544,10 +640,10 @@ class TableViewWidget(QWidget):
         self._loading = True
         self._page_load_t0 = time.perf_counter()
         self._page_load_wall_start = time.time()
-        self.loading_overlay.show()
-        self.loading_overlay.raise_()
+        self.loading_progress_bar.show()
         self.prev_btn.setEnabled(False)
         self.next_btn.setEnabled(False)
+        self.page_size_combo.setEnabled(False)
 
         def _worker():
             try:
@@ -664,7 +760,8 @@ class TableViewWidget(QWidget):
 
     def _finish_loading(self):
         self._loading = False
-        self.loading_overlay.hide()
+        self.loading_progress_bar.hide()
+        self.page_size_combo.setEnabled(True)
 
     def _apply_page_result(self, result):
         """Main-thread handler for load_table_data()'s worker `_page_loaded`
@@ -685,12 +782,14 @@ class TableViewWidget(QWidget):
                     if column_combo:
                         current = column_combo.currentText()
                         column_combo.clear()
+                        column_combo.addItem(_RAW_SQL_COLUMN)
                         column_combo.addItems(self.columns)
-                        if current in self.columns:
+                        if current in self.columns or current == _RAW_SQL_COLUMN:
                             column_combo.setCurrentText(current)
 
         self.data_table.load_data(df, table_name=self.table_name)
         self.data_table.set_primary_key_columns(self._primary_keys)
+        self._restore_grid_layout()
         _page_load_ms = (time.perf_counter() - self._page_load_t0) * 1000
         # issue #174: a page load spanning a detected system
         # suspend/sleep isn't a real measurement of this operation's
@@ -734,6 +833,29 @@ class TableViewWidget(QWidget):
         logger.info(f"Loaded page {self.current_page} ({len(df)} rows) from {self.table_name}")
         self._load_failed = False
 
+    # ── Grid layout persistence (issue #182) ────────────────────────────
+    # data_table.load_data() rebuilds the grid's columns from scratch on
+    # every page/sort/filter refresh (and always resets pinned columns to
+    # 0 while doing it — see its own docstring), so this runs after every
+    # _apply_page_result, not just on first open.
+
+    def _restore_grid_layout(self):
+        saved = grid_layout.get_layout(
+            self.config.get("id", "") if self.config else "",
+            self.config.get("database", "") if self.config else "",
+            self.table_name,
+        )
+        if saved:
+            self.data_table.apply_layout_state(saved)
+
+    def _save_grid_layout(self):
+        grid_layout.save_layout(
+            self.config.get("id", "") if self.config else "",
+            self.config.get("database", "") if self.config else "",
+            self.table_name,
+            self.data_table.get_layout_state(),
+        )
+
     def _on_page_load_failed(self, msg):
         """Main-thread handler for load_table_data()'s worker
         `_page_load_errored` signal."""
@@ -754,6 +876,24 @@ class TableViewWidget(QWidget):
         a (re)connect completes."""
         if self._load_failed:
             self.load_table_data()
+
+    def _on_page_size_changed(self, text: str):
+        """Rows-per-page combo box changed (issue #251) — persists as the
+        default for newly opened table views and reloads this one at the
+        new size, starting back at page 1 (page boundaries shift under a
+        different page size, so resuming at the old page number could land
+        past the end or repeat/skip rows)."""
+        try:
+            new_size = int(text)
+        except ValueError:
+            return
+        if new_size == self.page_size:
+            return
+        self.page_size = new_size
+        preferences.set(_PAGE_SIZE_PREF_KEY, new_size)
+        # total_rows doesn't change with page_size — same table/filter,
+        # just a different grouping into pages — so skip the recount.
+        self.reset_and_load_first_page(keep_count=True)
 
     def prev_page(self):
         """Load previous page"""
@@ -777,10 +917,14 @@ class TableViewWidget(QWidget):
         row_layout.setContentsMargins(0, 0, 0, 0)
         row_layout.setSpacing(4)
 
-        # Column selector
+        # Column selector. "Raw SQL" is a pseudo-column (not a real
+        # self.columns entry) — picking it searches every column for the
+        # typed value instead of one specific column, replacing the old
+        # standalone "search all columns" box with a row in this same list.
         column_combo = QComboBox()
         column_combo.setObjectName("column_combo")
         column_combo.setMinimumWidth(120)
+        column_combo.addItem(_RAW_SQL_COLUMN)
         if self.columns:
             column_combo.addItems(self.columns)
         row_layout.addWidget(column_combo)
@@ -800,6 +944,15 @@ class TableViewWidget(QWidget):
         # Connect Return key to apply filters
         value_input.returnPressed.connect(self.apply_all_filters)
         row_layout.addWidget(value_input)
+
+        def _on_column_changed(text):
+            is_raw_sql = text == _RAW_SQL_COLUMN
+            operator_combo.setEnabled(not is_raw_sql)
+            value_input.setPlaceholderText(
+                "Search all columns…" if is_raw_sql else "Enter value..."
+            )
+        column_combo.currentTextChanged.connect(_on_column_changed)
+        _on_column_changed(column_combo.currentText())
 
         row_layout.addStretch()
 
@@ -881,6 +1034,14 @@ class TableViewWidget(QWidget):
             if not column:
                 continue
 
+            if column == _RAW_SQL_COLUMN:
+                if not value or not self.columns:
+                    continue
+                escaped = value.replace("'", "''")
+                or_clause = " OR ".join(f"{col} LIKE '%{escaped}%'" for col in self.columns)
+                filter_conditions.append(f"({or_clause})")
+                continue
+
             # Build filter condition
             if operator in ["IS NULL", "IS NOT NULL"]:
                 filter_conditions.append(f"{column} {operator}")
@@ -941,8 +1102,12 @@ class TableViewWidget(QWidget):
         self.reset_and_load_first_page()
 
     def toggle_filter(self):
-        """Toggle filter visibility with Cmd+F"""
+        """Toggle filter visibility with Cmd+F, or the Filter toolbar
+        button — keep that button's checked look in sync regardless of
+        which of the two triggered this (it auto-toggles itself when
+        clicked directly, but not when Ctrl+F does)."""
         self.filter_visible = not self.filter_visible
+        self.filter_toggle_btn.setChecked(self.filter_visible)
         if self.filter_visible:
             self.filter_container.show()
             # Focus on first value input
@@ -959,6 +1124,7 @@ class TableViewWidget(QWidget):
         """Hide filter with Esc key"""
         if self.filter_visible:
             self.filter_visible = False
+            self.filter_toggle_btn.setChecked(False)
             self.filter_container.hide()
 
     # ─── Refresh ───────────────────────────────────────────────────────────────
@@ -1149,8 +1315,7 @@ class TableViewWidget(QWidget):
         logger.info(f"📊 Generated SQL: {len(changes['updates'])} UPDATEs, {len(changes['inserts'])} INSERTs, {len(changes['deletes'])} DELETEs")
 
         self._loading = True
-        self.loading_overlay.show()
-        self.loading_overlay.raise_()
+        self.loading_progress_bar.show()
 
         def _worker():
             try:
