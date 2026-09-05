@@ -264,8 +264,9 @@ shown.
 | `Ctrl+Q` | Quit |
 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Zoom in / out / reset |
 
-On macOS, Qt may display or accept the matching Command-key shortcuts,
-depending on the system key mapping.
+On macOS, Qt automatically maps `Ctrl` to `Cmd` for every shortcut above
+(e.g. `Ctrl+N` is `Cmd+N`), since all shortcuts are defined with the
+portable `Ctrl` modifier.
 
 ## Supported databases
 
