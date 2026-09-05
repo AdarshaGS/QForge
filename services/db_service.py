@@ -164,6 +164,25 @@ class DbService:
         self.read_only = False
         self.in_transaction = False
         self._config = None   # stored for auto-reconnect
+        # Issue #256: per-connection cache for get_columns/get_foreign_keys/
+        # get_primary_keys/get_indexes, keyed by (kind, table_name). These
+        # are called repeatedly for the same table from many independent
+        # places (ERD, Schema Compare, table view, FK filter chips,
+        # dependency analyzer) with no sharing today — each pays a fresh
+        # SHOW/information_schema round-trip. Cleared wherever the table
+        # namespace this connection sees could have changed: connect(),
+        # select_db(), set_schema(), and any schema-changing statement this
+        # connection runs (_invalidate_schema_cache_if_ddl).
+        self._metadata_cache = {}
+
+    def _cached_metadata(self, kind: str, table_name: str, fetch):
+        key = (kind, table_name)
+        if key not in self._metadata_cache:
+            self._metadata_cache[key] = fetch()
+        return self._metadata_cache[key]
+
+    def clear_metadata_cache(self):
+        self._metadata_cache = {}
 
     def _q(self, identifier: str) -> str:
         """Quote *identifier* (table/column/index name) for this
@@ -237,6 +256,7 @@ class DbService:
     def connect(self, config):
         """Connect to database based on type"""
 
+        self.clear_metadata_cache()
         db_type = config.get("type", "mysql").lower()
         self.db_type = db_type
         self.read_only = bool(config.get("read_only"))
@@ -558,6 +578,7 @@ class DbService:
         if self.connection:
             try:
                 self.connection.select_db(database)
+                self.clear_metadata_cache()  # different database == different table namespace
                 return
             except Exception as ex:
                 if not self._is_connection_error(ex):
@@ -696,7 +717,12 @@ class DbService:
     def get_foreign_keys(self, table_name: str) -> list[dict]:
         """Return FK definitions for *table_name*.
         Each dict has keys: column, ref_table, ref_column.
+        Cached per connection (issue #256) — see _cached_metadata.
         """
+        return self._cached_metadata("foreign_keys", table_name,
+                                      lambda: self._fetch_foreign_keys(table_name))
+
+    def _fetch_foreign_keys(self, table_name: str) -> list[dict]:
         try:
             if self.db_type == "mysql":
                 cursor = self.connection.cursor()
@@ -735,7 +761,12 @@ class DbService:
 
     def get_primary_keys(self, table_name: str) -> list[str]:
         """Return the primary-key column name(s) for *table_name*, in key
-        order. Empty list if the table has no primary key or on failure."""
+        order. Empty list if the table has no primary key or on failure.
+        Cached per connection (issue #256) — see _cached_metadata."""
+        return self._cached_metadata("primary_keys", table_name,
+                                      lambda: self._fetch_primary_keys(table_name))
+
+    def _fetch_primary_keys(self, table_name: str) -> list[str]:
         try:
             if self.db_type == "mysql":
                 cursor = self.connection.cursor()
@@ -931,10 +962,11 @@ class DbService:
         return result
 
     def _invalidate_schema_cache_if_ddl(self, query: str):
-        """Issue #72: every write in the app funnels through here, so this
-        is the single place that can catch a successful schema-changing
-        statement (raw SQL, the Create/Alter Table dialogs, etc.) and drop
-        the now-stale on-disk schema cache entry."""
+        """Issue #72/#256: every write in the app funnels through here, so
+        this is the single place that can catch a successful schema-
+        changing statement (raw SQL, the Create/Alter Table dialogs, etc.)
+        and drop both the now-stale on-disk schema cache entry and this
+        connection's in-memory per-table metadata cache."""
         if not self._config:
             return
         try:
@@ -946,6 +978,7 @@ class DbService:
             if changed:
                 schema_cache.invalidate(
                     self._config.get("id", ""), self._config.get("database", ""))
+                self.clear_metadata_cache()
         except Exception as ex:
             logger.debug(f"Schema-cache invalidation check failed: {ex}")
 
@@ -1122,8 +1155,12 @@ class DbService:
             return ""
 
     def get_columns(self, table_name):
-        """Get columns for a table based on database type"""
-        
+        """Get columns for a table based on database type. Cached per
+        connection (issue #256) — see _cached_metadata."""
+        return self._cached_metadata("columns", table_name,
+                                      lambda: self._fetch_columns(table_name))
+
+    def _fetch_columns(self, table_name):
         if self.db_type == "mysql":
             cursor = self.connection.cursor()
             cursor.execute(f"SHOW COLUMNS FROM {self._q(table_name)}")
@@ -1398,6 +1435,7 @@ class DbService:
             return
         with self.connection.cursor() as cur:
             cur.execute(f"SET search_path TO {self._q(schema)}, public")
+        self.clear_metadata_cache()  # different schema == different table namespace
 
     def describe_table(self, table_name):
 
@@ -1418,7 +1456,12 @@ class DbService:
     def get_indexes(self, table_name: str) -> list[dict]:
         """Return index definitions for *table_name*.
         Each dict has: name, columns, unique, type.
+        Cached per connection (issue #256) — see _cached_metadata.
         """
+        return self._cached_metadata("indexes", table_name,
+                                      lambda: self._fetch_indexes(table_name))
+
+    def _fetch_indexes(self, table_name: str) -> list[dict]:
         try:
             if self.db_type == "mysql":
                 cursor = self.connection.cursor()

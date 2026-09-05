@@ -121,30 +121,41 @@ def _fetch_side(config: dict, table_names: list = None) -> dict:
                 logger.debug(f"Schema diff: failed to list tables: {ex}")
                 return {}
 
+        # Bulk, single-round-trip metadata (same calls services/erd_model.py
+        # and services/schema_snapshot.py already use) instead of a
+        # get_columns()/get_primary_keys()/get_foreign_keys() loop per
+        # table — that was up to 3 round trips PER TABLE PER SIDE, the
+        # slowest part of opening Schema Compare on a non-trivial schema.
+        # get_indexes() has no bulk equivalent, so it stays per-table below.
+        try:
+            column_details = db.get_all_column_details()
+        except Exception as ex:
+            logger.debug(f"Schema diff: failed to read column details: {ex}")
+            column_details = {}
+
+        try:
+            fks_by_table = db.get_all_foreign_keys()
+        except Exception as ex:
+            logger.debug(f"Schema diff: failed to read foreign keys: {ex}")
+            fks_by_table = {}
+
         result = {}
         for name in names:
-            try:
-                raw_columns = db.get_columns(name)
-            except Exception as ex:
-                logger.debug(f"Schema diff: failed to read columns for {name}: {ex}")
+            cols = column_details.get(name)
+            if cols is None:
+                logger.debug(f"Schema diff: no column details for {name}")
                 continue
 
-            try:
-                pk_cols = set(db.get_primary_keys(name))
-            except Exception as ex:
-                logger.debug(f"Schema diff: failed to read primary keys for {name}: {ex}")
-                pk_cols = set()
-
-            columns = {}
-            for col in raw_columns:
-                col_name = col.get("Field", "")
-                columns[col_name] = ColumnInfo(
-                    name=col_name,
-                    data_type=str(col.get("Type", "") or ""),
-                    nullable=(str(col.get("Null", "YES")).upper() != "NO"),
-                    default=col.get("Default"),
-                    is_primary_key=col_name in pk_cols,
+            columns = {
+                col["name"]: ColumnInfo(
+                    name=col["name"],
+                    data_type=str(col.get("type", "") or ""),
+                    nullable=bool(col.get("nullable", True)),
+                    default=col.get("default"),
+                    is_primary_key=col.get("key") == "PRI",
                 )
+                for col in cols
+            }
 
             try:
                 indexes = db.get_indexes(name)
@@ -152,13 +163,7 @@ def _fetch_side(config: dict, table_names: list = None) -> dict:
                 logger.debug(f"Schema diff: failed to read indexes for {name}: {ex}")
                 indexes = []
 
-            try:
-                fks = db.get_foreign_keys(name)
-            except Exception as ex:
-                logger.debug(f"Schema diff: failed to read foreign keys for {name}: {ex}")
-                fks = []
-
-            result[name] = (columns, indexes, fks)
+            result[name] = (columns, indexes, fks_by_table.get(name, []))
 
         return result
     finally:

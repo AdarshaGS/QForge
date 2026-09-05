@@ -991,6 +991,13 @@ class ConnectionPanel(QWidget):
             self._clear_schema_state()
             return
 
+        # Issue #256: an explicit refresh (or a db/schema switch, which also
+        # routes through here) means the table namespace this connection
+        # sees may have changed — drop its in-memory per-table metadata
+        # cache (get_columns/get_foreign_keys/get_primary_keys/get_indexes)
+        # so callers see current data, not whatever was cached earlier.
+        self.db_service.clear_metadata_cache()
+
         # Clear immediately so the user sees empty tree straight away
         self._stop_schema_loading_indicator()
         self._schema_retry_item = None

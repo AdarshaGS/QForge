@@ -1,197 +1,201 @@
-# Graph Report - .  (2026-09-01)
+# Graph Report - QForge  (2026-09-04)
 
 ## Corpus Check
-- 160 files · ~154,772 words
+- 167 files · ~161,986 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 2977 nodes · 5904 edges · 181 communities (142 shown, 39 thin omitted)
-- Extraction: 93% EXTRACTED · 7% INFERRED · 0% AMBIGUOUS · INFERRED: 410 edges (avg confidence: 0.61)
+- 3000 nodes · 5981 edges · 180 communities (143 shown, 37 thin omitted)
+- Extraction: 93% EXTRACTED · 7% INFERRED · 0% AMBIGUOUS · INFERRED: 417 edges (avg confidence: 0.61)
 - Token cost: 0 input · 0 output
 
+## Graph Freshness
+- Built from commit: `62edb995`
+- Run `git rev-parse HEAD` and compare to check if the graph is stale.
+- Run `graphify update .` after code changes (no API cost).
+
 ## Community Hubs (Navigation)
-- License Manager Tests
-- Query Cost Estimation
-- Db Service Sqlite Tests
-- Schema Compare Dialog
-- Schema Snapshot Tests
-- SQL Code Editor
-- Query Classifier Tests
-- Export Scope Dialog Tests
-- SQL Tab Toolbar & Dialogs
-- Database Service Core
-- Main Window Core
-- Connection Panel Core
-- Benchmark Harness
-- PostgreSQL Integration Tests
-- Editable Grid PK Tests
-- Table View Streaming Load
-- Connection Dialog UI Layout
-- Query Cost Tests
-- Data Compare Dialog
-- Data Diff Engine
-- Theme Manager
-- Query Verifier
-- ER Diagram Dialog Core
-- Database Query Execution
-- Perf Overlay Toggle Tests
-- Upgrade to Pro Dialog
-- Mock Data Dialog
-- SQL Completer Core Engine
-- Mock Data Generator
-- Code Editor Find & Replace
-- Query History
-- Editable Grid Undo/Redo
-- Onboarding
-- Query Library Dialog
-- Perf Metrics Tests
-- Table Context Menu Actions
-- Saved Queries
-- Query Analyzer Compare Tab
-- Table Structure Editor
-- ER Diagram View & Minimap
-- Entitlements Model
-- Export Worker Tests
-- Quick Search
-- Query Analyzer Profile Sections
-- Df Export Tests
-- ER Diagram Table Boxes
-- ER Diagram Model
-- Database Switcher
-- Connection Panel Tab Management
-- Connection Panel Query Lifecycle
-- Editable Grid Row Batch Ops
-- Editable Grid Frozen Columns
-- Row Stream Writers Tests
-- Run All Statements Tests
-- License Activation Dialog
-- Entitlement Config Tests
-- Query Analyzer Cost Estimate Tab
-- Connection Panel Query Navigation Tests
-- Sql Tab Result Viewer 178 Tests
-- Connection Dialog Core Actions
-- Connection Panel Schema Loading
-- Db Service Mysql Lenient Decoding Tests
-- Schema Diff Data Model
-- Ddl Toggles Tests
-- Install Source Tests
-- Connection List Load & Migration
-- SQL Snippet Manager
-- SQL Completer Suggestion Scoring
-- Code Editor Input Handling
-- Table Structure Panels
-- Ui Design
-- Self-Update Detection
-- Dot Export Tests
-- Query History Dialog
-- SQL Tab Result Grid Paging
-- Launch Plan
-- Database & Table Export
-- Column Filter Dialog
-- SQL Completer Popup Window
-- Schema Migration
-- Performance Metrics
-- Sql Completer Schema Awareness Tests
-- Column Selection Dialog
-- Dangerous Query Guard
-- SQL Tab Multi-Result Display
-- Self Updater
-- Editable Grid Header & Theming
-- Editable Table Formula Tests
-- Licensing Client Tests
-- Database Management (Create/Drop)
-- Editable Grid Composite Undo
-- Editable Grid Filtering & Load
-- Updater
-- ER Diagram Relationship Curves
-- Schema Diff Tests
-- Schema Migration SQL Generation
-- Db Service Select Db Tests
-- Sql Completer Multiword Insert Tests
-- Connection Dialog Status Feedback
-- Connection Panel Tab Actions
-- Table View Sort & Save
-- Database Transaction Control
-- Database Connection Setup
-- Table Organization
-- Saved Queries Tests
-- Table View Reconnect Reload Tests
-- Export Worker (DOT/SQL)
-- SQL Go-to-Definition
-- Connection Panel Status Bar 178 Tests
-- Connection Panel Focus Restore Tests
-- DataFrame Export
-- Table View Widget Suspend Guard Tests
-- Connection Dialog Save & Connect
-- Saved Queries & History Filtering
-- SSH Key Auth Compatibility Shim
-- Connection Dialog First Run Hint Tests
-- Environment Tests
-- Sql Tab Go To Definition Tests
-- Sql Tab Quick Fixes Tests
-- Table View Widget Primary Keys Tests
-- Schema Diff Engine
-- PostgreSQL Durability Tests
-- Generated Columns Tests
-- Sql Tab Status Banner Tests
-- Table View Widget Pagination Tests
-- Connection Dialog Selection Handling
-- Editable Grid Row Export
-- Licensing Client
-- PostgreSQL Test Fixtures
-- Stream Table Rows Tests
-- SQL Completer Item Rendering
-- Table View Reload & Pagination
-- Deploy
-- Sql Highlighter
-- Editable Grid Copy & Context Menu
-- ER Diagram Layout
-- Update Install & Relaunch
-- Sql Tab Result Primary Keys Tests
-- SQL Tab Theming
-- Sql Tab Escape Dismisses Popup Tests
-- Editable Grid Change SQL Generation
-- Query Cost Status Badge
-- SQL Result Diff Highlighting
-- Memory
-- Conftest
-- PostgreSQL Reconnect Tests
-- Connections File Sanitization
-- Editable Grid Cell Detail Popup
-- SQL Tab Save Shortcut
-- SQL Tab Query Extraction
-- Docker Compose
-- Build
-- Downloadedfile
-- Data Compare Design
-- Flush Context — Current State
-- Flush Context — Milestone Status
-- Flush Context — Open Threads
-- Flush Context — Where Detail Lives
-- Load Context
-- Benchmarking
-- Miscellaneous
-- Add To Project
-- Logo
-- Pyproject
-- README — Compare Schemas
-- README — Control a Transaction
-- README — Explore an ER Diagram
-- README — Read-Only Mode
-- Miscellaneous
-- Miscellaneous
-- Miscellaneous
-- Miscellaneous
-- Miscellaneous
-- Miscellaneous
-- Miscellaneous
-- Miscellaneous
-- Miscellaneous
-- Miscellaneous
-- Miscellaneous
+- [[_COMMUNITY_License Manager Tests|License Manager Tests]]
+- [[_COMMUNITY_Query Cost Estimation|Query Cost Estimation]]
+- [[_COMMUNITY_Db Service Sqlite Tests|Db Service Sqlite Tests]]
+- [[_COMMUNITY_Schema Compare Dialog|Schema Compare Dialog]]
+- [[_COMMUNITY_Schema Snapshot Tests|Schema Snapshot Tests]]
+- [[_COMMUNITY_SQL Code Editor|SQL Code Editor]]
+- [[_COMMUNITY_Query Classifier Tests|Query Classifier Tests]]
+- [[_COMMUNITY_Export Scope Dialog Tests|Export Scope Dialog Tests]]
+- [[_COMMUNITY_SQL Tab Toolbar & Dialogs|SQL Tab Toolbar & Dialogs]]
+- [[_COMMUNITY_Database Service Core|Database Service Core]]
+- [[_COMMUNITY_Main Window Core|Main Window Core]]
+- [[_COMMUNITY_Connection Panel Core|Connection Panel Core]]
+- [[_COMMUNITY_Benchmark Harness|Benchmark Harness]]
+- [[_COMMUNITY_PostgreSQL Integration Tests|PostgreSQL Integration Tests]]
+- [[_COMMUNITY_Editable Grid PK Tests|Editable Grid PK Tests]]
+- [[_COMMUNITY_Table View Streaming Load|Table View Streaming Load]]
+- [[_COMMUNITY_Connection Dialog UI Layout|Connection Dialog UI Layout]]
+- [[_COMMUNITY_Query Cost Tests|Query Cost Tests]]
+- [[_COMMUNITY_Data Compare Dialog|Data Compare Dialog]]
+- [[_COMMUNITY_Data Diff Engine|Data Diff Engine]]
+- [[_COMMUNITY_Theme Manager|Theme Manager]]
+- [[_COMMUNITY_Query Verifier|Query Verifier]]
+- [[_COMMUNITY_ER Diagram Dialog Core|ER Diagram Dialog Core]]
+- [[_COMMUNITY_Database Query Execution|Database Query Execution]]
+- [[_COMMUNITY_Perf Overlay Toggle Tests|Perf Overlay Toggle Tests]]
+- [[_COMMUNITY_Upgrade to Pro Dialog|Upgrade to Pro Dialog]]
+- [[_COMMUNITY_Mock Data Dialog|Mock Data Dialog]]
+- [[_COMMUNITY_SQL Completer Core Engine|SQL Completer Core Engine]]
+- [[_COMMUNITY_Mock Data Generator|Mock Data Generator]]
+- [[_COMMUNITY_Code Editor Find & Replace|Code Editor Find & Replace]]
+- [[_COMMUNITY_Query History|Query History]]
+- [[_COMMUNITY_Editable Grid UndoRedo|Editable Grid Undo/Redo]]
+- [[_COMMUNITY_Onboarding|Onboarding]]
+- [[_COMMUNITY_Query Library Dialog|Query Library Dialog]]
+- [[_COMMUNITY_Perf Metrics Tests|Perf Metrics Tests]]
+- [[_COMMUNITY_Table Context Menu Actions|Table Context Menu Actions]]
+- [[_COMMUNITY_Saved Queries|Saved Queries]]
+- [[_COMMUNITY_Query Analyzer Compare Tab|Query Analyzer Compare Tab]]
+- [[_COMMUNITY_Table Structure Editor|Table Structure Editor]]
+- [[_COMMUNITY_ER Diagram View & Minimap|ER Diagram View & Minimap]]
+- [[_COMMUNITY_Entitlements Model|Entitlements Model]]
+- [[_COMMUNITY_Export Worker Tests|Export Worker Tests]]
+- [[_COMMUNITY_Quick Search|Quick Search]]
+- [[_COMMUNITY_Query Analyzer Profile Sections|Query Analyzer Profile Sections]]
+- [[_COMMUNITY_Df Export Tests|Df Export Tests]]
+- [[_COMMUNITY_ER Diagram Table Boxes|ER Diagram Table Boxes]]
+- [[_COMMUNITY_ER Diagram Model|ER Diagram Model]]
+- [[_COMMUNITY_Database Switcher|Database Switcher]]
+- [[_COMMUNITY_Connection Panel Tab Management|Connection Panel Tab Management]]
+- [[_COMMUNITY_Connection Panel Query Lifecycle|Connection Panel Query Lifecycle]]
+- [[_COMMUNITY_Editable Grid Row Batch Ops|Editable Grid Row Batch Ops]]
+- [[_COMMUNITY_Editable Grid Frozen Columns|Editable Grid Frozen Columns]]
+- [[_COMMUNITY_Row Stream Writers Tests|Row Stream Writers Tests]]
+- [[_COMMUNITY_Run All Statements Tests|Run All Statements Tests]]
+- [[_COMMUNITY_License Activation Dialog|License Activation Dialog]]
+- [[_COMMUNITY_Entitlement Config Tests|Entitlement Config Tests]]
+- [[_COMMUNITY_Query Analyzer Cost Estimate Tab|Query Analyzer Cost Estimate Tab]]
+- [[_COMMUNITY_Connection Panel Query Navigation Tests|Connection Panel Query Navigation Tests]]
+- [[_COMMUNITY_Sql Tab Result Viewer 178 Tests|Sql Tab Result Viewer 178 Tests]]
+- [[_COMMUNITY_Connection Dialog Core Actions|Connection Dialog Core Actions]]
+- [[_COMMUNITY_Connection Panel Schema Loading|Connection Panel Schema Loading]]
+- [[_COMMUNITY_Db Service Mysql Lenient Decoding Tests|Db Service Mysql Lenient Decoding Tests]]
+- [[_COMMUNITY_Schema Diff Data Model|Schema Diff Data Model]]
+- [[_COMMUNITY_Ddl Toggles Tests|Ddl Toggles Tests]]
+- [[_COMMUNITY_Install Source Tests|Install Source Tests]]
+- [[_COMMUNITY_Connection List Load & Migration|Connection List Load & Migration]]
+- [[_COMMUNITY_SQL Snippet Manager|SQL Snippet Manager]]
+- [[_COMMUNITY_SQL Completer Suggestion Scoring|SQL Completer Suggestion Scoring]]
+- [[_COMMUNITY_Code Editor Input Handling|Code Editor Input Handling]]
+- [[_COMMUNITY_Table Structure Panels|Table Structure Panels]]
+- [[_COMMUNITY_Ui Design|Ui Design]]
+- [[_COMMUNITY_Self-Update Detection|Self-Update Detection]]
+- [[_COMMUNITY_Dot Export Tests|Dot Export Tests]]
+- [[_COMMUNITY_Query History Dialog|Query History Dialog]]
+- [[_COMMUNITY_SQL Tab Result Grid Paging|SQL Tab Result Grid Paging]]
+- [[_COMMUNITY_Launch Plan|Launch Plan]]
+- [[_COMMUNITY_Database & Table Export|Database & Table Export]]
+- [[_COMMUNITY_Column Filter Dialog|Column Filter Dialog]]
+- [[_COMMUNITY_SQL Completer Popup Window|SQL Completer Popup Window]]
+- [[_COMMUNITY_Schema Migration|Schema Migration]]
+- [[_COMMUNITY_Performance Metrics|Performance Metrics]]
+- [[_COMMUNITY_Sql Completer Schema Awareness Tests|Sql Completer Schema Awareness Tests]]
+- [[_COMMUNITY_Column Selection Dialog|Column Selection Dialog]]
+- [[_COMMUNITY_Dangerous Query Guard|Dangerous Query Guard]]
+- [[_COMMUNITY_SQL Tab Multi-Result Display|SQL Tab Multi-Result Display]]
+- [[_COMMUNITY_Self Updater|Self Updater]]
+- [[_COMMUNITY_Editable Grid Header & Theming|Editable Grid Header & Theming]]
+- [[_COMMUNITY_Editable Table Formula Tests|Editable Table Formula Tests]]
+- [[_COMMUNITY_Licensing Client Tests|Licensing Client Tests]]
+- [[_COMMUNITY_Database Management (CreateDrop)|Database Management (Create/Drop)]]
+- [[_COMMUNITY_Editable Grid Composite Undo|Editable Grid Composite Undo]]
+- [[_COMMUNITY_Editable Grid Filtering & Load|Editable Grid Filtering & Load]]
+- [[_COMMUNITY_Updater|Updater]]
+- [[_COMMUNITY_ER Diagram Relationship Curves|ER Diagram Relationship Curves]]
+- [[_COMMUNITY_Schema Diff Tests|Schema Diff Tests]]
+- [[_COMMUNITY_Schema Migration SQL Generation|Schema Migration SQL Generation]]
+- [[_COMMUNITY_Db Service Select Db Tests|Db Service Select Db Tests]]
+- [[_COMMUNITY_Sql Completer Multiword Insert Tests|Sql Completer Multiword Insert Tests]]
+- [[_COMMUNITY_Connection Dialog Status Feedback|Connection Dialog Status Feedback]]
+- [[_COMMUNITY_Connection Panel Tab Actions|Connection Panel Tab Actions]]
+- [[_COMMUNITY_Table View Sort & Save|Table View Sort & Save]]
+- [[_COMMUNITY_Database Transaction Control|Database Transaction Control]]
+- [[_COMMUNITY_Database Connection Setup|Database Connection Setup]]
+- [[_COMMUNITY_Table Organization|Table Organization]]
+- [[_COMMUNITY_Saved Queries Tests|Saved Queries Tests]]
+- [[_COMMUNITY_Table View Reconnect Reload Tests|Table View Reconnect Reload Tests]]
+- [[_COMMUNITY_Export Worker (DOTSQL)|Export Worker (DOT/SQL)]]
+- [[_COMMUNITY_SQL Go-to-Definition|SQL Go-to-Definition]]
+- [[_COMMUNITY_Connection Panel Status Bar 178 Tests|Connection Panel Status Bar 178 Tests]]
+- [[_COMMUNITY_Connection Panel Focus Restore Tests|Connection Panel Focus Restore Tests]]
+- [[_COMMUNITY_DataFrame Export|DataFrame Export]]
+- [[_COMMUNITY_Table View Widget Suspend Guard Tests|Table View Widget Suspend Guard Tests]]
+- [[_COMMUNITY_Connection Dialog Save & Connect|Connection Dialog Save & Connect]]
+- [[_COMMUNITY_Saved Queries & History Filtering|Saved Queries & History Filtering]]
+- [[_COMMUNITY_SSH Key Auth Compatibility Shim|SSH Key Auth Compatibility Shim]]
+- [[_COMMUNITY_Connection Dialog First Run Hint Tests|Connection Dialog First Run Hint Tests]]
+- [[_COMMUNITY_Environment Tests|Environment Tests]]
+- [[_COMMUNITY_Sql Tab Go To Definition Tests|Sql Tab Go To Definition Tests]]
+- [[_COMMUNITY_Sql Tab Quick Fixes Tests|Sql Tab Quick Fixes Tests]]
+- [[_COMMUNITY_Table View Widget Primary Keys Tests|Table View Widget Primary Keys Tests]]
+- [[_COMMUNITY_Schema Diff Engine|Schema Diff Engine]]
+- [[_COMMUNITY_PostgreSQL Durability Tests|PostgreSQL Durability Tests]]
+- [[_COMMUNITY_Generated Columns Tests|Generated Columns Tests]]
+- [[_COMMUNITY_Sql Tab Status Banner Tests|Sql Tab Status Banner Tests]]
+- [[_COMMUNITY_Table View Widget Pagination Tests|Table View Widget Pagination Tests]]
+- [[_COMMUNITY_Connection Dialog Selection Handling|Connection Dialog Selection Handling]]
+- [[_COMMUNITY_Editable Grid Row Export|Editable Grid Row Export]]
+- [[_COMMUNITY_Licensing Client|Licensing Client]]
+- [[_COMMUNITY_PostgreSQL Test Fixtures|PostgreSQL Test Fixtures]]
+- [[_COMMUNITY_Stream Table Rows Tests|Stream Table Rows Tests]]
+- [[_COMMUNITY_SQL Completer Item Rendering|SQL Completer Item Rendering]]
+- [[_COMMUNITY_Table View Reload & Pagination|Table View Reload & Pagination]]
+- [[_COMMUNITY_Deploy|Deploy]]
+- [[_COMMUNITY_Sql Highlighter|Sql Highlighter]]
+- [[_COMMUNITY_Editable Grid Copy & Context Menu|Editable Grid Copy & Context Menu]]
+- [[_COMMUNITY_ER Diagram Layout|ER Diagram Layout]]
+- [[_COMMUNITY_Update Install & Relaunch|Update Install & Relaunch]]
+- [[_COMMUNITY_Sql Tab Result Primary Keys Tests|Sql Tab Result Primary Keys Tests]]
+- [[_COMMUNITY_SQL Tab Theming|SQL Tab Theming]]
+- [[_COMMUNITY_Sql Tab Escape Dismisses Popup Tests|Sql Tab Escape Dismisses Popup Tests]]
+- [[_COMMUNITY_Editable Grid Change SQL Generation|Editable Grid Change SQL Generation]]
+- [[_COMMUNITY_Query Cost Status Badge|Query Cost Status Badge]]
+- [[_COMMUNITY_SQL Result Diff Highlighting|SQL Result Diff Highlighting]]
+- [[_COMMUNITY_Memory|Memory]]
+- [[_COMMUNITY_Conftest|Conftest]]
+- [[_COMMUNITY_PostgreSQL Reconnect Tests|PostgreSQL Reconnect Tests]]
+- [[_COMMUNITY_Connections File Sanitization|Connections File Sanitization]]
+- [[_COMMUNITY_Editable Grid Cell Detail Popup|Editable Grid Cell Detail Popup]]
+- [[_COMMUNITY_SQL Tab Query Extraction|SQL Tab Query Extraction]]
+- [[_COMMUNITY_Docker Compose|Docker Compose]]
+- [[_COMMUNITY_Build|Build]]
+- [[_COMMUNITY_Downloadedfile|Downloadedfile]]
+- [[_COMMUNITY_Data Compare Design|Data Compare Design]]
+- [[_COMMUNITY_Flush Context — Current State|Flush Context — Current State]]
+- [[_COMMUNITY_Flush Context — Milestone Status|Flush Context — Milestone Status]]
+- [[_COMMUNITY_Flush Context — Open Threads|Flush Context — Open Threads]]
+- [[_COMMUNITY_Flush Context — Where Detail Lives|Flush Context — Where Detail Lives]]
+- [[_COMMUNITY_Load Context|Load Context]]
+- [[_COMMUNITY_Benchmarking|Benchmarking]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
+- [[_COMMUNITY_Add To Project|Add To Project]]
+- [[_COMMUNITY_Logo|Logo]]
+- [[_COMMUNITY_Pyproject|Pyproject]]
+- [[_COMMUNITY_README — Compare Schemas|README — Compare Schemas]]
+- [[_COMMUNITY_README — Control a Transaction|README — Control a Transaction]]
+- [[_COMMUNITY_README — Explore an ER Diagram|README — Explore an ER Diagram]]
+- [[_COMMUNITY_README — Read-Only Mode|README — Read-Only Mode]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
+- [[_COMMUNITY_Miscellaneous|Miscellaneous]]
 
 ## God Nodes (most connected - your core abstractions)
-1. `ConnectionPanel` - 179 edges
+1. `ConnectionPanel` - 182 edges
 2. `DbService` - 163 edges
 3. `SqlTab` - 138 edges
 4. `EditableTableWidget` - 86 edges
@@ -199,20 +203,20 @@
 6. `TableViewWidget` - 71 edges
 7. `MainWindow` - 67 edges
 8. `ExportScopeDialog` - 48 edges
-9. `SchemaCompareDialog` - 42 edges
-10. `ErdDialog` - 40 edges
+9. `ErdDialog` - 42 edges
+10. `SchemaCompareDialog` - 42 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `Downloaded File Placeholder` --semantically_similar_to--> `Local File Placeholder`  [INFERRED] [semantically similar]
   downloadedfile.txt → localfile.txt
-- `MainWindow` --uses--> `DbService`  [INFERRED]
-  main.py → services/db_service.py
-- `MainWindow` --uses--> `Edition`  [INFERRED]
-  main.py → services/entitlements.py
-- `MainWindow` --uses--> `QueryHistory`  [INFERRED]
-  main.py → services/query_history.py
-- `MainWindow` --uses--> `SavedQueries`  [INFERRED]
-  main.py → services/saved_queries.py
+- `_QueryWorker` --uses--> `DbService`  [INFERRED]
+  ui/connection_panel.py → services/db_service.py
+- `_QueryWorker` --uses--> `Feature`  [INFERRED]
+  ui/connection_panel.py → services/entitlements.py
+- `_QueryWorker` --uses--> `Limit`  [INFERRED]
+  ui/connection_panel.py → services/entitlements.py
+- `_QueryWorker` --uses--> `QueryHistory`  [INFERRED]
+  ui/connection_panel.py → services/query_history.py
 
 ## Import Cycles
 - None detected.
@@ -220,31 +224,31 @@
 ## Hyperedges (group relationships)
 - **Disagreeing Pricing Numbers Across Docs** — launch_plan_personal_license_pricing, product_strategy, readme_free_pro_tiers [INFERRED 0.75]
 
-## Communities (181 total, 39 thin omitted)
+## Communities (180 total, 37 thin omitted)
 
 ### Community 0 - "License Manager Tests"
 Cohesion: 0.08
-Nodes (54): Ed25519PrivateKey, _issue(), _keygen(), _load_private_key(), main(), build_key_string(), canonical_payload_bytes(), _decode_key_string() (+46 more)
+Nodes (52): Ed25519PrivateKey, _issue(), _keygen(), _load_private_key(), main(), build_key_string(), canonical_payload_bytes(), _decode_key_string() (+44 more)
 
 ### Community 1 - "Query Cost Estimation"
-Cohesion: 0.07
-Nodes (59): generate_optimized_sql(), html_escape(), list_sql_files(), load_connections(), main(), open_connection(), pick_connection(), print_summary() (+51 more)
+Cohesion: 0.06
+Nodes (61): generate_optimized_sql(), html_escape(), list_sql_files(), load_connections(), main(), open_connection(), pick_connection(), print_summary() (+53 more)
 
 ### Community 2 - "Db Service Sqlite Tests"
 Cohesion: 0.04
-Nodes (17): db(), db_path(), evil_db(), fixture, No begin_transaction() call — every statement still persists immediately,…, Regression test for the bug this slice fixes: a write statement inside a manual…, A user can type BEGIN/COMMIT directly in the editor instead of clicking the…, A fully independent DbService to the same file — proves durability from a… (+9 more)
+Nodes (19): db(), db_path(), evil_db(), fixture, No begin_transaction() call — every statement still persists immediately,…, Regression test for the bug this slice fixes: a write statement inside a manual…, A user can type BEGIN/COMMIT directly in the editor instead of clicking the…, A fully independent DbService to the same file — proves durability from a… (+11 more)
 
 ### Community 3 - "Schema Compare Dialog"
 Cohesion: 0.06
-Nodes (21): Open the read-only Schema Compare dialog (issue #68), preselecting this…, _diff_is_destructive(), _MigrationReviewDialog, _Placeholder, QColor, QComboBox, QDialog, QFrame (+13 more)
+Nodes (19): Open the read-only Schema Compare dialog (issue #68), preselecting         this, _diff_is_destructive(), _MigrationReviewDialog, QColor, QComboBox, QDialog, QFrame, QTreeWidgetItem (+11 more)
 
 ### Community 4 - "Schema Snapshot Tests"
 Cohesion: 0.07
-Nodes (41): fetch_schema_snapshot(), Fetch a read-only snapshot of a database's schema. Uses its own dedicated,…, Connect using `config`, gather schema metadata, then disconnect. Returns a dict…, _connected_db(), Issue #72: a successful schema-changing statement must drop the on-disk schema…, test_alter_table_invalidates_cache(), test_connection_without_id_never_touches_cache_file(), test_create_table_invalidates_cache() (+33 more)
+Nodes (39): fetch_schema_snapshot(), Connect using `config`, gather schema metadata, then disconnect. Returns a dict…, _connected_db(), Issue #72: a successful schema-changing statement must drop the on-disk schema…, test_alter_table_invalidates_cache(), test_connection_without_id_never_touches_cache_file(), test_create_table_invalidates_cache(), test_drop_table_invalidates_cache() (+31 more)
 
 ### Community 5 - "SQL Code Editor"
-Cohesion: 0.06
-Nodes (26): _asset_path(), Resolve a bundled asset both when running from source and when frozen by…, QPainter, QRect, QSize, QStyleOptionViewItem, _bracket_spans(), Tests for CodeEditor's matching-bracket highlight (issue #208) — the class… (+18 more)
+Cohesion: 0.07
+Nodes (16): _asset_path(), Resolve a bundled asset both when running from source and when frozen by…, QPainter, QRect, QSize, QStyleOptionViewItem, CodeEditor, _Gutter (+8 more)
 
 ### Community 6 - "Query Classifier Tests"
 Cohesion: 0.09
@@ -255,28 +259,28 @@ Cohesion: 0.06
 Nodes (32): Tests for the per-table Structure/Content/Drop export grid (issue #157),…, test_advanced_options_defaults(), test_auto_increment_and_strip_generated_default_on_mysql(), test_auto_increment_and_strip_generated_disabled_outside_sql_tab(), test_auto_increment_disabled_on_postgresql_and_sqlite(), test_batch_kib_only_set_when_toggle_checked(), test_bulk_select_only_touches_columns_relevant_to_current_format(), test_csv_tab_only_content_is_relevant() (+24 more)
 
 ### Community 8 - "SQL Tab Toolbar & Dialogs"
-Cohesion: 0.05
-Nodes (20): QWidget, Open the snippet management dialog., Called when snippets are changed in the editor dialog., Enable commit/revert buttons when changes are made, Minify/compress SQL query., Show filter dialog for current results, Add filter input boxes to column headers, Update status when filters change (+12 more)
+Cohesion: 0.04
+Nodes (25): Regression test for issue #152 — pressing Esc while the autocomplete popup was…, The pre-existing esc_shortcut -> hide_filter() behavior (for the table-view…, test_escape_hides_popup_when_visible(), test_escape_still_hides_filter_panel_when_popup_not_visible(), Open the snippet management dialog., Called when snippets are changed in the editor dialog., Commit changes to database, Enable commit/revert buttons when changes are made (+17 more)
 
 ### Community 9 - "Database Service Core"
 Cohesion: 0.06
-Nodes (23): DbService, Get columns for a table based on database type, Return this table's CREATE TABLE statement, followed by its indexes and foreign…, Return {table_name: [col_name, ...]} for all tables in one query. Used to…, Return {table_name: [{name, type, nullable, default, key}, ...]} for every…, Return {table_name: [{column, ref_table, ref_column}, ...]} for every table in…, Quote *identifier* (table/column/index name) for this connection's dialect,…, Return index definitions for *table_name*. Each dict has: name, columns,… (+15 more)
+Nodes (21): DbService, Get columns for a table based on database type, Return this table's CREATE TABLE statement, followed by its indexes and foreign…, Return {table_name: [col_name, ...]} for all tables in one query. Used to…, Return {table_name: [{name, type, nullable, default, key}, ...]} for every…, Return {table_name: [{column, ref_table, ref_column}, ...]} for every table in…, Quote *identifier* (table/column/index name) for this connection's dialect,…, Return index definitions for *table_name*. Each dict has: name, columns,… (+13 more)
 
 ### Community 10 - "Main Window Core"
-Cohesion: 0.08
-Nodes (12): MainWindow, Adjust *widget*'s font size relative to its last zoom level. Reading…, Background, best-effort fetch of the remote entitlement override…, Close the connection panel at *index*. No confirmation unless one of its tabs…, Close all connection tabs except the one at *keep_index*., Cmd+W: close current content tab; if that was the last tab for this connection,…, Right-click menu on a connection tab., Top-level window. A QTabBar at the top holds one tab per open database… (+4 more)
+Cohesion: 0.15
+Nodes (5): MainWindow, Adjust *widget*'s font size relative to its last zoom level. Reading…, Top-level window. A QTabBar at the top holds one tab per open database…, Keeps the menu bar's Pro-affordance labels in sync with the current edition —…, QMainWindow
 
 ### Community 11 - "Connection Panel Core"
-Cohesion: 0.06
-Nodes (14): ConnectionPanel, Receives worker `cost_ready` signal via bridge — best-effort, never fires for a…, True if any tab in this connection has an open manual transaction — used to…, Read-only popup showing a function/procedure's CREATE statement (issue:…, Build the full (item_type, display_text, payload) list for the command palette:…, Fuzzy-match the active category's item names (tables, views, or functions —…, QSS for the Schema/Queries/History toggle buttons — set directly per-widget…, Return serialisable list of open tabs. (+6 more)
+Cohesion: 0.07
+Nodes (12): ConnectionPanel, Popup twin of show_db_switcher() below, for PostgreSQL schemas., Receives worker `cost_ready` signal via bridge — best-effort,         never fire, True if any tab in this connection has an open manual         transaction — used, Write *table*'s structure/content/drop to the already-open file         handle *, Export structure + data as a single .sql file (context menu's         "Export Ta, Build the full (item_type, display_text, payload) list for the         command p, Return serialisable list of open tabs. (+4 more)
 
 ### Community 12 - "Benchmark Harness"
 Cohesion: 0.08
 Nodes (34): benchmarks(), _make_sqlite_db(), Connection & database switching benchmarks (issue #60). Sqlite-only, same…, benchmarks(), _make_sqlite_db(), Backend benchmarks: DB connection establishment + query execution (sqlite).…, benchmarks(), _construct_one_main_window() (+26 more)
 
 ### Community 14 - "Editable Grid PK Tests"
-Cohesion: 0.07
-Nodes (29): _edit_cell(), Tests for EditableTableWidget.get_changes()'s WHERE-clause column selection.…, The declared PK isn't among this result set's columns (e.g. a hand-written…, The WHERE clause's original-value literal previously wasn't escaped (only the…, A fresh load_data() (different table/query) must not keep a stale PK from…, Primary key is `id` (column 1, not column 0) — the WHERE clause must key off…, No primary_key_columns set (e.g. table has no PK, or the caller never resolved…, The WHERE clause must use the row's original id, not the new one just typed, or… (+21 more)
+Cohesion: 0.06
+Nodes (31): _edit_cell(), Tests for EditableTableWidget.get_changes()'s WHERE-clause column selection.…, The declared PK isn't among this result set's columns (e.g. a hand-written…, The WHERE clause's original-value literal previously wasn't escaped (only the…, A fresh load_data() (different table/query) must not keep a stale PK from…, Primary key is `id` (column 1, not column 0) — the WHERE clause must key off…, No primary_key_columns set (e.g. table has no PK, or the caller never resolved…, The WHERE clause must use the row's original id, not the new one just typed, or… (+23 more)
 
 ### Community 15 - "Table View Streaming Load"
 Cohesion: 0.05
@@ -284,31 +288,31 @@ Nodes (19): Widget that shows a table with streaming data loading, Update loadin
 
 ### Community 16 - "Connection Dialog UI Layout"
 Cohesion: 0.12
-Nodes (14): QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton, QTextEdit, QWidget, Size *edit* to its own text, not the row's full width: stays at the medium…, QWidget (+6 more)
+Nodes (13): QComboBox, QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton, QTextEdit, QWidget, Size *edit* to its own text, not the row's full width: stays at the medium… (+5 more)
 
 ### Community 17 - "Query Cost Tests"
 Cohesion: 0.06
 Nodes (5): skipif, fixture, Tests for services/query_cost.py. MySQL coverage is pure unit tests against the…, sqlite_db(), TestPostgresLive
 
 ### Community 18 - "Data Compare Dialog"
-Cohesion: 0.09
-Nodes (10): Open the read-only Data Compare dialog (issue #197/#204), preselecting this…, DataCompareDialog, QComboBox, QDialog, *conn_combo*'s resolved config, with "database" overridden to whatever…, Rebuilds the left tree from self._category_data, honoring the active change-…, A concise one-line Detail-column summary — "3 fields changed" for a modified…, Opens standalone — the caller only supplies which connection id to preselect as… (+2 more)
+Cohesion: 0.10
+Nodes (11): Open the read-only Data Compare dialog (issue #197/#204),         preselecting t, DataCompareDialog, QComboBox, QDialog, QWidget, *conn_combo*'s resolved config, with "database" overridden to whatever…, Rebuilds the left tree from self._category_data, honoring the active change-…, A concise one-line Detail-column summary — "3 fields changed" for a modified… (+3 more)
 
 ### Community 19 - "Data Diff Engine"
 Cohesion: 0.17
 Nodes (30): _append_capped(), build_data_diff(), DataDiff, _diff_by_key(), _diff_whole_rows(), _fetch_side(), _index_by_key(), Build a read-only row-level data diff between two database connections (issue… (+22 more)
 
 ### Community 20 - "Theme Manager"
-Cohesion: 0.11
-Nodes (19): Data Compare — read-only row-level data diff between two saved connections…, Structured error dialog for failed grid edits (issue #143). Replaces…, _load_connection_profiles(), _profile_label(), Schema Compare — read-only structural diff between two saved connections (issue…, Raw (credential-free) connection list for populating the source/ target pickers…, ThemeManager — QForge design system (see ai/ui-design.md for the source of…, Render a 16x16 'x' close-tab icon in *color_hex* to a cached PNG and return its… (+11 more)
+Cohesion: 0.08
+Nodes (29): Fetch a read-only snapshot of a database's schema. Uses its own dedicated,…, ConnectionPanel ═══════════════ A self-contained widget that owns one database c, Data Compare — read-only row-level data diff between two saved connections…, _load_connection_profiles(), _Placeholder, _profile_label(), Schema Compare — read-only structural diff between two saved connections (issue…, Centered icon/heading/subtitle empty-state, mutable in place so the same widget… (+21 more)
 
 ### Community 21 - "Query Verifier"
-Cohesion: 0.11
-Nodes (18): AggRow, ColDiffRow, ExplainRow, QueryVerifier, QueryVerifier ───────────── Runs two SQL queries (original vs optimised) and…, Compare two SQL queries using an existing DbService connection., Run EXPLAIN and return list[ExplainRow]. Non-fatal on any error., One row from EXPLAIN output — key fields only. (+10 more)
+Cohesion: 0.08
+Nodes (25): AggRow, ColDiffRow, ExplainRow, QueryVerifier, QueryVerifier ───────────── Runs two SQL queries (original vs optimised) and…, Compare two SQL queries using an existing DbService connection., Run EXPLAIN and return list[ExplainRow]. Non-fatal on any error., One row from EXPLAIN output — key fields only. (+17 more)
 
 ### Community 22 - "ER Diagram Dialog Core"
-Cohesion: 0.12
-Nodes (4): ErdDialog, QDialog, Opens against a connection profile's config dict (same shape passed to…, Select *table_name*'s node (highlighting it and its relationship edges, same as…
+Cohesion: 0.11
+Nodes (4): ErdDialog, QDialog, Opens against a connection profile's config dict (same shape passed     to DbSer, Select *table_name*'s node (highlighting it and its relationship         edges,
 
 ### Community 23 - "Database Query Execution"
 Cohesion: 0.09
@@ -319,8 +323,8 @@ Cohesion: 0.12
 Nodes (20): _MainWindowStub, QWidget, Regression guard for the dev performance overlay (issue #43): the shortcut…, Regression guard for issue #172: import/export operations had no…, Regression guard for issue #169: without word wrap, a stat line wider than the…, Regression guard for issue #170: CPU utilization was computed for the offline…, test_active_connections_counts_only_live_db_service_connections(), test_label_has_word_wrap_enabled() (+12 more)
 
 ### Community 25 - "Upgrade to Pro Dialog"
-Cohesion: 0.14
-Nodes (19): Enum, Edition, Feature, Limit, services/entitlements.py — the centralized Free/Pro entitlement model (issue…, _QueryWorker, ConnectionPanel ═══════════════ A self-contained widget that owns one database…, Best-effort pre-run cost estimate for the status-bar badge — plan-only (EXPLAIN… (+11 more)
+Cohesion: 0.33
+Nodes (5): QObject, QObject, _QueryWorker, Best-effort pre-run cost estimate for the status-bar badge —         plan-only (, Runs one or more SQL statements on a QThread and emits the result.     Receives
 
 ### Community 26 - "Mock Data Dialog"
 Cohesion: 0.12
@@ -331,28 +335,28 @@ Cohesion: 0.08
 Nodes (11): Drives autocomplete for a QTextEdit. Design goals ───────────── • GENERAL…, Replace the snippet cache (called after SnippetManager is updated)., Refresh schema cache (called on connect / db switch).…, Every table and view name the active connection reported., A bare table/view name, or an alias already used in the current query (via…, Column name(s) of `table` marked primary key in the bulk-fetched column_details…, Recompute and display suggestions for the current editor state. force=True →…, Return the token (incl. alias.col dot notation) ending at pos. (+3 more)
 
 ### Community 28 - "Mock Data Generator"
-Cohesion: 0.13
-Nodes (26): date, build_insert_sql(), ColumnSpec, _gen_address(), _gen_boolean(), _gen_date(), _gen_datetime(), _gen_email() (+18 more)
+Cohesion: 0.16
+Nodes (22): date, build_insert_sql(), ColumnSpec, _gen_address(), _gen_boolean(), _gen_date(), _gen_datetime(), _gen_email() (+14 more)
 
 ### Community 29 - "Code Editor Find & Replace"
 Cohesion: 0.11
 Nodes (10): QTextCursor, Merge CodeEditor's own selections (current-line highlight + matching-bracket…, Cmd+F: open Quick Filter when the result grid has focus (issue #2), otherwise…, Ctrl+Alt+F (Cmd+Option+F on macOS): show find+replace bar., The visible 'Replace' toggle button in the find bar (issue #112) — lets Replace…, Single place that shows/hides the replace row and keeps the toggle button's…, Build a regex pattern from the current search text + toggles. Smart-case: if…, Remove all orange match highlights from the editor. (+2 more)
 
 ### Community 30 - "Query History"
-Cohesion: 0.09
-Nodes (13): QueryHistory, Simple query history manager, Load query history from file, Save query history to file, Add a query to history. cost_score/cost_label are the optional pre-run estimate…, Search queries by keyword, _MainWindowStub, QDialog (+5 more)
+Cohesion: 0.04
+Nodes (32): QueryHistory, Simple query history manager, Load query history from file, Save query history to file, Add a query to history. cost_score/cost_label are the optional pre-run estimate…, Search queries by keyword, saved_queries.py — Persistent store for user-saved SQL queries. Backs the…, CRUD + persistence for named, favoritable saved SQL queries. (+24 more)
 
 ### Community 31 - "Editable Grid Undo/Redo"
-Cohesion: 0.09
-Nodes (12): _CellEditCommand, QColor, Apply the correct colour to every cell in *row* based on its state., Legacy helper — delegates to _repaint_row when state is already set., One cell's text changed from old_text to new_text., (at_row, delta) this command's own undo/redo causes to every OTHER row index —…, row was toggled into/out of the pending-deletion set., Track when an item is modified, push an undo step, and paint changed cell + row. (+4 more)
+Cohesion: 0.18
+Nodes (6): _CellEditCommand, One cell's text changed from old_text to new_text., (at_row, delta) this command's own undo/redo causes to every OTHER row index —…, Track when an item is modified, push an undo step, and paint changed cell + row., Update modified_rows/modified_cells for one cell against its original DB value…, Set a cell's text without going through on_item_changed (so restoring it…
 
 ### Community 32 - "Onboarding"
-Cohesion: 0.11
-Nodes (14): _is_remote_connection(), True for connections where establishing db_service.connect() is slow enough…, saved_queries.py — Persistent store for user-saved SQL queries. Backs the…, Regression guard: after a fresh connection's modal ConnectionDialog closes, the…, Persist per-table column widths across sessions., dismiss_connection_hint(), is_connection_hint_dismissed(), Persist one-time first-run UI state across sessions (issue #164). Currently… (+6 more)
+Cohesion: 0.60
+Nodes (4): dismiss_connection_hint(), is_connection_hint_dismissed(), Persist one-time first-run UI state across sessions (issue #164). Currently…, _read()
 
 ### Community 33 - "Query Library Dialog"
-Cohesion: 0.13
-Nodes (11): _panel_with_one_sql_tab(), _PanelStub, Opening or saving a saved query should name its tab after the query, not leave…, _store(), test_query_library_dialog_exposes_selected_entrys_name(), test_save_current_query_renames_the_tab_to_the_name_just_given(), test_use_saved_query_leaves_tab_name_alone_when_entry_has_no_name(), test_use_saved_query_renames_tab_to_query_name() (+3 more)
+Cohesion: 0.08
+Nodes (21): _panel_with_table_view_active_and_sql_tab_in_background(), _PanelStub, Regression tests for issue #175 — opening a saved query (or history entry)…, Just enough of ConnectionPanel for _active_sql_tab()/_use_saved_query()/…, Mirrors the bug repro: a table Data/Structure view (any non-SqlTab widget) is…, test_active_sql_tab_brings_a_background_sql_tab_to_front(), test_use_history_item_does_not_force_sidebar_back_to_schema(), test_use_saved_query_does_not_force_sidebar_back_to_schema() (+13 more)
 
 ### Community 34 - "Perf Metrics Tests"
 Cohesion: 0.11
@@ -360,23 +364,23 @@ Nodes (25): Regression guard for issue #172 (timing) and #171 (in-flight gauge):
 
 ### Community 35 - "Table Context Menu Actions"
 Cohesion: 0.10
-Nodes (8): Full table/view context menu (issue #142, TablePlus parity). Grouped:…, Open a read-only ER diagram of the current database (issue #62). Builds its own…, Opens the Mock Data Generator (issue #77). Environment/read-only safety gating…, Read a CSV file and INSERT all rows into *table_name*., Export just the rows (context menu's "Export Table Data") without the…, Export structure + data as a single .sql file (context menu's "Export Table as…, StructureEditorDialog already supports a "New Table" mode (table_name=None) —…, Classify *sql* (one statement or a whole script) and show whatever dialog is…
+Nodes (7): Full table/view context menu (issue #142, TablePlus parity).         Grouped: na, Open a read-only ER diagram of the current database (issue #62).         Builds, Opens the Mock Data Generator (issue #77). Environment/read-only         safety, Read a CSV file and INSERT all rows into *table_name*., Export just the rows (context menu's "Export Table Data") without         the Ex, StructureEditorDialog already supports a "New Table" mode         (table_name=No, Classify *sql* (one statement or a whole script) and show         whatever dialo
 
 ### Community 36 - "Saved Queries"
-Cohesion: 0.13
-Nodes (9): CRUD + persistence for named, favoritable saved SQL queries., SavedQueries, _MainWindowStub, QDialog, QWidget, Regression test for issue #173: _prompt_new_connection() must accumulate…, First call: accepted but with no connection selected (get_selected_connection()…, _RepromptThenCancelDialog (+1 more)
+Cohesion: 0.17
+Nodes (4): Fuzzy-match the active category's item names (tables, views, or         function, QSS for the Schema/Queries/History toggle buttons — set directly         per-wid, Rasterize *emoji* to a small QIcon (cached) — this app has no         icon image, Rebuild schema_tree as a flat list of just the active category's         items —
 
 ### Community 37 - "Query Analyzer Compare Tab"
-Cohesion: 0.16
-Nodes (11): _check_row(), _CompareQueriesTab, _extract_params(), _plan_node_card(), _plan_tree_widget(), QLabel, QWidget, Recreates the plan hierarchy as a small vertical flow of node cards connected… (+3 more)
+Cohesion: 0.14
+Nodes (13): VerifyResult, _CompareQueriesTab, _issue_card(), _plan_node_card(), _plan_tree_widget(), QFrame, QLabel, QWidget (+5 more)
 
 ### Community 38 - "Table Structure Editor"
 Cohesion: 0.10
 Nodes (12): QDialog, Enable/disable length input based on type, Enable/disable auto increment when primary key is toggled, Add column to the table, Remove selected column, Dialog for creating/editing table structure, Generate CREATE TABLE or ALTER TABLE SQL, Generate CREATE TABLE SQL (+4 more)
 
 ### Community 39 - "ER Diagram View & Minimap"
-Cohesion: 0.11
-Nodes (9): QGraphicsView, QRectF, _ErdView, _InspectorPanel, _MinimapView, QWidget, Wheel-to-zoom; left-drag on empty canvas (or empty space between nodes) pans,…, Small always-fit overview sharing the main scene. Draws the main view's visible… (+1 more)
+Cohesion: 0.07
+Nodes (21): QColor, QGraphicsRectItem, QGraphicsSimpleTextItem, QGraphicsView, QRectF, QWidget, _CollapseToggle, _ErdView (+13 more)
 
 ### Community 40 - "Entitlements Model"
 Cohesion: 0.15
@@ -391,32 +395,32 @@ Cohesion: 0.11
 Nodes (13): QKeyEvent, _collect_actions(), Command palette: search and run any app menu action by name (issue #232).…, {key: QAction} for every enabled, non-separator, leaf action under *menu_bar* —…, show_command_palette(), QDialog, QuickSearchDialog, Handle arrow key navigation from search input (+5 more)
 
 ### Community 43 - "Query Analyzer Profile Sections"
-Cohesion: 0.21
-Nodes (13): _count_plan_nodes(), _divider(), _issue_card(), _na(), _plan_depth(), QFrame, QueryAnalyzerDialog ──────────────────── Consolidated query-analysis dialog —…, Render a possibly-unavailable metric — never fabricate a number when the… (+5 more)
+Cohesion: 0.20
+Nodes (3): Idle connections show their environment's semantic colour (the safety cue from…, Render a 16x16 'x' close-tab icon in *color_hex* to a cached PNG and return its…, *hex_color* ("#RRGGBB") at *alpha_hex* opacity ("00"-"ff"), as a Qt stylesheet…
 
 ### Community 44 - "Df Export Tests"
-Cohesion: 0.14
-Nodes (17): Regression for issue #162: an embedded backtick/quote in a table/column name…, Regression: batch_kib=None (the default) must reproduce today's exact one-row-…, test_quote_identifier_escapes_embedded_quote_char_per_dialect(), test_sql_value_literal_blob_as_hex_false_falls_back_to_null(), test_sql_value_literal_hex_encodes_blobs_per_dialect(), test_sql_value_literal_leaves_numbers_unquoted(), test_sql_value_literal_null_for_none_and_nan(), test_sql_value_literal_quotes_and_escapes_strings() (+9 more)
+Cohesion: 0.23
+Nodes (8): Regression: batch_kib=None (the default) must reproduce today's exact one-row-…, test_to_sql_inserts_batches_multiple_rows_per_statement_by_kib(), test_to_sql_inserts_builds_one_statement_per_row(), test_to_sql_inserts_quotes_identifiers_per_dialect(), test_to_sql_inserts_single_large_batch_when_kib_is_generous(), Incrementally writes `INSERT INTO ... VALUES (...);` statements to an open file…, SqlInsertStreamWriter, _to_sql_inserts()
 
 ### Community 45 - "ER Diagram Table Boxes"
-Cohesion: 0.12
-Nodes (8): QGraphicsRectItem, QGraphicsSimpleTextItem, _CollapseToggle, _header_color(), QColor, Small header glyph that collapses/expands its parent table node, intercepting…, One table box: header + one row per column. Draggable (ItemIsMovable) and…, _TableNodeItem
+Cohesion: 0.17
+Nodes (9): QPainterPath, QPointF, _append_cardinality_marks(), _build_curved_path(), _curve_crosses_obstacles(), One table box: header + one row per column. Draggable     (ItemIsMovable) and co, Cubic-bezier connector, bowed perpendicular to the straight line so     it reads, Appends a crow's-foot ("many") or a single tick ("one") to *path* at     endpoin (+1 more)
 
 ### Community 46 - "ER Diagram Model"
-Cohesion: 0.18
-Nodes (20): build_erd_graph(), ErdColumn, ErdGraph, ErdRelationship, ErdTable, fetch_table_indexes(), _is_unique_single_column(), Build a read-only ER-diagram graph model from database metadata (issue #63).… (+12 more)
+Cohesion: 0.16
+Nodes (24): build_erd_graph(), build_erd_graph_from_snapshot(), ErdColumn, ErdGraph, ErdRelationship, ErdTable, fetch_table_indexes(), _is_unique_single_column() (+16 more)
 
 ### Community 47 - "Database Switcher"
 Cohesion: 0.15
 Nodes (12): _dialog(), Tests for DbSwitcherDialog's click-outside-to-close behavior (issue #234). Uses…, test_escape_still_closes_the_popup(), test_internal_focus_change_does_not_select_or_close(), test_picking_an_item_still_emits_db_selected(), test_uses_popup_window_type(), Open the Cmd+K database switcher dialog., DbSwitcherDialog (+4 more)
 
 ### Community 48 - "Connection Panel Tab Management"
-Cohesion: 0.10
-Nodes (10): Open a table view; re-focus if already open. *silent* suppresses the Free-tier…, Guarantee this panel has at least one query tab. Called once right after a…, True if one more tab stays within Limit.MAX_QUERY_TABS — query tabs and table-…, Open a blank SQL query tab. Returns the new tab, or None if the tab cap (issue…, Open the consolidated Analyze Query dialog (Cost & Profile + Compare Queries),…, Place a visible × QPushButton on the tab at the given index., Open (or focus) *table_name*'s tab and switch it to the Structure sub-tab…, No dedicated CREATE VIEW UI exists — open a fresh SQL tab with a template so… (+2 more)
+Cohesion: 0.08
+Nodes (13): Open a table view; re-focus if already open. *silent* suppresses         the Fre, Guarantee this panel has at least one query tab. Called once         right after, True if one more tab stays within Limit.MAX_QUERY_TABS — query         tabs and, Open a blank SQL query tab. Returns the new tab, or None if the         tab cap, Execute inline-edit SQL statements against the live connection., Execute the SQL in `tab` on a background thread; Cancel actually         stops i, Handler for the tab's Begin/Commit/Rollback buttons — runs         *stmt* throug, Open the consolidated Analyze Query dialog (Cost & Profile +         Compare Que (+5 more)
 
 ### Community 49 - "Connection Panel Query Lifecycle"
-Cohesion: 0.12
-Nodes (9): Restore the Run button to its default ready state., Load FK map for *table_name* into the result grid and ensure the navigate_fk…, Receives worker `done` signal via bridge — guaranteed main thread., Receives worker `errored` signal via bridge — guaranteed main thread., Receives worker `cancelled` signal via bridge — guaranteed main thread., Called at the end of every query-completion handler. Decides whether this tab's…, Manually reconnect to the database and reload the schema., Retry every open TableViewWidget currently stuck on a connection error, now… (+1 more)
+Cohesion: 0.16
+Nodes (8): Restore the Run button to its default ready state., Load FK map for *table_name* into the result grid and ensure the         navigat, Receives worker `done` signal via bridge — guaranteed main thread., Multi-statement result handler. Every statement gets its own         "Query N" s, Receives worker `errored` signal via bridge — guaranteed main thread., Receives worker `cancelled` signal via bridge — guaranteed main thread., Called at the end of every query-completion handler. Decides         whether thi, Single choke point for health_changed — keeps self._last_health         (read by
 
 ### Community 50 - "Editable Grid Row Batch Ops"
 Cohesion: 0.13
@@ -427,28 +431,28 @@ Cohesion: 0.10
 Nodes (9): Draw the active sort column/direction directly into the header text. Qt's…, Inner (non-reentrant) implementation of _display_data., Re-apply colour to all rows that have a known dirty state. Called after every…, Freeze the leading *count* (current visual order) columns so they stay visible…, Arrange the frozen view's header sections in the same left-to-right visual…, Show only the frozen columns in the overlay view; the main view keeps showing…, Position/size the overlay so it exactly covers the frozen columns' header +…, Right-click a column header: freeze up through that column, or unfreeze if a… (+1 more)
 
 ### Community 52 - "Row Stream Writers Tests"
-Cohesion: 0.14
-Nodes (14): Tests for the CSV/XML row writers (issue #159)., Issue #115: a cell value starting with =, +, -, or @ is read as a formula by…, test_csv_writer_decodes_blobs_when_hex_disabled(), test_csv_writer_hex_encodes_blobs_by_default(), test_csv_writer_neutralizes_leading_formula_characters(), test_csv_writer_none_becomes_empty_cell(), test_csv_writer_writes_header_then_rows(), test_xml_writer_escapes_special_characters() (+6 more)
+Cohesion: 0.24
+Nodes (9): Tests for the CSV/XML row writers (issue #159)., Issue #115: a cell value starting with =, +, -, or @ is read as a formula by…, test_csv_writer_decodes_blobs_when_hex_disabled(), test_csv_writer_hex_encodes_blobs_by_default(), test_csv_writer_neutralizes_leading_formula_characters(), test_csv_writer_none_becomes_empty_cell(), test_csv_writer_writes_header_then_rows(), CsvRowStreamWriter (+1 more)
 
 ### Community 53 - "Run All Statements Tests"
-Cohesion: 0.14
-Nodes (12): _MultiDonePanelStub, _PanelStub, Regression tests for Run's default multi-statement behavior: with no text…, Just enough of ConnectionPanel for _on_query_multi_done() to run against a real…, Just enough of ConnectionPanel for _run_query_in_tab()'s query- resolution step…, _tab_with_cursor_in_first_statement(), test_a_single_statement_still_runs_normally_with_no_selection(), test_multi_done_mixes_selects_writes_and_errors_in_their_own_tabs() (+4 more)
+Cohesion: 0.15
+Nodes (11): _MultiDonePanelStub, _PanelStub, Regression tests for Run's default multi-statement behavior: with no text…, Just enough of ConnectionPanel for _on_query_multi_done() to run against a real…, Just enough of ConnectionPanel for _run_query_in_tab()'s query- resolution step…, _tab_with_cursor_in_first_statement(), test_a_single_statement_still_runs_normally_with_no_selection(), test_multi_done_mixes_selects_writes_and_errors_in_their_own_tabs() (+3 more)
 
 ### Community 54 - "License Activation Dialog"
-Cohesion: 0.16
-Nodes (7): _LicenseActionWorker, LicenseDialog, _mask_email(), QDialog, QThread, ui/license_dialog.py — view current edition, activate or deactivate a Pro…, Runs a single license_manager call (activate or deactivate) off the UI thread…
+Cohesion: 0.09
+Nodes (25): Enum, QGraphicsPathItem, Edition, Feature, Limit, services/entitlements.py — the centralized Free/Pro entitlement model (issue…, services/license_manager.py — local license persistence + validation. Owns…, Read-only ER diagram — table nodes + FK relationship lines on a QGraphicsView ca (+17 more)
 
 ### Community 55 - "Entitlement Config Tests"
 Cohesion: 0.19
 Nodes (17): _clean_limits_section(), parse_remote_override(), services/entitlement_config.py — the single place every Free/Pro tunable value…, Validate an untrusted remote JSON payload against the shape of the bundled…, test_blank_price_label_is_dropped(), test_bool_is_not_accepted_as_a_limit_value(), test_explicit_empty_feature_list_is_preserved(), test_full_valid_payload_passes_through() (+9 more)
 
 ### Community 56 - "Query Analyzer Cost Estimate Tab"
-Cohesion: 0.20
-Nodes (5): CostEstimate, Pre-run, plan-only estimate — never executes the user's query., _CostProfileTab, Single-query cost estimate (plan-only, never executes) plus an opt-in post-run…, Section-11 safety gate: EXPLAIN ANALYZE genuinely runs the statement, so a…
+Cohesion: 0.17
+Nodes (11): _check_row(), _CostProfileTab, _count_plan_nodes(), _divider(), _na(), Render a possibly-unavailable metric — never fabricate a number when the…, Single-query cost estimate (plan-only, never executes) plus an opt-in post-run…, Section-11 safety gate: EXPLAIN ANALYZE genuinely runs the statement, so a… (+3 more)
 
 ### Community 57 - "Connection Panel Query Navigation Tests"
-Cohesion: 0.16
-Nodes (11): _panel_with_table_view_active_and_sql_tab_in_background(), _PanelStub, Regression tests for issue #175 — opening a saved query (or history entry)…, Just enough of ConnectionPanel for _active_sql_tab()/_use_saved_query()/…, Mirrors the bug repro: a table Data/Structure view (any non-SqlTab widget) is…, test_active_sql_tab_brings_a_background_sql_tab_to_front(), test_use_history_item_does_not_force_sidebar_back_to_schema(), test_use_saved_query_does_not_force_sidebar_back_to_schema() (+3 more)
+Cohesion: 0.18
+Nodes (8): Background fetch of the remote entitlement-config override — mirrors…, Downloads, verifies, and installs a QForge update DMG in place over the running…, Path to the .app bundle currently running, or None if not frozen., running_app_bundle_path(), Ed25519 signature verification for release SHA256SUMS.txt (issue #113). SHA256…, True iff signature_b64 (base64-encoded ed25519 signature) validates against…, verify_signature(), Background update checker — hits GitHub releases API, emits a signal when a…
 
 ### Community 58 - "Sql Tab Result Viewer 178 Tests"
 Cohesion: 0.18
@@ -459,32 +463,32 @@ Cohesion: 0.12
 Nodes (4): ConnectionDialog, QDialog, Deselect tree and clear form to create a new connection., Auto-suggest Read-only when the user picks Staging/Production — one-directional…
 
 ### Community 60 - "Connection Panel Schema Loading"
-Cohesion: 0.16
-Nodes (7): QTreeWidgetItem, Populate the tree/autocomplete from a cached snapshot (issue #71) immediately;…, Attach a live elapsed-time ticker to *item* (already inserted in the tree) for…, Fetch schema on a daemon thread using a *dedicated* connection (see…, Push tables/columns to autocomplete as soon as they're fetched — ahead of the…, Main-thread: populate the schema tree from background result., notify=True (explicit "Refresh Schema" actions only, not the initial connect /…
+Cohesion: 0.14
+Nodes (10): QTreeWidgetItem, QTreeWidgetItem, Populate the tree/autocomplete from a cached snapshot (issue         #71) immedi, Attach a live elapsed-time ticker to *item* (already inserted in         the tre, Fetch schema on a daemon thread using a *dedicated* connection         (see serv, Push tables/columns to autocomplete as soon as they're fetched —         ahead o, Main-thread: populate the schema tree from background result., Manually reconnect to the database and reload the schema. (+2 more)
 
 ### Community 61 - "Db Service Mysql Lenient Decoding Tests"
 Cohesion: 0.19
 Nodes (14): _ensure_lenient_mysql_decoding(), _lenient_read_row_from_packet(), Drop-in replacement for pymysql.connections.MySQLResult's own row-decoder…, Idempotently patch pymysql to survive non-UTF-8-clean string columns (issue…, _FakePacket, _FakeResult, Regression tests for issue #150 — a non-UTF-8-clean byte in a MySQL string…, Stands in for pymysql's MysqlPacket — read_length_coded_string() is the only… (+6 more)
 
 ### Community 62 - "Schema Diff Data Model"
-Cohesion: 0.27
-Nodes (16): ColumnDiff, ColumnInfo, TableDiff, _alter_table_sql(), _column_def_sql(), _col(), Tests for the schema-compare migration SQL generator (issue #69)., Issue #114: a crafted/compromised source database could report an 'int'-typed… (+8 more)
+Cohesion: 0.07
+Nodes (61): build_schema_diff(), ColumnDiff, ColumnInfo, _diff_columns(), _diff_foreign_keys(), _diff_indexes(), _diff_table(), _fetch_side() (+53 more)
 
 ### Community 63 - "Ddl Toggles Tests"
-Cohesion: 0.17
-Nodes (15): Tests for the auto-increment-value and generated-column DDL text transforms…, test_strip_auto_increment_value_is_noop_without_clause(), test_strip_auto_increment_value_removes_clause(), test_strip_generated_column_clauses_handles_multiple_columns(), test_strip_generated_column_clauses_handles_nested_parens(), test_strip_generated_column_clauses_is_noop_without_clause(), test_strip_generated_column_clauses_removes_simple_expression(), test_drop_table_statement_quotes_per_dialect() (+7 more)
+Cohesion: 0.22
+Nodes (12): Tests for the auto-increment-value and generated-column DDL text transforms…, test_strip_auto_increment_value_is_noop_without_clause(), test_strip_auto_increment_value_removes_clause(), test_strip_generated_column_clauses_handles_multiple_columns(), test_strip_generated_column_clauses_handles_nested_parens(), test_strip_generated_column_clauses_is_noop_without_clause(), test_strip_generated_column_clauses_removes_simple_expression(), Producer thread body for 'sql'/'csv'/'xml': walks *table_opts* in         order, (+4 more)
 
 ### Community 64 - "Install Source Tests"
-Cohesion: 0.14
-Nodes (13): issue #79: installation-source detection must correctly tell a Homebrew-managed…, test_detect_direct_when_brew_missing(), test_detect_direct_when_cask_not_installed(), test_detect_homebrew_when_cask_listed(), test_detect_unknown_when_brew_errors(), HomebrewUpdateInstaller, QThread, Runs `brew upgrade --cask qforge` on a worker thread for a Homebrew-managed… (+5 more)
+Cohesion: 0.27
+Nodes (9): issue #79: installation-source detection must correctly tell a Homebrew-managed…, test_detect_direct_when_brew_missing(), test_detect_direct_when_cask_not_installed(), test_detect_homebrew_when_cask_listed(), test_detect_unknown_when_brew_errors(), brew_path(), detect(), Path to the `brew` executable, or None if it can't be found. (+1 more)
 
 ### Community 65 - "Connection List Load & Migration"
 Cohesion: 0.13
 Nodes (7): Rebuild self.connections order to match the new drag-dropped tree order., Show context menu on right-click over a connection item., connections.json can hold plaintext passwords (the OS-keychain fallback — see…, Rebuild the group combo items from all saved connections., Assign a stable id to every connection, migrating any legacy plaintext password…, Fetch a single credential from the OS keychain on demand, caching the result…, Write this dialog session's known value of a credential to the keychain,…
 
 ### Community 66 - "SQL Snippet Manager"
-Cohesion: 0.15
-Nodes (7): snippet_manager.py — Persistent SQL snippet store. Snippets are keyed by a…, Return a copy of all snippets., Create or update a snippet., Restore built-in snippets (keeps user-added ones)., Merge snippets from *path* and return the number imported., CRUD + persistence for user-defined SQL snippets., SnippetManager
+Cohesion: 0.14
+Nodes (8): _ClickableRow, A QWidget that behaves like a button for the schema sidebar's     category rows, Return a copy of all snippets., Create or update a snippet., Restore built-in snippets (keeps user-added ones)., Merge snippets from *path* and return the number imported., CRUD + persistence for user-defined SQL snippets., SnippetManager
 
 ### Community 67 - "SQL Completer Suggestion Scoring"
 Cohesion: 0.17
@@ -495,7 +499,7 @@ Cohesion: 0.11
 Nodes (9): Resolve the identifier under the mouse against the completer's schema…, Route key events: popup navigation first, then auto-trigger., Insert a matching closing quote and place the cursor between them. If the…, Return True if the editor cursor is currently inside a quoted string literal., Toggle -- comment on each selected line (or current line)., Cmd+D: expand selection to current word, then find and select next match., Delete the entire line the cursor is on (Cmd+Backspace / ⌘⌫)., Update autocomplete with schema information (+1 more)
 
 ### Community 69 - "Table Structure Panels"
-Cohesion: 0.16
+Cohesion: 0.18
 Nodes (11): _fill_columns_table(), _fill_fk_table(), _fill_indexes_table(), _filter_table_rows(), _new_readonly_table(), QTableWidget, QWidget, Live, in-memory, case-insensitive row filter (issue #53). (+3 more)
 
 ### Community 70 - "Ui Design"
@@ -503,8 +507,8 @@ Cohesion: 0.15
 Nodes (15): Accessibility and quality checks, Component rules, Connection Tab/Title Label Line, Dark — graphite blue, Dark Palette — Graphite Blue, Design direction, Environment safety indicators, Implementation notes (+7 more)
 
 ### Community 71 - "Self-Update Detection"
-Cohesion: 0.16
-Nodes (6): Detected once per session and cached (issue #79) \u2014 a local `brew list`…, Self-update needs an actual .dmg asset and a running .app bundle to replace…, What clicking Update will actually do, for the banner/dialog text \u2014 a…, Triggered by Help → Check for Updates. Shows a dialog with result., Path to the .app bundle currently running, or None if not frozen., running_app_bundle_path()
+Cohesion: 0.12
+Nodes (6): Detected once per session and cached (issue #79) \u2014 a local `brew list`…, Self-update needs an actual .dmg asset and a running .app bundle to replace…, What clicking Update will actually do, for the banner/dialog text \u2014 a…, Triggered by Help → Check for Updates. Shows a dialog with result., HomebrewUpdateInstaller, QThread
 
 ### Community 72 - "Dot Export Tests"
 Cohesion: 0.22
@@ -523,44 +527,44 @@ Cohesion: 0.13
 Nodes (15): AI Flush Context, Production Safety Slices Roadmap, Build & Release Workflow, Launch Plan, 1. Pricing, 2. Investment to build the launch pieces, 3. Apple Developer ID + notarization timeline, Personal License Pricing (+7 more)
 
 ### Community 76 - "Database & Table Export"
-Cohesion: 0.14
-Nodes (6): Event, Optimistic open (previously-visited remote/SSH connection with a warm schema…, Export chosen tables' structure and/or data to a single SQL dump (issue #39:…, Prompt for a save path whose filter/extension matches *scope*'s selected format…, Stream *table_opts* to *file_path* on a background QThread via _ExportWorker…, Export a single table without needing an open query tab (issue #39), via the…
+Cohesion: 0.12
+Nodes (9): DbService, Event, QueryHistory, SavedQueries, Optimistic open (previously-visited remote/SSH connection with a         warm sc, Export chosen tables' structure and/or data to a single SQL dump         (issue, Prompt for a save path whose filter/extension matches *scope*'s         selected, Stream *table_opts* to *file_path* on a background QThread via         _ExportWo (+1 more)
 
 ### Community 77 - "Column Filter Dialog"
-Cohesion: 0.16
-Nodes (6): QComboBox, ColumnFilterDialog, QDialog, Get the current filters, Dialog for filtering table data by column and value, Update the display of active filters
+Cohesion: 0.21
+Nodes (5): ColumnFilterDialog, QDialog, Get the current filters, Dialog for filtering table data by column and value, Update the display of active filters
 
 ### Community 78 - "SQL Completer Popup Window"
-Cohesion: 0.15
-Nodes (7): QPoint, QFrame, QListWidgetItem, Frameless floating window shown below the cursor. Never steals keyboard focus…, Construct the popup on first real use — see __init__ for why., Route a key event to the popup. Returns True if the event was consumed (caller…, SqlCompletePopup
+Cohesion: 0.11
+Nodes (10): QPoint, QFrame, QListWidgetItem, QStyledItemDelegate, Paints each row: bold-highlighted prefix on the left, type badge on the right., Frameless floating window shown below the cursor. Never steals keyboard focus…, Construct the popup on first real use — see __init__ for why., Route a key event to the popup. Returns True if the event was consumed (caller… (+2 more)
 
 ### Community 79 - "Schema Migration"
-Cohesion: 0.17
-Nodes (13): IndexDiff, _default_clause(), _index_sql(), _quoted_column_list(), Generates a reviewable SQL migration script from a SchemaDiff (issue #69): DDL…, *cols* is DbService.get_indexes()'s comma-joined 'columns' field — raw,…, Emits DEFAULT <val> unquoted only when *val* itself parses as a number — not,…, Issue #114: DbService.get_indexes()'s 'columns' field is a raw, unquoted,… (+5 more)
+Cohesion: 0.18
+Nodes (6): _is_remote_connection(), Background, best-effort fetch of the remote entitlement override…, True for connections where establishing db_service.connect() is slow enough…, EntitlementConfigFetcher, QThread, Runs a single HTTP GET on a worker thread; emits config_loaded only on success.…
 
 ### Community 80 - "Performance Metrics"
-Cohesion: 0.17
-Nodes (14): Calling it repeatedly (every MainWindow construction in tests that build a real…, test_active_tasks_tracks_started_and_finished(), test_start_suspend_watchdog_is_idempotent(), test_task_finished_without_started_does_not_go_negative(), Regression guard for issue #171: no in-flight background-operation indicator…, test_refresh_shows_background_task_count(), active_tasks(), In-process runtime performance registry (issue #43). Shared by every live… (+6 more)
+Cohesion: 0.28
+Nodes (9): test_active_tasks_tracks_started_and_finished(), test_task_finished_without_started_does_not_go_negative(), Regression guard for issue #171: no in-flight background-operation indicator…, test_refresh_shows_background_task_count(), active_tasks(), Mark one background operation of *name* (e.g. "schema_fetch", "export") as…, name -> count of currently in-flight operations, omitting any name whose count…, task_finished() (+1 more)
 
 ### Community 81 - "Sql Completer Schema Awareness Tests"
 Cohesion: 0.29
 Nodes (14): _find(), _make_completer(), Tests for the richer schema payload SqlCompleter.set_schema() now accepts…, A real SqlCompleter over a throwaway editor, schema pre-loaded with…, test_column_suggestion_carries_type_badge(), test_fk_aware_join_on_suggestion_uses_real_fk_relationship(), test_fk_join_suggestion_absent_without_matching_relationship(), test_foreign_key_column_is_flagged_fk() (+6 more)
 
 ### Community 82 - "Column Selection Dialog"
-Cohesion: 0.14
-Nodes (9): ColumnSelectionDialog, QDialog, Lets the user pick which columns to include before exporting (issue #142's…, _ClickableRow, A QWidget that behaves like a button for the schema sidebar's category rows…, QDialog, QueryAnalyzerDialog, Consolidated entry point: Cost & Profile + Compare Queries tabs. (+1 more)
+Cohesion: 0.33
+Nodes (3): ColumnSelectionDialog, QDialog, Lets the user pick which columns to include before exporting (issue #142's…
 
 ### Community 83 - "Dangerous Query Guard"
 Cohesion: 0.28
 Nodes (14): _env_badge_label(), _header_row(), mock_data_generation_allowed(), QLabel, Query guard dialogs — shown before a write reaches the database when the…, Informational hard block, same visual shape as show_read_only_blocked — used…, Gate for the whole Mock Data Generation flow (issue #77) — called before the…, Informational only — this connection is read-only, nothing to confirm. (+6 more)
 
 ### Community 84 - "SQL Tab Multi-Result Display"
-Cohesion: 0.15
-Nodes (8): DataFrame, Show multiple SELECT results as a horizontal tab bar above the grid., Restore the splitter to its pre-collapse size once a real result grid is being…, Display a SQL error as a structured card — title, message, best- effort…, Import data from CSV, JSON, or Excel files, Update column options in all filter rows, Best-effort (line, column) — both 1-indexed — of the error within *query*, or…, _sql_error_location()
+Cohesion: 0.10
+Nodes (12): DataFrame, Show multiple SELECT results as a horizontal tab bar above the grid., Helper: show text in the status_label (QPlainTextEdit), sized to fit the text's…, Row count and query time live only in the bottom status bar — no text/icon row…, Shrink the splitter's bottom pane to just fit the status line, giving the…, Restore the splitter to its pre-collapse size once a real result grid is being…, Display a SQL error as a structured card — title, message, best- effort…, Show a neutral 'query cancelled' status. (+4 more)
 
 ### Community 85 - "Self Updater"
-Cohesion: 0.19
-Nodes (7): QThread, Downloads, verifies, and installs a QForge update DMG in place over the running…, Downloads the release DMG, verifies it against the published SHA256SUMS.txt,…, UpdateInstaller, Ed25519 signature verification for release SHA256SUMS.txt (issue #113). SHA256…, True iff signature_b64 (base64-encoded ed25519 signature) validates against…, verify_signature()
+Cohesion: 0.33
+Nodes (3): QThread, Downloads the release DMG, verifies it against the published SHA256SUMS.txt,…, UpdateInstaller
 
 ### Community 86 - "Editable Grid Header & Theming"
 Cohesion: 0.18
@@ -576,31 +580,27 @@ Nodes (8): _FakeResponse, _mock_urlopen(), test_activate_online_network_failure_
 
 ### Community 89 - "Database Management (Create/Drop)"
 Cohesion: 0.16
-Nodes (7): Blocking DB-list fetch used by refresh/create/drop-database flows. Returns True…, Issue #138: previously ran _load_databases() with no visual feedback at all — a…, Slide-in notification from the right when a background query finishes., QWidget, Non-blocking slide-in notification, for status that shouldn't interrupt the…, Slide a small notification in from the bottom-right corner of *parent* and back…, show_toast()
-
-### Community 90 - "Editable Grid Composite Undo"
-Cohesion: 0.18
-Nodes (4): _CompositeCommand, Physically remove *row* (undo of a row insert) and shift every row-indexed…, Renumber every row index this widget tracks — the dirty-state sets, the cell…, Groups several commands (e.g. a paste or a multi-row duplicate) into one…
+Nodes (7): Blocking DB-list fetch used by refresh/create/drop-database flows.         Retur, Issue #138: previously ran _load_databases() with no visual         feedback at, Slide-in notification from the right when a background query finishes., QWidget, Non-blocking slide-in notification, for status that shouldn't interrupt the…, Slide a small notification in from the bottom-right corner of *parent* and back…, show_toast()
 
 ### Community 91 - "Editable Grid Filtering & Load"
 Cohesion: 0.14
 Nodes (7): DataFrame, Sort the currently displayed data by the clicked column (client-side)., Check if there are any uncommitted changes, Load data from DataFrame, Display dataframe in the table, Apply filter to a specific column, Apply all active column filters
 
 ### Community 92 - "Updater"
-Cohesion: 0.15
-Nodes (10): EntitlementConfigFetcher, QThread, Background fetch of the remote entitlement-config override — mirrors…, Runs a single HTTP GET on a worker thread; emits config_loaded only on success.…, QThread, Background update checker — hits GitHub releases API, emits a signal when a…, v1.2.3' or '1.2.3' → (1, 2, 3), Runs a single HTTP request on a worker thread; never blocks the UI. (+2 more)
+Cohesion: 0.29
+Nodes (5): QThread, v1.2.3' or '1.2.3' → (1, 2, 3), Runs a single HTTP request on a worker thread; never blocks the UI., UpdateChecker, _vtuple()
 
 ### Community 93 - "ER Diagram Relationship Curves"
-Cohesion: 0.22
-Nodes (10): QGraphicsPathItem, QPainterPath, QPointF, _append_cardinality_marks(), _build_curved_path(), _curve_crosses_obstacles(), Cubic-bezier connector, bowed perpendicular to the straight line so it reads…, Appends a crow's-foot ("many") or a single tick ("one") to *path* at endpoint… (+2 more)
+Cohesion: 0.33
+Nodes (10): _bracket_spans(), Tests for CodeEditor's matching-bracket highlight (issue #208) — the class…, (start, end) pairs for every non-full-width (i.e. bracket) selection., CodeEditor's line-highlight selection (full-width, no visible text span) must…, _selections_at(), test_bracket_inside_string_literal_is_ignored(), test_cursor_away_from_any_bracket_has_no_bracket_selection(), test_matched_pair_highlights_both_brackets() (+2 more)
 
 ### Community 94 - "Schema Diff Tests"
-Cohesion: 0.42
-Nodes (12): build_schema_diff(), Connect to *source_config* then *target_config* (each its own dedicated…, _make_sqlite_config(), Tests for the schema-compare diff model (issue #68) — pure data, no UI., _run(), test_added_and_removed_tables(), test_added_removed_and_modified_columns(), test_foreign_key_added_and_removed() (+4 more)
+Cohesion: 0.22
+Nodes (6): test_xml_writer_escapes_special_characters(), test_xml_writer_wraps_rows_in_table_root(), _cell_str(), Incrementally writes `<row><col>value</col>...</row>` elements to an open text…, _xml_escape(), XmlRowStreamWriter
 
 ### Community 95 - "Schema Migration SQL Generation"
-Cohesion: 0.22
-Nodes (12): Count only — kept for existing callers/tests. The names themselves are what the…, SchemaDiff, _diff_for_table(), generate_migration_sql(), DDL, as one string, that transforms *target* toward *source*. table_name: if…, A SchemaDiff containing only *table_name*'s change, whichever bucket it's in —…, _make_sqlite_config(), _run() (+4 more)
+Cohesion: 0.29
+Nodes (8): Structured error dialog for failed grid edits (issue #143). Replaces…, *failures*: list of {"kind": "DELETE"/"UPDATE"/"INSERT", "sql": str, "error":…, show_save_errors(), SQL error classification (issue #178, extended for #143). Turns a raw driver…, Return a short actionable hint for a SQL error message, or empty string., Best-effort short title for an error badge/heading, e.g. 'SQL Syntax Error…, sql_error_hint(), sql_error_title()
 
 ### Community 96 - "Db Service Select Db Tests"
 Cohesion: 0.23
@@ -615,8 +615,8 @@ Cohesion: 0.21
 Nodes (6): QColor, Show a status pill next to the buttons that clears itself after a few seconds…, Tint the selected connection tree item with the given color., Whether the app's active theme is dark. The status/field tint colors below need…, Turn all connection form fields green (success) or red (failure) like TablePlus., (background, text, border) hex colors for a normalized environment key (see…
 
 ### Community 99 - "Connection Panel Tab Actions"
-Cohesion: 0.15
-Nodes (5): Execute inline-edit SQL statements against the live connection., Return unique {{param}} names found in *query*, in order of appearance., If *query* contains {{params}}, show an inline dialog and substitute. Returns…, Execute the SQL in `tab` on a background thread; Cancel actually stops it.…, Handler for the tab's Begin/Commit/Rollback buttons — runs *stmt* through the…
+Cohesion: 0.20
+Nodes (4): QDialog, Return unique {{param}} names found in *query*, in order of appearance., If *query* contains {{params}}, show an inline dialog and substitute.         Re, Read-only popup showing a function/procedure's CREATE statement         (issue:
 
 ### Community 100 - "Table View Sort & Save"
 Cohesion: 0.15
@@ -643,8 +643,8 @@ Cohesion: 0.23
 Nodes (7): _FlakyDbService, Regression tests for issue #176 — a TableViewWidget created before the…, Fails every execute_query() call until connected=True — simulates a…, test_connection_panel_reloads_only_the_errored_tabs(), test_reload_if_errored_is_a_noop_for_an_already_loaded_tab(), test_reload_if_errored_retries_and_recovers_once_connected(), test_tab_created_before_connect_starts_in_error_state()
 
 ### Community 106 - "Export Worker (DOT/SQL)"
-Cohesion: 0.32
-Nodes (6): _ExportWorker, _open_export_file(), QObject, Sanitize a table name before using it as a zip member filename (issue #163).…, Runs export_database()/_export_table()'s write loop on a QThread (issue #158),…, _safe_zip_entry_name()
+Cohesion: 0.36
+Nodes (5): _ExportWorker, _open_export_file(), Sanitize a table name before using it as a zip member filename     (issue #163)., Runs export_database()/_export_table()'s write loop on a QThread     (issue #158, _safe_zip_entry_name()
 
 ### Community 107 - "SQL Go-to-Definition"
 Cohesion: 0.20
@@ -656,11 +656,11 @@ Nodes (7): parametrize, _FakeHealthSignal, _PanelStub, Tests for issue #178's Co
 
 ### Community 109 - "Connection Panel Focus Restore Tests"
 Cohesion: 0.29
-Nodes (8): _panel_with_tabs(), _PanelStub, Regression test for issue #149 — session restore left focus on the last…, Just enough of ConnectionPanel for focus_first_tab() to operate on — avoids…, test_focus_first_tab_focuses_tab_zeros_editor_not_the_last_ones(), test_focus_first_tab_is_a_noop_on_an_empty_panel(), test_focus_first_tab_makes_tab_zero_current_after_restore_loop(), Make tab 0 the active tab and focus its editor. Call once after all of a…
+Nodes (8): _panel_with_tabs(), _PanelStub, Regression test for issue #149 — session restore left focus on the last…, Just enough of ConnectionPanel for focus_first_tab() to operate on — avoids…, test_focus_first_tab_focuses_tab_zeros_editor_not_the_last_ones(), test_focus_first_tab_is_a_noop_on_an_empty_panel(), test_focus_first_tab_makes_tab_zero_current_after_restore_loop(), Make tab 0 the active tab and focus its editor. Call once after         all of a
 
 ### Community 110 - "DataFrame Export"
-Cohesion: 0.22
-Nodes (9): Issue #115: export_dataframe()'s CSV/XLSX paths go through…, test_guarded_for_spreadsheet_neutralizes_string_cells_only(), _cell_str(), _csv_formula_guard(), _guarded_for_spreadsheet(), DataFrame, Shared CSV/JSON/Excel/SQL export helper for pandas DataFrames., Copy of *df* with every string cell passed through _csv_formula_guard (issue… (+1 more)
+Cohesion: 0.21
+Nodes (13): Regression for issue #162: an embedded backtick/quote in a table/column name…, Issue #115: export_dataframe()'s CSV/XLSX paths go through…, test_drop_table_statement_quotes_per_dialect(), test_guarded_for_spreadsheet_neutralizes_string_cells_only(), test_quote_identifier_escapes_embedded_quote_char_per_dialect(), test_sql_value_literal_blob_as_hex_false_falls_back_to_null(), test_sql_value_literal_hex_encodes_blobs_per_dialect(), test_sql_value_literal_leaves_numbers_unquoted() (+5 more)
 
 ### Community 111 - "Table View Widget Suspend Guard Tests"
 Cohesion: 0.24
@@ -669,6 +669,10 @@ Nodes (7): test_counter_get_unknown_name_returns_empty_dict(), _FakeDbService, R
 ### Community 112 - "Connection Dialog Save & Connect"
 Cohesion: 0.22
 Nodes (4): Return the currently selected connection QTreeWidgetItem, or None., Record a just-submitted form's password(s) as this session's known value for…, Return the typed group name — free text; any name not matching an existing…, require_name=False for actions that don't persist the connection (test, one-off…
+
+### Community 113 - "Saved Queries & History Filtering"
+Cohesion: 0.18
+Nodes (4): QListWidgetItem, QListWidgetItem, QWidget, Return the current tab if it's a SQL editor, else the most         recently open
 
 ### Community 114 - "SSH Key Auth Compatibility Shim"
 Cohesion: 0.33
@@ -695,8 +699,8 @@ Cohesion: 0.27
 Nodes (5): FakeDbService, TableViewWidget.load_table_data() must pass the table's real primary key(s) to…, test_declared_primary_key_is_applied_to_data_table(), test_no_primary_key_leaves_data_table_with_empty_list(), test_primary_keys_fetched_once_and_reused_across_page_loads()
 
 ### Community 120 - "Schema Diff Engine"
-Cohesion: 0.33
-Nodes (8): _diff_columns(), _diff_foreign_keys(), _diff_indexes(), _diff_table(), _fetch_side(), ForeignKeyDiff, Build a read-only structural diff between two database schemas (issue #68).…, Returns {table_name: (columns_by_name, indexes, foreign_keys)}.
+Cohesion: 0.24
+Nodes (5): QColor, Apply the correct colour to every cell in *row* based on its state., Legacy helper — delegates to _repaint_row when state is already set., row was toggled into/out of the pending-deletion set., _RowDeleteMarkCommand
 
 ### Community 121 - "PostgreSQL Durability Tests"
 Cohesion: 0.22
@@ -719,8 +723,8 @@ Cohesion: 0.22
 Nodes (3): Reset form fields to default stylesheet., Load connection form when a connection item (not a group) is clicked., Walk the tree and select the item whose UserRole data equals idx.
 
 ### Community 126 - "Editable Grid Row Export"
-Cohesion: 0.22
-Nodes (5): Export visible table data to CSV / JSON / Excel / SQL — despite the name, this…, Export only the currently-selected rows (issue #123). Reads from the same typed…, Export data in multiple formats: CSV, JSON, Excel, SQL, export_dataframe(), Prompt for a save file and export `df` as CSV/JSON/Excel/SQL. Shows an…
+Cohesion: 0.25
+Nodes (4): Close the connection panel at *index*. No confirmation unless one of its tabs…, Close all connection tabs except the one at *keep_index*., Cmd+W: close current content tab; if that was the last tab for this connection,…, Right-click menu on a connection tab.
 
 ### Community 127 - "Licensing Client"
 Cohesion: 0.32
@@ -735,8 +739,8 @@ Cohesion: 0.25
 Nodes (4): db(), fixture, Tests for DbService.stream_table_rows() (issue #158): reads a table via…, test_stream_table_rows_requires_connection()
 
 ### Community 130 - "SQL Completer Item Rendering"
-Cohesion: 0.29
-Nodes (4): QStyledItemDelegate, sql_completer.py — Professional context-aware SQL autocomplete…, Paints each row: bold-highlighted prefix on the left, type badge on the right., SuggestionDelegate
+Cohesion: 0.22
+Nodes (3): Physically remove *row* (undo of a row insert) and shift every row-indexed…, Renumber every row index this widget tracks — the dirty-state sets, the cell…, _shift_row()
 
 ### Community 131 - "Table View Reload & Pagination"
 Cohesion: 0.29
@@ -763,8 +767,12 @@ Cohesion: 0.53
 Nodes (5): SqlTab's editable query-result grid must also key UPDATE/DELETE off the real…, _tab_with_schema(), test_no_table_name_leaves_primary_keys_empty(), test_result_grid_gets_real_primary_key_on_load(), test_result_grid_update_sql_keys_off_primary_key_not_column_zero()
 
 ### Community 139 - "Sql Tab Escape Dismisses Popup Tests"
-Cohesion: 0.40
-Nodes (4): Regression test for issue #152 — pressing Esc while the autocomplete popup was…, The pre-existing esc_shortcut -> hide_filter() behavior (for the table-view…, test_escape_hides_popup_when_visible(), test_escape_still_hides_filter_panel_when_popup_not_visible()
+Cohesion: 0.50
+Nodes (4): infer_generator(), Normalize a raw `get_columns()` `Type` string (MySQL/Postgres spellings differ)…, Default generator for a column, from its name and `get_columns()` type string.…, _type_bucket()
+
+### Community 141 - "Query Cost Status Badge"
+Cohesion: 0.50
+Nodes (4): Calling it repeatedly (every MainWindow construction in tests that build a real…, test_start_suspend_watchdog_is_idempotent(), Idempotent — safe to call from multiple entry points. Spawns a daemon thread…, start_suspend_watchdog()
 
 ### Community 143 - "Memory"
 Cohesion: 0.50
@@ -789,19 +797,19 @@ Nodes (3): Docker Compose Test Fixtures, Tests Workflow (CI), Tests README
 ## Knowledge Gaps
 - **33 isolated node(s):** `1. Pricing`, `2. Investment to build the launch pieces`, `3. Apple Developer ID + notarization timeline`, `Read-only mode`, `Control a transaction` (+28 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **39 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **37 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
 - **What is the exact relationship between `Keyring-Only Credential Storage` and `Secure Credential Storage Memory`?**
   _Edge tagged AMBIGUOUS (relation: conceptually_related_to) - confidence is low._
-- **Why does `DbService` connect `Database Service Core` to `PostgreSQL Test Fixtures`, `Stream Table Rows Tests`, `Db Service Sqlite Tests`, `Schema Compare Dialog`, `Schema Snapshot Tests`, `Main Window Core`, `Connection Panel Core`, `Benchmark Harness`, `PostgreSQL Integration Tests`, `Query Cost Tests`, `Data Compare Dialog`, `Data Diff Engine`, `Theme Manager`, `Query Verifier`, `Database Query Execution`, `Upgrade to Pro Dialog`, `Onboarding`, `Query Analyzer Compare Tab`, `Export Worker Tests`, `Query Analyzer Profile Sections`, `ER Diagram Model`, `Query Analyzer Cost Estimate Tab`, `Connection Dialog Core Actions`, `Schema Diff Data Model`, `Database & Table Export`, `Schema Migration`, `Column Selection Dialog`, `Schema Diff Tests`, `Schema Migration SQL Generation`, `Db Service Select Db Tests`, `Connection Dialog Status Feedback`, `Connection Panel Tab Actions`, `Database Transaction Control`, `Database Connection Setup`, `Export Worker (DOT/SQL)`, `SSH Key Auth Compatibility Shim`, `Schema Diff Engine`, `PostgreSQL Durability Tests`, `Generated Columns Tests`?**
-  _High betweenness centrality (0.280) - this node is a cross-community bridge._
-- **Why does `SqlTab` connect `SQL Tab Toolbar & Dialogs` to `SQL Code Editor`, `Sql Tab Result Primary Keys Tests`, `Main Window Core`, `Sql Tab Escape Dismisses Popup Tests`, `Connection Panel Core`, `Query Cost Status Badge`, `Editable Grid PK Tests`, `SQL Result Diff Highlighting`, `SQL Tab Theming`, `Table View Streaming Load`, `Theme Manager`, `SQL Tab Save Shortcut`, `SQL Tab Query Extraction`, `Upgrade to Pro Dialog`, `SQL Completer Core Engine`, `Code Editor Find & Replace`, `Onboarding`, `Query Library Dialog`, `Connection Panel Tab Management`, `Run All Statements Tests`, `Connection Panel Query Navigation Tests`, `Sql Tab Result Viewer 178 Tests`, `SQL Snippet Manager`, `Code Editor Input Handling`, `SQL Tab Result Grid Paging`, `Column Selection Dialog`, `SQL Tab Multi-Result Display`, `Export Worker (DOT/SQL)`, `SQL Go-to-Definition`, `Connection Panel Status Bar 178 Tests`, `Connection Panel Focus Restore Tests`, `Sql Tab Go To Definition Tests`, `Sql Tab Quick Fixes Tests`, `Sql Tab Status Banner Tests`, `Editable Grid Row Export`?**
+- **Why does `DbService` connect `Database Service Core` to `PostgreSQL Test Fixtures`, `Stream Table Rows Tests`, `Db Service Sqlite Tests`, `Schema Compare Dialog`, `Schema Snapshot Tests`, `Main Window Core`, `Connection Panel Core`, `Benchmark Harness`, `PostgreSQL Integration Tests`, `Query Cost Tests`, `Data Compare Dialog`, `Data Diff Engine`, `Theme Manager`, `Query Verifier`, `Database Query Execution`, `Upgrade to Pro Dialog`, `Query History`, `Query Analyzer Compare Tab`, `Export Worker Tests`, `ER Diagram Model`, `Connection Panel Tab Management`, `Query Analyzer Cost Estimate Tab`, `Connection Dialog Core Actions`, `Schema Diff Data Model`, `SQL Snippet Manager`, `Database & Table Export`, `Schema Migration`, `Db Service Select Db Tests`, `Connection Dialog Status Feedback`, `Database Transaction Control`, `Database Connection Setup`, `Export Worker (DOT/SQL)`, `PostgreSQL Durability Tests`, `Generated Columns Tests`?**
+  _High betweenness centrality (0.258) - this node is a cross-community bridge._
+- **Why does `SqlTab` connect `SQL Tab Toolbar & Dialogs` to `SQL Code Editor`, `Sql Tab Result Primary Keys Tests`, `Main Window Core`, `Connection Panel Core`, `SQL Tab Theming`, `Editable Grid PK Tests`, `Table View Streaming Load`, `Connection Dialog UI Layout`, `Theme Manager`, `SQL Tab Query Extraction`, `Upgrade to Pro Dialog`, `SQL Completer Core Engine`, `Code Editor Find & Replace`, `Query History`, `Query Library Dialog`, `Connection Panel Tab Management`, `Run All Statements Tests`, `Sql Tab Result Viewer 178 Tests`, `SQL Snippet Manager`, `Code Editor Input Handling`, `Table Structure Panels`, `SQL Tab Result Grid Paging`, `SQL Tab Multi-Result Display`, `Export Worker (DOT/SQL)`, `SQL Go-to-Definition`, `Connection Panel Status Bar 178 Tests`, `Connection Panel Focus Restore Tests`, `Sql Tab Go To Definition Tests`, `Sql Tab Quick Fixes Tests`, `Sql Tab Status Banner Tests`?**
   _High betweenness centrality (0.203) - this node is a cross-community bridge._
-- **Why does `ConnectionPanel` connect `Connection Panel Core` to `Schema Compare Dialog`, `Export Scope Dialog Tests`, `SQL Tab Toolbar & Dialogs`, `Database Service Core`, `Main Window Core`, `Table View Streaming Load`, `Connection Dialog UI Layout`, `Data Compare Dialog`, `Theme Manager`, `ER Diagram Dialog Core`, `Upgrade to Pro Dialog`, `Mock Data Dialog`, `Query History`, `Onboarding`, `Query Library Dialog`, `Table Context Menu Actions`, `Saved Queries`, `Table Structure Editor`, `Quick Search`, `Df Export Tests`, `Database Switcher`, `Connection Panel Tab Management`, `Connection Panel Query Lifecycle`, `Row Stream Writers Tests`, `Run All Statements Tests`, `Connection Panel Query Navigation Tests`, `Connection Dialog Core Actions`, `Connection Panel Schema Loading`, `Ddl Toggles Tests`, `SQL Snippet Manager`, `Query History Dialog`, `Database & Table Export`, `Schema Migration`, `Column Selection Dialog`, `Database Management (Create/Drop)`, `Connection Panel Tab Actions`, `Table View Reconnect Reload Tests`, `Connection Panel Status Bar 178 Tests`, `Connection Panel Focus Restore Tests`, `Saved Queries & History Filtering`, `Editable Grid Row Export`?**
-  _High betweenness centrality (0.141) - this node is a cross-community bridge._
+- **Why does `ConnectionPanel` connect `Connection Panel Core` to `Schema Compare Dialog`, `Export Scope Dialog Tests`, `SQL Tab Toolbar & Dialogs`, `Database Service Core`, `Main Window Core`, `Table View Streaming Load`, `Connection Dialog UI Layout`, `Data Compare Dialog`, `Theme Manager`, `Query Verifier`, `ER Diagram Dialog Core`, `Mock Data Dialog`, `Query History`, `Query Library Dialog`, `Table Context Menu Actions`, `Saved Queries`, `Table Structure Editor`, `ER Diagram View & Minimap`, `Quick Search`, `Query Analyzer Profile Sections`, `Df Export Tests`, `Database Switcher`, `Connection Panel Tab Management`, `Connection Panel Query Lifecycle`, `Row Stream Writers Tests`, `Run All Statements Tests`, `License Activation Dialog`, `Connection Dialog Core Actions`, `Connection Panel Schema Loading`, `Schema Diff Data Model`, `SQL Snippet Manager`, `Query History Dialog`, `Database & Table Export`, `Schema Migration`, `Column Selection Dialog`, `Database Management (Create/Drop)`, `Schema Diff Tests`, `Connection Panel Tab Actions`, `Table View Reconnect Reload Tests`, `Connection Panel Status Bar 178 Tests`, `Connection Panel Focus Restore Tests`, `Saved Queries & History Filtering`?**
+  _High betweenness centrality (0.148) - this node is a cross-community bridge._
 - **Are the 34 inferred relationships involving `ConnectionPanel` (e.g. with `MainWindow` and `_PanelStub`) actually correct?**
   _`ConnectionPanel` has 34 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 35 inferred relationships involving `DbService` (e.g. with `MainWindow` and `DataDiff`) actually correct?**
