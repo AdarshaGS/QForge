@@ -1,9 +1,19 @@
-"""Regression tests for Run's default multi-statement behavior: with no
-text selected, Run always executes every statement in the editor (not just
-the one the cursor happens to sit in) — a user with a 10-statement UPDATE
-script previously saw only one row change because plain Run resolved to
-just the cursor's statement. Selecting text still runs only that selection,
-so a single statement can still be executed manually.
+"""Regression tests for Run's statement-scoping behavior.
+
+History: Run originally scoped to the statement at the cursor. A user with
+a 10-statement UPDATE script got confused when only one row changed,
+because plain Run silently resolved to just the cursor's statement — so
+Run's no-selection default was changed to "run everything." That in turn
+broke the opposite, equally valid case: a SELECT followed by an UPDATE,
+cursor on the UPDATE, Run firing both instead of just the one the user was
+looking at (issue reported 2026-09-03).
+
+Resolution: plain Run (no selection) is cursor-scoped again — matching
+DataGrip/DBeaver/TablePlus convention, see SqlTab.get_query() — and
+"run everything" becomes its own explicit action (Ctrl+Shift+Return /
+Database menu "Run All Statements" / ConnectionPanel.run_all_statements(),
+threaded through _run_query_in_tab's `run_all=True`) instead of a silent
+fallback, so neither case is ambiguous anymore.
 
 Follows the existing _PanelStub pattern (see
 tests/test_connection_panel_query_navigation.py) rather than constructing a
@@ -59,11 +69,43 @@ def _tab_with_cursor_in_first_statement():
     return tab
 
 
-def test_run_with_no_selection_sends_every_statement_regardless_of_cursor():
+def test_run_with_no_selection_sends_only_the_cursors_statement():
     tab = _tab_with_cursor_in_first_statement()
     panel = _PanelStub()
 
     ConnectionPanel._run_query_in_tab(panel, tab)
+
+    assert len(panel.guard_calls) == 1
+    sent = panel.guard_calls[0]
+    assert "UPDATE a" in sent
+    assert "UPDATE b" not in sent
+    assert "UPDATE c" not in sent
+
+
+def test_run_with_cursor_on_the_second_of_two_statements_sends_only_that_one():
+    # The reported case: a SELECT followed by an UPDATE, cursor on the
+    # UPDATE — plain Run must fire only the UPDATE, not both.
+    tab = SqlTab()
+    tab.editor.setPlainText("SELECT *\nFROM organisations;\n\n"
+                             "UPDATE audit_logs\nSET organisation_id = 2\nWHERE id = 3;")
+    cursor = tab.editor.textCursor()
+    cursor.setPosition(tab.editor.toPlainText().index("UPDATE") + 3)
+    tab.editor.setTextCursor(cursor)
+
+    panel = _PanelStub()
+    ConnectionPanel._run_query_in_tab(panel, tab)
+
+    assert len(panel.guard_calls) == 1
+    sent = panel.guard_calls[0]
+    assert "UPDATE audit_logs" in sent
+    assert "SELECT" not in sent
+
+
+def test_run_all_sends_every_statement_regardless_of_cursor():
+    tab = _tab_with_cursor_in_first_statement()
+    panel = _PanelStub()
+
+    ConnectionPanel._run_query_in_tab(panel, tab, run_all=True)
 
     assert len(panel.guard_calls) == 1
     sent = panel.guard_calls[0]
@@ -131,7 +173,7 @@ def test_multi_done_shows_a_tab_per_write_statement_not_just_selects():
     tab._last_query = "UPDATE a SET x=1; UPDATE b SET x=2;"
     panel = _MultiDonePanelStub()
 
-    results = [("UPDATE a SET x=1;", 3), ("UPDATE b SET x=2;", 5)]
+    results = [("UPDATE a SET x=1;", 3, None), ("UPDATE b SET x=2;", 5, None)]
     ConnectionPanel._on_query_multi_done(panel, tab, results, 0.01)
 
     assert tab._multi_result_bar.count() == 2
@@ -146,7 +188,7 @@ def test_multi_done_mixes_selects_writes_and_errors_in_their_own_tabs():
 
     df = pd.DataFrame({"n": [1]})
     err = ValueError("no such table: missing")
-    results = [("SELECT 1;", df), ("UPDATE a SET x=1;", 2), ("SELECT * FROM missing;", err)]
+    results = [("SELECT 1;", df, None), ("UPDATE a SET x=1;", 2, None), ("SELECT * FROM missing;", err, None)]
     ConnectionPanel._on_query_multi_done(panel, tab, results, 0.02)
 
     assert tab._multi_result_bar.count() == 3

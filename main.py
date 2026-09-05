@@ -937,6 +937,12 @@ class MainWindow(QMainWindow):
             lambda: self._current_panel() and self._current_panel().open_query_analyzer()
         )
 
+        act = db_menu.addAction("Run All Statements")
+        act.setShortcut("Ctrl+Shift+Return")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().run_all_statements()
+        )
+
         db_menu.addSeparator()
 
         act = db_menu.addAction("Create Database…")

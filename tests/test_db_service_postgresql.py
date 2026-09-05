@@ -307,21 +307,25 @@ def test_execute_multi_query_runs_all_statements(db):
     script = "SELECT * FROM users ORDER BY id; UPDATE users SET name = 'Zed' WHERE id = 1;"
     results = db.execute_multi_query(script)
     assert len(results) == 2
-    label1, df1 = results[0]
-    label2, affected = results[1]
+    label1, df1, cost1 = results[0]
+    label2, affected, cost2 = results[1]
     assert list(df1["name"]) == ["Alice", "Bob"]
     assert affected == 1  # UPDATE affected 1 row, no result set
     assert db.execute_query("SELECT name FROM users WHERE id = 1").iloc[0]["name"] == "Zed"
+    assert cost1 is not None and cost1.error == ""  # SELECT gets a plan-only estimate
+    assert cost2 is None  # writes never get one
 
 
 def test_execute_multi_query_continues_after_a_statement_error(db):
     script = "SELECT * FROM does_not_exist; SELECT * FROM users ORDER BY id;"
     results = db.execute_multi_query(script)
     assert len(results) == 2
-    _, first_result = results[0]
-    _, second_result = results[1]
+    _, first_result, first_cost = results[0]
+    _, second_result, second_cost = results[1]
     assert isinstance(first_result, Exception)
+    assert first_cost is None  # the SELECT itself failed — nothing to estimate
     assert list(second_result["name"]) == ["Alice", "Bob"]
+    assert second_cost is not None and second_cost.error == ""
 
 
 # ─── Transactions ────────────────────────────────────────────────────────

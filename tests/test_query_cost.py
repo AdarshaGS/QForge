@@ -27,10 +27,18 @@ def test_analyze_sql_text_flags_select_star():
 
 def test_score_issues_sums_severity_weights():
     issues = [
+        query_cost.Issue("MEDIUM", "X", "m", "s"),
+        query_cost.Issue("LOW", "Y", "m", "s"),
+    ]
+    assert query_cost.score_issues(issues) == 25
+
+
+def test_score_issues_caps_at_100():
+    issues = [
         query_cost.Issue("CRITICAL", "X", "m", "s"),
         query_cost.Issue("LOW", "Y", "m", "s"),
     ]
-    assert query_cost.score_issues(issues) == 105
+    assert query_cost.score_issues(issues) == 100
 
 
 def test_label_for_picks_worst_issue():
@@ -84,6 +92,114 @@ def test_mysql_indexed_lookup_has_no_scan_issue():
     }]
     issues = query_cost.analyze_explain_rows(rows, "SELECT id FROM orders WHERE id = 1")
     assert not any(i.code == "FULL_TABLE_SCAN" for i in issues)
+
+
+# ===========================================================================
+# MySQL — full-scan severity must be contextual, not "type=ALL == CRITICAL"
+# ===========================================================================
+
+def _full_scan_row(table="t", rows=38, possible_keys=None, filtered=100):
+    return [{
+        "id": 1, "select_type": "SIMPLE", "table": table, "type": "ALL",
+        "possible_keys": possible_keys, "key": None, "Extra": "", "rows": rows,
+        "filtered": filtered,
+    }]
+
+
+def test_full_scan_of_small_table_is_low_severity_with_no_index_recommendation():
+    rows = _full_scan_row("audit_logs", rows=38)
+    issues = query_cost.analyze_explain_rows(rows, "SELECT * FROM audit_logs;")
+    scan = next(i for i in issues if i.code == "FULL_TABLE_SCAN")
+    assert scan.severity in ("INFO", "LOW")
+    assert scan.suggestion == ""
+    assert query_cost.risk_level_for(issues) == "Low"
+
+
+def test_full_scan_no_where_clause_never_recommends_an_index_regardless_of_size():
+    # Reading the whole table is the only possible plan when there's
+    # nothing to filter on — an index can't help, even on a huge table.
+    rows = _full_scan_row("events", rows=5_000_000)
+    issues = query_cost.analyze_explain_rows(rows, "SELECT * FROM events;")
+    scan = next(i for i in issues if i.code == "FULL_TABLE_SCAN")
+    assert scan.suggestion == ""
+
+
+def test_full_scan_large_table_with_selective_filter_and_no_index_is_flagged_and_actionable():
+    rows = _full_scan_row("events", rows=250_000, possible_keys=None, filtered=2.5)
+    issues = query_cost.analyze_explain_rows(rows, "SELECT * FROM events WHERE status = 'pending';")
+    scan = next(i for i in issues if i.code == "FULL_TABLE_SCAN")
+    assert scan.severity in ("HIGH", "CRITICAL")
+    assert scan.suggestion != ""
+    assert "index" in scan.suggestion.lower()
+    assert query_cost.risk_level_for(issues) in ("High", "Critical")
+
+
+def test_full_scan_with_existing_index_candidate_not_recommended_again():
+    # possible_keys is populated (MySQL considered an index) even though
+    # type=ALL — recommending "add an index" here would be wrong since one
+    # already exists as a candidate.
+    rows = _full_scan_row("orders", rows=20_000, possible_keys="idx_status", filtered=80)
+    issues = query_cost.analyze_explain_rows(
+        rows, "SELECT * FROM orders WHERE status != 'archived';")
+    scan = next(i for i in issues if i.code == "FULL_TABLE_SCAN")
+    assert scan.suggestion == ""
+
+
+def test_full_scan_join_with_missing_index_on_joined_table_is_flagged():
+    rows = [
+        {"id": 1, "select_type": "SIMPLE", "table": "o", "type": "ref",
+         "possible_keys": "idx_customer", "key": "idx_customer", "Extra": "", "rows": 3,
+         "filtered": 100},
+        {"id": 1, "select_type": "SIMPLE", "table": "c", "type": "ALL",
+         "possible_keys": None, "key": None, "Extra": "Using where", "rows": 500_000,
+         "filtered": 10},
+    ]
+    sql = ("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id "
+           "WHERE c.region = 'EU';")
+    issues = query_cost.analyze_explain_rows(rows, sql)
+    scan = next(i for i in issues if i.code == "FULL_TABLE_SCAN")
+    assert scan.severity in ("HIGH", "CRITICAL")
+    assert "index" in scan.suggestion.lower()
+
+
+def test_filesort_and_temp_table_downgraded_on_tiny_result_sets():
+    rows = [{
+        "id": 1, "select_type": "SIMPLE", "table": "tags", "type": "ALL",
+        "possible_keys": None, "key": None, "Extra": "Using filesort", "rows": 50,
+        "filtered": 100,
+    }]
+    issues = query_cost.analyze_explain_rows(rows, "SELECT * FROM tags ORDER BY name;")
+    filesort = next(i for i in issues if i.code == "FILESORT")
+    assert filesort.severity in ("INFO", "LOW")
+    assert filesort.suggestion == ""
+
+
+def test_profile_full_scan_of_small_table_is_low_severity_not_critical():
+    # Run Profile (EXPLAIN ANALYZE) path — must apply the same contextual
+    # verdict as the plan-only path (Estimate Cost), not the old blanket
+    # "any table/full scan node = CRITICAL" rule.
+    tree_text = ("-> Table scan on audit_logs  (cost=4.05 rows=38) "
+                 "(actual time=0.010..0.020 rows=38 loops=1)\n")
+    root = query_cost.parse_mysql_analyze_tree(tree_text)
+    classic_rows = [{
+        "id": 1, "select_type": "SIMPLE", "table": "audit_logs", "type": "ALL",
+        "possible_keys": None, "key": None, "Extra": "", "rows": 38, "filtered": 100,
+    }]
+    query_cost._annotate_tree_from_explain_rows(root, classic_rows)
+    issues = query_cost.analyze_mysql_profile(root, "SELECT * FROM audit_logs")
+    scan = next(i for i in issues if i.code == "FULL_TABLE_SCAN")
+    assert scan.severity in ("INFO", "LOW")
+    assert scan.suggestion == ""
+    assert query_cost.risk_level_for(issues) == "Low"
+
+
+def test_score_issues_is_never_larger_than_100():
+    issues = [
+        query_cost.Issue("CRITICAL", "A", "m", "s"),
+        query_cost.Issue("CRITICAL", "B", "m", "s"),
+        query_cost.Issue("HIGH", "C", "m", "s"),
+    ]
+    assert query_cost.score_issues(issues) == 100
 
 
 # ===========================================================================
@@ -174,6 +290,110 @@ def test_postgres_index_scan_not_flagged():
     }
     issues = query_cost.analyze_postgres_plan(plan, "SELECT * FROM orders WHERE id = 1", has_actuals=False)
     assert not any(i.code == "SEQ_SCAN" for i in issues)
+
+
+# ===========================================================================
+# Plan comparison — diff_plan_trees() (#181: multi-operator Plan
+# Comparison in Compare Queries). Pure unit tests against hand-built
+# ProfileNode trees + Issue lists — no DB needed, dialect-agnostic by
+# design (the function only looks at ProfileNode/Issue shapes, not the
+# dialect that produced them).
+# ===========================================================================
+
+def _node(table, access_type="", children=None):
+    return query_cost.ProfileNode(
+        node_type=f"scan {table}", table=table, access_type=access_type,
+        children=children or [],
+    )
+
+
+def _estimate(tree, issues=None):
+    return query_cost.CostEstimate(
+        dialect="mysql", issues=issues or [], plan_tree=tree,
+    )
+
+
+def test_diff_plan_trees_empty_when_no_plan_tree():
+    est_no_tree = query_cost.CostEstimate(dialect="mysql", plan_tree=None)
+    est_with_tree = _estimate(_node("orders"))
+    assert query_cost.diff_plan_trees(est_no_tree, est_with_tree) == []
+    assert query_cost.diff_plan_trees(est_with_tree, est_no_tree) == []
+
+
+def test_diff_plan_trees_unchanged_table_is_omitted():
+    est1 = _estimate(_node("orders", "ref"))
+    est2 = _estimate(_node("orders", "ref"))
+    assert query_cost.diff_plan_trees(est1, est2) == []
+
+
+def test_diff_plan_trees_flags_regression_when_severity_worsens():
+    issue = query_cost.Issue("CRITICAL", "FULL_TABLE_SCAN", "Table `orders` is read with a full scan.", "")
+    est1 = _estimate(_node("orders", "ref"))
+    est2 = _estimate(_node("orders", "ALL"), issues=[issue])
+
+    deltas = query_cost.diff_plan_trees(est1, est2)
+    assert len(deltas) == 1
+    assert deltas[0].table == "orders"
+    assert deltas[0].status == "regression"
+    assert deltas[0].access_before == "ref"
+    assert deltas[0].access_after == "ALL"
+
+
+def test_diff_plan_trees_flags_improvement_when_severity_resolves():
+    issue = query_cost.Issue("CRITICAL", "FULL_TABLE_SCAN", "Table `orders` is read with a full scan.", "")
+    est1 = _estimate(_node("orders", "ALL"), issues=[issue])
+    est2 = _estimate(_node("orders", "ref"))
+
+    deltas = query_cost.diff_plan_trees(est1, est2)
+    assert len(deltas) == 1
+    assert deltas[0].status == "improvement"
+
+
+def test_diff_plan_trees_flags_neutral_change_when_severity_unchanged():
+    est1 = _estimate(_node("orders", "ref"))
+    est2 = _estimate(_node("orders", "eq_ref"))
+
+    deltas = query_cost.diff_plan_trees(est1, est2)
+    assert len(deltas) == 1
+    assert deltas[0].status == "changed"
+
+
+def test_diff_plan_trees_flags_added_and_removed_tables():
+    est1 = _estimate(_node("orders", "ref", children=[_node("users", "eq_ref")]))
+    est2 = _estimate(_node("orders", "ref"))
+
+    deltas = query_cost.diff_plan_trees(est1, est2)
+    assert len(deltas) == 1
+    assert deltas[0].table == "users"
+    assert deltas[0].status == "removed"
+
+    deltas_reversed = query_cost.diff_plan_trees(est2, est1)
+    assert len(deltas_reversed) == 1
+    assert deltas_reversed[0].status == "added"
+
+
+def test_diff_plan_trees_matches_postgres_style_issue_messages():
+    # PostgreSQL's issue messages don't use MySQL's "Table `t`" prefix
+    # (e.g. "Sequential scan on `orders` ...") — diff_plan_trees must still
+    # match the table via the backtick-quoted name, not a fixed prefix.
+    issue = query_cost.Issue("HIGH", "SEQ_SCAN", "Sequential scan on `orders` (~50,000 rows).", "")
+    est1 = _estimate(_node("orders", "Index Scan"))
+    est2 = _estimate(_node("orders", "Seq Scan"), issues=[issue])
+
+    deltas = query_cost.diff_plan_trees(est1, est2)
+    assert len(deltas) == 1
+    assert deltas[0].table == "orders"
+    assert deltas[0].status == "regression"
+
+
+def test_diff_plan_trees_query_wide_issue_without_table_is_not_attached():
+    # SELECT_STAR (and Postgres's Nested-Loop-count warning) name no
+    # table at all — must not be force-matched to an unrelated table.
+    issue = query_cost.Issue("LOW", "SELECT_STAR", "SELECT * fetches all columns, including unused ones.", "")
+    est1 = _estimate(_node("orders", "ref"))
+    est2 = _estimate(_node("orders", "ref"), issues=[issue])
+
+    assert query_cost.diff_plan_trees(est1, est2) == []
 
 
 # ===========================================================================

@@ -76,7 +76,7 @@ def test_use_saved_query_does_not_force_sidebar_back_to_schema():
 def test_use_history_item_does_not_force_sidebar_back_to_schema():
     panel, sql_tab, table_view = _panel_with_table_view_active_and_sql_tab_in_background()
     item = QListWidgetItem("SELECT 1")
-    item.setData(Qt.UserRole, "SELECT 1")
+    item.setData(Qt.UserRole, {"query": "SELECT 1"})
 
     ConnectionPanel._use_history_item(panel, item)
 

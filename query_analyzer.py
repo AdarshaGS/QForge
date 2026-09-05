@@ -241,7 +241,11 @@ def generate_optimized_sql(result: QueryResult) -> str:
             lines.append("")
 
     # ---- Index recommendations -----------------------------------------------
-    index_issues = [i for i in result.issues if i.code == "FULL_TABLE_SCAN"]
+    # Only issues that actually carry a suggestion are real recommendations —
+    # query_cost.py leaves `suggestion` empty for a full scan that isn't
+    # actionable (small table, no WHERE/JOIN condition, etc.), so this must
+    # not blindly key off the code alone.
+    index_issues = [i for i in result.issues if i.code == "FULL_TABLE_SCAN" and i.suggestion]
     if index_issues:
         lines.append("-- " + "-" * 72)
         lines.append("-- RECOMMENDED INDEXES (review before applying to production):")

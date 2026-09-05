@@ -22,6 +22,7 @@ import pandas as pd
 from sqlparse.engine.grouping import MAX_GROUPING_TOKENS
 from sqlparse.exceptions import SQLParseError
 
+from services import query_cost
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -106,6 +107,14 @@ class VerifyResult:
     explain_original: list = field(default_factory=list)    # list[ExplainRow]
     explain_optimised: list = field(default_factory=list)
 
+    # Plan-only cost estimates — a real plan tree + severity-classified
+    # issues for each side, richer than the flat ExplainRow lists above;
+    # used to render a real Plan Comparison instead of a raw
+    # EXPLAIN-rows-side-by-side dump. None when unavailable (e.g.
+    # unsupported dialect) — never a partially-fabricated estimate.
+    cost_original: Optional[query_cost.CostEstimate] = None
+    cost_optimised: Optional[query_cost.CostEstimate] = None
+
     # Timings
     elapsed_original: float = 0.0
     elapsed_optimised: float = 0.0
@@ -138,6 +147,16 @@ class QueryVerifier:
             # ── Run EXPLAIN (best-effort, non-fatal) ──────────────────────────
             result.explain_original  = self._run_explain(original_query)
             result.explain_optimised = self._run_explain(optimised_query)
+
+            # ── Plan-only cost estimate for each side (best-effort, non-fatal:
+            # estimate_cost() catches its own errors and returns a CostEstimate
+            # with .error set rather than raising) — feeds the tree-based Plan
+            # Comparison in the UI. Two more plan-only EXPLAINs on top of the
+            # bare ones above; never executes original_query/optimised_query.
+            db_type = getattr(self._db, "db_type", "")
+            if db_type in ("mysql", "postgresql"):
+                result.cost_original  = query_cost.estimate_cost(self._db, original_query)
+                result.cost_optimised = query_cost.estimate_cost(self._db, optimised_query)
 
             # ── Run both queries ──────────────────────────────────────────────
             logger.info("QueryVerifier: running original query…")

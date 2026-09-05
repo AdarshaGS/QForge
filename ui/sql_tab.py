@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QSizePolicy,
     QScrollArea,
+    QCheckBox,
 )
 from PySide6.QtGui import QTextCursor, QColor, QTextCharFormat, QFontMetrics
 
@@ -36,6 +37,7 @@ from ui.sql_completer import SqlCompleter
 from ui.editable_table import EditableTableWidget
 from utils.df_export import export_dataframe
 from utils import perf_metrics
+from services import preferences
 from ui.column_filter_dialog import ColumnFilterDialog
 from ui.theme_manager import ThemeManager
 from ui.snippet_manager import SnippetManager
@@ -100,6 +102,11 @@ class SqlTab(QWidget):
     # Emitted when the status-bar cost badge is clicked — parent opens the
     # Analyze Query dialog's Cost & Profile tab for this tab's query
     open_analyzer = Signal()
+    # Emitted by Ctrl+Shift+Return — parent runs every statement in the
+    # editor regardless of selection/cursor position, distinct from plain
+    # Run (Ctrl+Return / the Run button), which scopes to the selection or
+    # the statement at the cursor (see ConnectionPanel._run_query_in_tab).
+    run_all_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -305,6 +312,18 @@ class SqlTab(QWidget):
         run_layout.addWidget(self.rollback_tx_btn)
 
         run_layout.addStretch()
+
+        self.auto_profile_chk = QCheckBox("Auto-profile")
+        self.auto_profile_chk.setToolTip(
+            "After each query, also run EXPLAIN ANALYZE to capture actual "
+            "execution timing into history. Executes every read query a "
+            "second time — leave off unless you're actively tuning."
+        )
+        self.auto_profile_chk.setStyleSheet("QCheckBox { color: #8e8e93; font-size: 12px; }")
+        self.auto_profile_chk.setChecked(preferences.get("auto_profile_queries", False))
+        self.auto_profile_chk.stateChanged.connect(
+            lambda state: preferences.set("auto_profile_queries", bool(state)))
+        run_layout.addWidget(self.auto_profile_chk)
 
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
@@ -874,6 +893,10 @@ class SqlTab(QWidget):
         self.run_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
         self.run_shortcut.activated.connect(self.run_btn.click)
 
+        # Run every statement in the editor, regardless of selection/cursor
+        # — the explicit counterpart to plain Run's cursor/selection scoping.
+        self.run_all_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Return"), self)
+        self.run_all_shortcut.activated.connect(self.run_all_requested.emit)
 
         # Add keyboard shortcuts for SQL formatting
         self.beautify_shortcut = QShortcut(QKeySequence("Ctrl+I"), self)
@@ -1652,7 +1675,7 @@ class SqlTab(QWidget):
 
         self._multi_results = results
         bar.blockSignals(True)
-        for i, (lbl, df) in enumerate(results):
+        for i, (lbl, df, *_rest) in enumerate(results):
             bar.addTab(f"Query {i+1}")
             bar.setTabToolTip(i, lbl)
         bar.blockSignals(False)
@@ -1663,14 +1686,18 @@ class SqlTab(QWidget):
         self._on_multi_result_tab(0)
         # A failed statement's tab holds an Exception, not a DataFrame — it
         # contributes no rows to this total rather than breaking len().
-        total_rows = sum(len(df) for _, df in results if not isinstance(df, Exception))
+        total_rows = sum(len(df) for _, df, *_rest in results if not isinstance(df, Exception))
         self.update_status(total_rows, elapsed)
 
     def _on_multi_result_tab(self, index: int):
         if not hasattr(self, '_multi_results') or index >= len(self._multi_results):
             return
-        _, df = self._multi_results[index]
+        # cost is this statement's own CostEstimate|None — 2-tuple entries
+        # (older callers, tests) simply carry no cost badge.
+        entry = self._multi_results[index]
+        _, df, cost = entry if len(entry) == 3 else (*entry, None)
         if isinstance(df, Exception):
+            self.clear_cost_estimate()
             self.show_error(str(df))
             return
         self.current_df = df
@@ -1680,6 +1707,7 @@ class SqlTab(QWidget):
         if len(df.columns) > 0:
             self._update_filter_columns(list(df.columns))
         self.result_table.show()
+        self.set_cost_estimate(cost)
         self._refresh_result_view()
         self._expand_result_area()
 

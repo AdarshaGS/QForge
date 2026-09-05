@@ -390,6 +390,12 @@ pip install -r requirements.txt
 The script installs PyInstaller into the active virtual environment if needed.
 It uses macOS utilities such as `hdiutil`, so run it on macOS.
 
+## Testing
+
+Tests live under `tests/` and run with `pytest`. When adding a new feature
+or fix, add one main test covering the core implementation — not a full
+suite of tests for every edge case.
+
 ## Releases (macOS, Windows, Linux)
 
 Pushing a `vX.Y.Z` tag runs `.github/workflows/build-release.yml`, which

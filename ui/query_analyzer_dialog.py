@@ -174,22 +174,28 @@ _RISK_COLOR = {
 }
 
 _DIALECT_COST_LABEL = {
-    "mysql": "MySQL Estimated Cost", "postgresql": "PostgreSQL Estimated Cost",
+    "mysql": "MySQL Optimizer Cost", "postgresql": "PostgreSQL Planner Cost",
 }
 
 _DIALECT_COST_TOOLTIP = {
     "mysql": (
-        "MySQL Estimated Cost is a relative cost calculated by the MySQL "
-        "optimizer when evaluating an execution plan. It is not execution "
-        "time, milliseconds, CPU time, monetary cost, or a percentage."
+        "MySQL Optimizer Cost is a relative, unitless cost the MySQL "
+        "optimizer calculates when choosing between execution plans. It "
+        "is NOT milliseconds, execution time, CPU time, monetary cost, or "
+        "a percentage — a cost of 40 is not \"40 ms\"."
     ),
     "postgresql": (
-        "PostgreSQL Estimated Cost is a relative cost calculated by the "
-        "PostgreSQL planner when evaluating an execution plan. It is not "
-        "execution time, milliseconds, CPU time, monetary cost, or a "
-        "percentage."
+        "PostgreSQL Planner Cost is a relative, unitless cost the "
+        "PostgreSQL planner calculates when choosing between execution "
+        "plans. It is NOT milliseconds, execution time, CPU time, "
+        "monetary cost, or a percentage."
     ),
 }
+
+_ROWS_EXAMINED_TOOLTIP = (
+    "Rows the optimizer expects to read while executing this plan, per "
+    "EXPLAIN — not the number of rows the query returns to you."
+)
 
 
 def _na(value, fmt: str = "{}") -> str:
@@ -271,6 +277,22 @@ def _mode_badge(text: str, color: str) -> QWidget:
     return lbl
 
 
+def _copy_with_feedback(btn: QPushButton, text: str, original_label: str) -> None:
+    """Copy `text` to the clipboard and briefly swap the button's label to
+    a confirmation — a clipboard write is otherwise silent, so without this
+    there's no way to tell the click actually registered."""
+    QApplication.clipboard().setText(text)
+    btn.setText("✓ Copied")
+
+    def _revert():
+        try:
+            btn.setText(original_label)
+        except RuntimeError:
+            pass  # the widget (dialog/tab) was already closed
+
+    QTimer.singleShot(1200, _revert)
+
+
 def _kv_row(label: str, value: str, value2: str = None, color: str = None) -> QWidget:
     """A label + one or two right-aligned-ish values on one line — used by
     the Compare Queries Performance / Plan Comparison sections. Pass value2
@@ -313,10 +335,53 @@ def _access_type_label(access_type: str) -> str:
     return _ACCESS_TYPE_LABEL.get(access_type, access_type or "Unknown")
 
 
-def _plan_node_card(node, has_actuals: bool) -> QWidget:
-    lowered = node.node_type.lower()
-    is_bad = "scan" in lowered and "index" not in lowered and "covering" not in lowered
-    border = _FAIL_COLOR if is_bad else _BORDER
+def _issues_by_table(issues: list) -> dict:
+    """Worst-severity scan-related issue per table (lowercased), so the
+    Execution Plan can be colored by the exact same verdict already shown
+    in the Issues section instead of forming a second, disconnected
+    opinion about which nodes are "bad"."""
+    by_table: dict = {}
+    for issue in issues or []:
+        if issue.code not in ("FULL_TABLE_SCAN", "NO_POSSIBLE_KEYS"):
+            continue
+        m = re.search(r"Table `([^`]+)`", issue.message)
+        if not m:
+            continue
+        tbl = m.group(1).lower()
+        cur = by_table.get(tbl)
+        if cur is None or query_cost.SEVERITY_SCORE[issue.severity] > query_cost.SEVERITY_SCORE[cur.severity]:
+            by_table[tbl] = issue
+    return by_table
+
+
+def _plan_explain_bits(node) -> list:
+    """Access type / possible keys / key / filtered — sourced only from
+    values EXPLAIN actually reported for this node's table (see
+    services.query_cost._annotate_tree_from_explain_rows). A field EXPLAIN
+    didn't report is simply omitted, never invented."""
+    bits = []
+    if node.access_type:
+        bits.append(f"access: {_access_type_label(node.access_type)}")
+    if node.possible_keys:
+        bits.append(f"possible keys: {node.possible_keys}")
+    if node.key:
+        bits.append(f"key: {node.key}")
+    elif node.possible_keys:
+        bits.append("key: none used")
+    if node.filtered is not None:
+        bits.append(f"filtered: {node.filtered:.1f}%")
+    return bits
+
+
+def _plan_node_card(node, has_actuals: bool, issues_by_table: dict = None) -> QWidget:
+    issues_by_table = issues_by_table or {}
+    matched = issues_by_table.get(node.table.lower()) if node.table else None
+    if matched is not None:
+        border = _SEV_COLOR.get(matched.severity, _BORDER)
+        title_color = border if matched.severity in ("CRITICAL", "HIGH") else _TEXT
+    else:
+        border = _BORDER
+        title_color = _TEXT
 
     card = QFrame()
     card.setStyleSheet(
@@ -328,7 +393,7 @@ def _plan_node_card(node, has_actuals: bool) -> QWidget:
 
     title = QLabel(node.node_type[:70] or "?")
     title.setStyleSheet(
-        f"color:{_FAIL_COLOR if is_bad else _TEXT}; font-size:12px; font-weight:700; border:none;"
+        f"color:{title_color}; font-size:12px; font-weight:700; border:none;"
     )
     title.setWordWrap(True)
     title.setMaximumWidth(220)
@@ -355,13 +420,21 @@ def _plan_node_card(node, has_actuals: bool) -> QWidget:
         stat_lbl.setWordWrap(True)
         v.addWidget(stat_lbl)
 
+    explain_bits = _plan_explain_bits(node)
+    if explain_bits:
+        explain_lbl = QLabel("  ·  ".join(explain_bits))
+        explain_lbl.setStyleSheet(f"color:{_MUTED}; font-size:10px; border:none;")
+        explain_lbl.setWordWrap(True)
+        v.addWidget(explain_lbl)
+
     return card
 
 
-def _plan_tree_widget(node, has_actuals: bool) -> QWidget:
+def _plan_tree_widget(node, has_actuals: bool, issues_by_table: dict = None) -> QWidget:
     """Recreates the plan hierarchy as a small vertical flow of node cards
     connected by simple line glyphs — built entirely from the parsed
     ProfileNode tree (never invented)."""
+    issues_by_table = issues_by_table or {}
     container = QWidget()
     cv = QVBoxLayout(container)
     cv.setContentsMargins(0, 0, 0, 0)
@@ -369,7 +442,7 @@ def _plan_tree_widget(node, has_actuals: bool) -> QWidget:
 
     row = QHBoxLayout()
     row.addStretch()
-    row.addWidget(_plan_node_card(node, has_actuals))
+    row.addWidget(_plan_node_card(node, has_actuals, issues_by_table))
     row.addStretch()
     cv.addLayout(row)
 
@@ -383,10 +456,58 @@ def _plan_tree_widget(node, has_actuals: bool) -> QWidget:
         children_row.setSpacing(16)
         children_row.addStretch()
         for child in node.children:
-            children_row.addWidget(_plan_tree_widget(child, has_actuals))
+            children_row.addWidget(_plan_tree_widget(child, has_actuals, issues_by_table))
         children_row.addStretch()
         cv.addLayout(children_row)
 
+    return container
+
+
+def _compact_plan_summary(node, has_actuals: bool, issues_by_table: dict) -> QWidget:
+    """A one-row detail strip for a single-operator plan — the common case
+    for a simple lookup or small-table scan — instead of the bordered
+    flow-chart card, which is unnecessary ceremony for one node. Uses the
+    same _stat_card tiles as Performance Summary for visual consistency."""
+    matched = issues_by_table.get(node.table.lower()) if node.table else None
+    sev_color = _SEV_COLOR.get(matched.severity) if matched else None
+
+    cards = [
+        _stat_card(
+            "Access Type",
+            _access_type_label(node.access_type) if node.access_type else (node.node_type[:32] or "—"),
+            color=sev_color,
+        ),
+    ]
+
+    if has_actuals and node.rows_estimated:
+        rows_val = f"{node.rows_estimated:,} → {node.rows_actual:,}"
+    elif has_actuals:
+        rows_val = f"{node.rows_actual:,}"
+    elif node.rows_estimated:
+        rows_val = f"{node.rows_estimated:,}"
+    else:
+        rows_val = "—"
+    cards.append(_stat_card("Rows", rows_val))
+
+    if node.possible_keys:
+        cards.append(_stat_card("Possible Keys", node.possible_keys))
+    cards.append(_stat_card("Key", node.key or "None"))
+    if node.filtered is not None:
+        cards.append(_stat_card("Filtered", f"{node.filtered:.1f}%"))
+    if has_actuals:
+        cards.append(_stat_card("Time", _format_duration(node.time_ms / 1000.0)))
+    elif node.cost:
+        cards.append(_stat_card("Cost", f"{node.cost:.2f}"))
+
+    container = QWidget()
+    v = QVBoxLayout(container)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(4)
+    if node.table:
+        t = QLabel(node.table)
+        t.setStyleSheet(f"color:{_INFO_COLOR}; font-size:12px; font-weight:600;")
+        v.addWidget(t)
+    v.addWidget(_summary_row(cards))
     return container
 
 
@@ -396,6 +517,41 @@ def _count_plan_nodes(node) -> int:
 
 def _plan_depth(node) -> int:
     return 1 + (max((_plan_depth(c) for c in node.children), default=0) if node.children else 0)
+
+
+def _plan_pane_widget(estimate, label: str) -> QWidget:
+    """One side of the Plan Comparison split view — a query label plus the
+    same tree/compact-summary rendering _CostProfileTab._add_plan_section
+    uses for a single query's plan, just returning a widget instead of
+    appending to a results layout so two of these can sit side by side."""
+    container = QWidget()
+    v = QVBoxLayout(container)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(4)
+
+    hdr = QLabel(label)
+    hdr.setStyleSheet(f"color:{_TEXT}; font-size:12px; font-weight:600;")
+    v.addWidget(hdr)
+
+    issues_by_table = _issues_by_table(estimate.issues)
+    root = estimate.plan_tree
+    total = _count_plan_nodes(root)
+    if total > 40:
+        info = QLabel(f"Plan has {total} operators — too large to render here.")
+        info.setStyleSheet(f"color:{_MUTED}; font-size:11px;")
+        info.setWordWrap(True)
+        v.addWidget(info)
+    elif total == 1:
+        v.addWidget(_compact_plan_summary(root, False, issues_by_table))
+    else:
+        holder = QScrollArea()
+        holder.setWidgetResizable(True)
+        holder.setFrameShape(QFrame.NoFrame)
+        holder.setFixedHeight(min(95 * _plan_depth(root) + 40, 280))
+        holder.setWidget(_plan_tree_widget(root, False, issues_by_table))
+        v.addWidget(holder)
+
+    return container
 
 
 def _issue_card(issue) -> QWidget:
@@ -540,13 +696,16 @@ class _CostProfileTab(QWidget):
     """Single-query cost estimate (plan-only, never executes) plus an
     opt-in post-run profile (EXPLAIN ANALYZE — executes the query).
 
-    Every run fully rebuilds the results pane from scratch (see
-    _render_estimate/_render_profile) rather than layering new results over
-    old ones — cheap at this size, and it's what keeps a stale plan from a
-    previous query/run from lingering on screen (section 12's "do not show
-    stale analysis results")."""
+    The Estimate and Profile sections each live in their own container
+    within the results pane and are cleared/rebuilt independently (see
+    _render_estimate/_render_profile) — so running one never erases the
+    other; both can be on screen together (section 12's "do not show
+    stale analysis results" still holds per-section: each section only
+    ever shows its own latest run or historical snapshot, never a mix)."""
 
-    def __init__(self, db_service, initial_query: str = "", parent=None):
+    def __init__(self, db_service, initial_query: str = "", initial_cost_detail: dict = None,
+                 initial_profile_detail: dict = None, query_history=None,
+                 history_entry_id: str = None, parent=None):
         super().__init__(parent)
         self._db = db_service
         self._dialect = getattr(db_service, "db_type", "") or ""
@@ -554,9 +713,17 @@ class _CostProfileTab(QWidget):
         self._cost_worker = None
         self._profile_thread = None
         self._profile_worker = None
-        self._build_ui(initial_query)
+        # When both are set, a live Estimate/Profile run here is persisted
+        # back onto that history entry (query_history.update_entry) — see
+        # _on_estimate_done/_on_profile_done. None for the "current tab's
+        # query" entry point (Database menu / status badge), which has no
+        # single history entry to write back to.
+        self._query_history = query_history
+        self._history_entry_id = history_entry_id
+        self._build_ui(initial_query, initial_cost_detail, initial_profile_detail)
 
-    def _build_ui(self, initial_query: str):
+    def _build_ui(self, initial_query: str, initial_cost_detail: dict = None,
+                  initial_profile_detail: dict = None):
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(0)
@@ -636,6 +803,33 @@ class _CostProfileTab(QWidget):
         self._results_layout.setContentsMargins(0, 4, 0, 4)
         self._results_layout.setSpacing(6)
 
+        # Estimate and Profile each get a persistent container, added once
+        # here and never removed — _render_estimate/_render_profile only
+        # ever clear+repopulate their own container's inner layout, so one
+        # can be showing while the other reruns, and both can be visible
+        # together.
+        self._empty_lbl = QLabel("Run Estimate Cost or Run Profile to analyze this query.")
+        self._empty_lbl.setAlignment(Qt.AlignCenter)
+        self._empty_lbl.setStyleSheet(f"color:{_MUTED}; font-size:13px; padding:24px;")
+        self._results_layout.addWidget(self._empty_lbl)
+
+        self._estimate_container = QWidget()
+        self._estimate_layout = QVBoxLayout(self._estimate_container)
+        self._estimate_layout.setContentsMargins(0, 0, 0, 0)
+        self._estimate_layout.setSpacing(6)
+        self._results_layout.addWidget(self._estimate_container)
+
+        self._section_divider = _divider()
+        self._results_layout.addWidget(self._section_divider)
+
+        self._profile_container = QWidget()
+        self._profile_layout = QVBoxLayout(self._profile_container)
+        self._profile_layout.setContentsMargins(0, 0, 0, 0)
+        self._profile_layout.setSpacing(6)
+        self._results_layout.addWidget(self._profile_container)
+
+        self._results_layout.addStretch()
+
         scroll.setWidget(self._results_widget)
         rp.addWidget(scroll, 1)
         splitter.addWidget(results_pane)
@@ -645,12 +839,33 @@ class _CostProfileTab(QWidget):
         splitter.setSizes([130, 560])
         root.addWidget(splitter, 1)
 
-        self._show_empty_state()
+        historical_estimate = query_cost.estimate_from_dict(initial_cost_detail)
+        historical_profile = query_cost.profile_from_dict(initial_profile_detail)
+        if historical_estimate:
+            self._render_estimate(historical_estimate, from_history=True)
+        if historical_profile:
+            self._render_profile(historical_profile, from_history=True)
+        if historical_estimate or historical_profile:
+            shown = " and ".join(
+                n for n, present in (("Estimate", historical_estimate), ("Profile", historical_profile)) if present
+            )
+            self._status_lbl.setText(
+                f"Showing the {shown} captured when this query last ran — "
+                "Estimate Cost / Run Profile re-check against the database now."
+            )
+        else:
+            self._show_empty_state()
 
     def set_query(self, sql: str):
         self._editor.setPlainText(sql)
 
     # ─── Result-pane state helpers ──────────────────────────────────────
+
+    def _update_empty_state(self):
+        has_estimate = self._estimate_layout.count() > 0
+        has_profile = self._profile_layout.count() > 0
+        self._empty_lbl.setVisible(not has_estimate and not has_profile)
+        self._section_divider.setVisible(has_estimate and has_profile)
 
     def _clear_layout(self, layout):
         while layout.count():
@@ -666,32 +881,38 @@ class _CostProfileTab(QWidget):
                 w.deleteLater()
 
     def _show_empty_state(self):
-        self._clear_layout(self._results_layout)
-        lbl = QLabel("Run Estimate Cost or Run Profile to analyze this query.")
-        lbl.setAlignment(Qt.AlignCenter)
-        lbl.setStyleSheet(f"color:{_MUTED}; font-size:13px; padding:24px;")
-        self._results_layout.addWidget(lbl)
-        self._results_layout.addStretch()
+        self._clear_layout(self._estimate_layout)
+        self._clear_layout(self._profile_layout)
+        self._update_empty_state()
 
-    def _show_loading(self, message: str):
-        self._clear_layout(self._results_layout)
+    def _show_loading(self, message: str, target: str):
+        layout = self._estimate_layout if target == "estimate" else self._profile_layout
+        self._clear_layout(layout)
         lbl = QLabel(message)
         lbl.setAlignment(Qt.AlignCenter)
         lbl.setStyleSheet(f"color:{_MUTED}; font-size:13px; padding:24px;")
-        self._results_layout.addWidget(lbl)
-        self._results_layout.addStretch()
+        layout.addWidget(lbl)
+        self._update_empty_state()
 
-    def _render_failure(self, title: str, message: str):
-        self._clear_layout(self._results_layout)
-        add = self._results_layout.addWidget
-        add(_section_label(title))
-        add(_divider())
-        add(_check_row("fail", title, message))
-        self._results_layout.addStretch()
+    def _render_failure(self, title: str, message: str, target: str):
+        layout = self._estimate_layout if target == "estimate" else self._profile_layout
+        self._clear_layout(layout)
+        layout.addWidget(_section_label(title))
+        layout.addWidget(_divider())
+        layout.addWidget(_check_row("fail", title, message))
+        self._update_empty_state()
 
     def _set_busy(self, busy: bool):
         self._estimate_btn.setEnabled(not busy)
         self._profile_btn.setEnabled(not busy and self._dialect in ("mysql", "postgresql"))
+
+    def _persist_to_history(self, **fields):
+        """Write *fields* onto the history entry this dialog was opened
+        for, if any — see _CostProfileTab.__init__. A no-op for the
+        "current tab's query" entry point, which has no single history
+        entry to write back to."""
+        if self._query_history and self._history_entry_id:
+            self._query_history.update_entry(self._history_entry_id, **fields)
 
     # ─── Cost estimate (plan-only) ───────────────────────────────────────
 
@@ -703,7 +924,7 @@ class _CostProfileTab(QWidget):
         self._estimate_btn.setText("Estimating…")
         self._status_lbl.setText("Running EXPLAIN…")
         self._status_lbl.setStyleSheet(f"color:{_MUTED}; font-size:12px;")
-        self._show_loading("Analyzing query…")
+        self._show_loading("Analyzing query…", target="estimate")
 
         worker = _CostWorker(self._db, sql)
         thread = QThread(self)
@@ -727,46 +948,54 @@ class _CostProfileTab(QWidget):
         if result.error:
             self._status_lbl.setText(f"Failed: {result.error}")
             self._status_lbl.setStyleSheet(f"color:{_FAIL_COLOR}; font-size:12px;")
-            self._render_failure("Query Analysis Failed", result.error)
+            self._render_failure("Query Analysis Failed", result.error, target="estimate")
             return
         self._status_lbl.setText("")
         self._render_estimate(result)
+        self._persist_to_history(
+            cost_score=result.score, cost_label=result.label,
+            cost_detail=query_cost.estimate_to_dict(result),
+        )
 
     def _on_estimate_error(self, message: str):
         self._set_busy(False)
         self._estimate_btn.setText("▶  Estimate Cost")
         self._status_lbl.setText(f"Error: {message}")
         self._status_lbl.setStyleSheet(f"color:{_FAIL_COLOR}; font-size:12px;")
-        self._render_failure("Query Analysis Failed", message)
+        self._render_failure("Query Analysis Failed", message, target="estimate")
 
-    def _render_estimate(self, result: query_cost.CostEstimate):
-        self._clear_layout(self._results_layout)
-        add = self._results_layout.addWidget
+    def _render_estimate(self, result: query_cost.CostEstimate, from_history: bool = False):
+        self._clear_layout(self._estimate_layout)
+        add = self._estimate_layout.addWidget
 
         risk = query_cost.risk_level_for(result.issues)
         cost_label = _DIALECT_COST_LABEL.get(result.dialect, "Estimated Cost")
         cost_tooltip = _DIALECT_COST_TOOLTIP.get(result.dialect, "")
 
         add(_section_label("Performance Summary"))
-        add(_mode_badge("ESTIMATE — QUERY NOT EXECUTED", _INFO_COLOR))
+        if from_history:
+            add(_mode_badge("FROM HISTORY — CAPTURED WHEN THIS QUERY LAST RAN", _MUTED))
+        else:
+            add(_mode_badge("ESTIMATE — QUERY NOT EXECUTED", _INFO_COLOR))
         add(_summary_row([
             _stat_card("QForge Risk Score", str(result.score),
                        color=_RISK_COLOR.get(risk), sub=risk,
                        tooltip="A QForge-derived severity score based on the issues "
                                "detected below — not a MySQL metric."),
             _stat_card(cost_label, _na(result.native_cost, "{:,.2f}"),
-                       sub="Optimizer cost estimate", tooltip=cost_tooltip),
-            _stat_card("Estimated Rows", _na(result.estimated_rows, "{:,}")),
+                       sub="Not milliseconds", tooltip=cost_tooltip),
+            _stat_card("Estimated Rows Examined", _na(result.estimated_rows, "{:,}"),
+                       tooltip=_ROWS_EXAMINED_TOOLTIP),
             _stat_card("Execution", "Not executed"),
         ]))
 
         self._add_issues_section(add, result.issues)
 
         if result.plan_tree:
-            self._add_plan_section(add, result.plan_tree, has_actuals=False)
+            self._add_plan_section(add, result.plan_tree, has_actuals=False, issues=result.issues)
 
         self._add_recommendations_section(add, result.issues)
-        self._results_layout.addStretch()
+        self._update_empty_state()
 
     # ─── Profile (post-run, executes the query) ──────────────────────────
 
@@ -815,7 +1044,7 @@ class _CostProfileTab(QWidget):
         self._profile_btn.setText("Running…")
         self._status_lbl.setText("Executing query with EXPLAIN ANALYZE…")
         self._status_lbl.setStyleSheet(f"color:{_MUTED}; font-size:12px;")
-        self._show_loading("Executing query and analyzing the plan…")
+        self._show_loading("Executing query and analyzing the plan…", target="profile")
 
         worker = _ProfileWorker(self._db, sql)
         thread = QThread(self)
@@ -836,26 +1065,28 @@ class _CostProfileTab(QWidget):
         self._profile_btn.setText("▶  Run Profile (executes query)")
         if not result.supported:
             self._status_lbl.setText("")
-            self._render_failure("Profile Not Available", result.error or "Not supported for this dialect.")
+            self._render_failure("Profile Not Available", result.error or "Not supported for this dialect.",
+                                  target="profile")
             return
         if result.error:
             self._status_lbl.setText(f"Failed: {result.error}")
             self._status_lbl.setStyleSheet(f"color:{_FAIL_COLOR}; font-size:12px;")
-            self._render_failure("Query Analysis Failed", result.error)
+            self._render_failure("Query Analysis Failed", result.error, target="profile")
             return
         self._status_lbl.setText("")
         self._render_profile(result)
+        self._persist_to_history(profile_detail=query_cost.profile_to_dict(result))
 
     def _on_profile_error(self, message: str):
         self._set_busy(False)
         self._profile_btn.setText("▶  Run Profile (executes query)")
         self._status_lbl.setText(f"Error: {message}")
         self._status_lbl.setStyleSheet(f"color:{_FAIL_COLOR}; font-size:12px;")
-        self._render_failure("Query Analysis Failed", message)
+        self._render_failure("Query Analysis Failed", message, target="profile")
 
-    def _render_profile(self, result: query_cost.QueryProfile):
-        self._clear_layout(self._results_layout)
-        add = self._results_layout.addWidget
+    def _render_profile(self, result: query_cost.QueryProfile, from_history: bool = False):
+        self._clear_layout(self._profile_layout)
+        add = self._profile_layout.addWidget
 
         risk = query_cost.risk_level_for(result.issues)
         cost_label = _DIALECT_COST_LABEL.get(result.dialect, "Estimated Cost")
@@ -865,15 +1096,19 @@ class _CostProfileTab(QWidget):
         actual_rows = result.root.rows_actual if result.root else None
 
         add(_section_label("Performance Summary"))
-        add(_mode_badge("PROFILE — QUERY EXECUTED", _PASS_COLOR))
+        if from_history:
+            add(_mode_badge("FROM HISTORY — CAPTURED WHEN THIS QUERY WAS LAST PROFILED", _MUTED))
+        else:
+            add(_mode_badge("PROFILE — QUERY EXECUTED", _PASS_COLOR))
         add(_summary_row([
             _stat_card("QForge Risk Score", str(query_cost.score_issues(result.issues)),
                        color=_RISK_COLOR.get(risk), sub=risk,
                        tooltip="A QForge-derived severity score based on the issues "
                                "detected below — not a MySQL metric."),
             _stat_card(cost_label, _na(native_cost, "{:,.2f}"),
-                       sub="Optimizer cost estimate", tooltip=cost_tooltip),
-            _stat_card("Estimated Rows", _na(est_rows, "{:,}")),
+                       sub="Not milliseconds", tooltip=cost_tooltip),
+            _stat_card("Estimated Rows Examined", _na(est_rows, "{:,}"),
+                       tooltip=_ROWS_EXAMINED_TOOLTIP),
             _stat_card("Actual Execution", _format_duration(result.total_time_ms / 1000.0)),
             _stat_card("Actual Rows", _na(actual_rows, "{:,}")),
         ]))
@@ -881,12 +1116,12 @@ class _CostProfileTab(QWidget):
         self._add_issues_section(add, result.issues)
 
         if result.root:
-            self._add_plan_section(add, result.root, has_actuals=True)
+            self._add_plan_section(add, result.root, has_actuals=True, issues=result.issues)
             self._add_estimate_vs_actual_section(add, result.root, result.issues)
-            self._add_detailed_profile_section(add, result.root)
+            self._add_detailed_profile_section(add, result.root, result.issues)
 
         self._add_recommendations_section(add, result.issues)
-        self._results_layout.addStretch()
+        self._update_empty_state()
 
     # ─── Shared result sections ───────────────────────────────────────────
 
@@ -899,10 +1134,11 @@ class _CostProfileTab(QWidget):
         for issue in sorted(issues, key=lambda i: query_cost.SEVERITY_SCORE[i.severity], reverse=True):
             add(_issue_card(issue))
 
-    def _add_plan_section(self, add, root, has_actuals: bool):
+    def _add_plan_section(self, add, root, has_actuals: bool, issues: list = None):
         add(_section_label("Execution Plan"))
         add(_divider())
 
+        issues_by_table = _issues_by_table(issues)
         total = _count_plan_nodes(root)
         if total > 40:
             add(_check_row(
@@ -912,11 +1148,15 @@ class _CostProfileTab(QWidget):
             ))
             return
 
+        if total == 1:
+            add(_compact_plan_summary(root, has_actuals, issues_by_table))
+            return
+
         holder = QScrollArea()
         holder.setWidgetResizable(True)
         holder.setFrameShape(QFrame.NoFrame)
         holder.setFixedHeight(min(95 * _plan_depth(root) + 40, 320))
-        holder.setWidget(_plan_tree_widget(root, has_actuals))
+        holder.setWidget(_plan_tree_widget(root, has_actuals, issues_by_table))
         add(holder)
 
     def _add_estimate_vs_actual_section(self, add, root, issues: list):
@@ -950,7 +1190,7 @@ class _CostProfileTab(QWidget):
             for issue in mismatches:
                 add(_check_row("warn", issue.message, issue.suggestion))
 
-    def _add_detailed_profile_section(self, add, root):
+    def _add_detailed_profile_section(self, add, root, issues: list = None):
         add(_section_label("Detailed Profile"))
         add(_divider())
         tree = QTreeWidget()
@@ -958,26 +1198,33 @@ class _CostProfileTab(QWidget):
         tree.setColumnCount(6)
         tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         tree.setMinimumHeight(min(28 * _count_plan_nodes(root) + 40, 360))
-        self._add_tree_node(tree, root)
+        self._add_tree_node(tree, root, _issues_by_table(issues))
         tree.expandAll()
         add(tree)
 
-    def _add_tree_node(self, tree_or_item, node):
+    def _add_tree_node(self, tree_or_item, node, issues_by_table: dict):
         item = QTreeWidgetItem([
             node.node_type, node.table,
             f"{node.rows_estimated:,}", f"{node.rows_actual:,}",
             f"{node.time_ms:.2f}", str(node.loops),
         ])
-        lowered = node.node_type.lower()
-        if ("scan" in lowered and "index" not in lowered) or "external" in (node.extra or "").lower():
+        # Same verdict as the Issues section and the Execution Plan diagram
+        # (see _issues_by_table) — a scan/spill only reads as a problem
+        # here when the rule engine actually flagged it as one.
+        matched = issues_by_table.get(node.table.lower()) if node.table else None
+        is_spill = "external" in (node.extra or "").lower()
+        if is_spill or (matched is not None and matched.severity in ("CRITICAL", "HIGH")):
             for col in range(6):
                 item.setForeground(col, QBrush(QColor(_FAIL_COLOR)))
+        elif matched is not None and matched.severity == "MEDIUM":
+            for col in range(6):
+                item.setForeground(col, QBrush(QColor(_WARN_COLOR)))
         if isinstance(tree_or_item, QTreeWidget):
             tree_or_item.addTopLevelItem(item)
         else:
             tree_or_item.addChild(item)
         for child in node.children:
-            self._add_tree_node(item, child)
+            self._add_tree_node(item, child, issues_by_table)
         return item
 
     def _add_recommendations_section(self, add, issues: list):
@@ -1018,8 +1265,11 @@ class _CostProfileTab(QWidget):
             f" border-radius:4px; font-size:11px; padding:0 10px;"
         )
         copy_btn.clicked.connect(
-            lambda: QApplication.clipboard().setText(
-                "\n".join(f"{i}. {r}" for i, r in enumerate(recs, 1)))
+            lambda: _copy_with_feedback(
+                copy_btn,
+                "\n".join(f"{i}. {r}" for i, r in enumerate(recs, 1)),
+                "⎘ Copy Recommendations",
+            )
         )
         copy_row.addWidget(copy_btn)
         add(copy_row_w)
@@ -1480,7 +1730,7 @@ class _CompareQueriesTab(QWidget):
                 f"background:transparent; color:{_MUTED}; border:1px solid {_BORDER};"
                 f" border-radius:3px; font-size:11px; padding:0 8px;"
             )
-            copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(r.error))
+            copy_btn.clicked.connect(lambda: _copy_with_feedback(copy_btn, r.error, "⎘ Copy"))
             title_row.addWidget(copy_btn)
             ec_layout.addLayout(title_row)
 
@@ -1697,10 +1947,57 @@ class _CompareQueriesTab(QWidget):
 
         add(agg_table)
 
+    # Status → (chip, label) for a PlanDelta row in the Plan Changes list.
+    _DELTA_STATUS = {
+        "regression": ("fail", "Regression"),
+        "improvement": ("pass", "Improvement"),
+        "changed":     ("info", "Changed"),
+        "added":       ("info", "Added"),
+        "removed":     ("info", "Removed"),
+    }
+
     def _add_plan_comparison_section(self, add, r: VerifyResult):
         add(_section_label("Plan Comparison"))
         add(_divider())
 
+        est1, est2 = r.cost_original, r.cost_optimised
+        if (est1 and not est1.error and est1.plan_tree
+                and est2 and not est2.error and est2.plan_tree):
+            self._add_tree_plan_comparison(add, est1, est2)
+            return
+
+        self._add_flat_plan_comparison(add, r)
+
+    def _add_tree_plan_comparison(self, add, est1, est2):
+        """Real plan trees are available for both sides (query_cost's
+        estimate_cost() — MySQL via EXPLAIN FORMAT=TREE, PostgreSQL via
+        EXPLAIN (FORMAT JSON)) — render them side by side and list what
+        actually changed, table by table, via query_cost.diff_plan_trees()."""
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(4)
+        splitter.addWidget(_plan_pane_widget(est1, "Query 1"))
+        splitter.addWidget(_plan_pane_widget(est2, "Query 2"))
+        add(splitter)
+
+        add(_section_label("Plan Changes"))
+        deltas = query_cost.diff_plan_trees(est1, est2)
+        if not deltas:
+            add(_check_row(
+                "pass",
+                "No table-level access-path or severity changes detected "
+                "between Query 1 and Query 2.",
+            ))
+            return
+
+        for d in deltas:
+            status, label = self._DELTA_STATUS[d.status]
+            add(_check_row(status, f"`{d.table}` — {label}", d.reason))
+
+    def _add_flat_plan_comparison(self, add, r: VerifyResult):
+        """Fallback when a real plan tree isn't available for one or both
+        sides (e.g. cost estimation errored, or an EXPLAIN FORMAT=TREE-
+        incompatible MySQL server) — the original flat single-operator
+        diff against the bare EXPLAIN rows QueryVerifier already fetched."""
         e1, e2 = r.explain_original, r.explain_optimised
         if not e1 or not e2:
             add(_check_row(
@@ -1805,10 +2102,10 @@ class _CompareQueriesTab(QWidget):
         def _copy_selected():
             rows = sorted({idx.row() for idx in tbl.selectedIndexes()})
             if rows:
-                QApplication.clipboard().setText(_rows_to_csv(rows))
+                _copy_with_feedback(copy_sel_btn, _rows_to_csv(rows), "⎘ Copy Selected")
 
         def _copy_all():
-            QApplication.clipboard().setText(_rows_to_csv(range(tbl.rowCount())))
+            _copy_with_feedback(copy_all_btn, _rows_to_csv(range(tbl.rowCount())), "⎘ Copy All as CSV")
 
         copy_sel_btn.clicked.connect(_copy_selected)
         copy_all_btn.clicked.connect(_copy_all)
@@ -1898,7 +2195,7 @@ class _CompareQueriesTab(QWidget):
             lines = ["Row\tColumn\tQuery 1\tQuery 2"]
             for row_no, col, ov, pv in flat_rows:
                 lines.append(f"{row_no}\t{col}\t{ov}\t{pv}")
-            QApplication.clipboard().setText("\n".join(lines))
+            _copy_with_feedback(copy_btn, "\n".join(lines), "⎘ Copy")
 
         copy_btn.clicked.connect(_copy_all_diff)
 
@@ -1973,7 +2270,9 @@ class _CompareQueriesTab(QWidget):
 class QueryAnalyzerDialog(QDialog):
     """Consolidated entry point: Cost & Profile + Compare Queries tabs."""
 
-    def __init__(self, db_service, initial_query: str = "", parent=None):
+    def __init__(self, db_service, initial_query: str = "", initial_cost_detail: dict = None,
+                 initial_profile_detail: dict = None, query_history=None,
+                 history_entry_id: str = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Analyze Query")
         self.setMinimumSize(1000, 720)
@@ -1985,7 +2284,11 @@ class QueryAnalyzerDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self._tabs = QTabWidget()
-        self._cost_tab = _CostProfileTab(db_service, initial_query=initial_query)
+        self._cost_tab = _CostProfileTab(db_service, initial_query=initial_query,
+                                          initial_cost_detail=initial_cost_detail,
+                                          initial_profile_detail=initial_profile_detail,
+                                          query_history=query_history,
+                                          history_entry_id=history_entry_id)
         self._compare_tab = _CompareQueriesTab(db_service, initial_query=initial_query)
         self._tabs.addTab(self._cost_tab, "Cost && Profile")
         self._tabs.addTab(self._compare_tab, "Compare Queries")
