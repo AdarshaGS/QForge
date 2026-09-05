@@ -2237,6 +2237,8 @@ class ConnectionPanel(QWidget):
         tab._last_cost_estimate = None
         if hasattr(tab, 'clear_cost_estimate'):
             tab.clear_cost_estimate()
+        if hasattr(tab, 'clear_for_run'):
+            tab.clear_for_run()
         tab._cancel_flag   = threading.Event()
         tab._query_start_time = time.time()
         tab.run_btn.setEnabled(False)

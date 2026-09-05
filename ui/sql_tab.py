@@ -2051,6 +2051,27 @@ class SqlTab(QWidget):
         if sizes:
             self.splitter.setSizes(sizes)
 
+    def clear_for_run(self):
+        """Hide any previous result grid or error card before a new run
+        starts, so re-running in the same tab doesn't leave stale output
+        on screen for the duration of the new query (issue #260)."""
+        if hasattr(self, '_multi_result_bar') and self._multi_result_bar is not None:
+            self._multi_result_bar.hide()
+        self.result_table.clearContents()
+        self.result_table.setRowCount(0)
+        self.result_table.setColumnCount(0)
+        self.result_table.hide()
+        self._pagination_bar.hide()
+        self._error_card_scroll.hide()
+        self._empty_state.hide()
+        self._result_actions_bar.hide()
+        self.status_label.hide()
+        self.status_label.setFixedHeight(0)
+        self._status_row.hide()
+        self._query_time_lbl.setText("Query time: —")
+        self._rows_status_lbl.setText("Rows: —")
+        self._collapse_result_area()
+
     def show_error(self, message: str, query: str = "", elapsed: float = 0.0):
         """Display a SQL error as a structured card — title, message, best-
         effort location + snippet, and the existing hint text (issue
