@@ -14,8 +14,9 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QStyle,
+    QToolTip,
 )
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent
 from PySide6.QtGui import QColor, QBrush, QPalette, QShortcut, QKeySequence, QCursor
 import pandas as pd
 from utils.df_export import export_dataframe
@@ -119,6 +120,20 @@ class _SortHighlightHeader(QHeaderView):
         painter.drawText(rect.adjusted(8, 0, -8, 0), Qt.AlignVCenter | Qt.AlignLeft, str(text or ""))
         painter.restore()
 
+    def event(self, e):
+        if e.type() == QEvent.ToolTip:
+            logical_index = self.logicalIndexAt(e.pos())
+            fk = self._owner._fk_info_for_column(logical_index) if logical_index >= 0 else None
+            if fk is not None:
+                QToolTip.showText(
+                    e.globalPos(),
+                    f"Foreign key → {fk['ref_table']}.{fk['ref_column']}",
+                    self,
+                )
+                return True
+            QToolTip.hideText()
+        return super().event(e)
+
 
 class _NoEditDelegate(QStyledItemDelegate):
     """Blocks edit-mode outright — assigned to the filler rows/columns that
@@ -136,30 +151,53 @@ class _NoEditDelegate(QStyledItemDelegate):
 _IS_NULL_ROLE = Qt.UserRole + 1
 _NULL_PLACEHOLDER_COLOR = QColor("#6b6b70")
 
+# Width (px) of the clickable nav-arrow zone reserved at the right edge of
+# an FK cell (issue #261). Fixed and independent of text length/alignment
+# so the delegate's paint geometry and the view's click hit-test
+# (EditableTableWidget._fk_arrow_rect) always agree on where it is.
+_FK_ARROW_ZONE_PX = 20
+
 
 class _NullAwareDelegate(QStyledItemDelegate):
     """Paints a cell flagged _IS_NULL_ROLE as a muted italic "NULL"
     placeholder instead of a blank cell pixel-identical to a genuine empty
-    string (issue #182). Paint-only: item.text() — what copy/paste,
-    dirty-diffing, and get_changes() all read — is untouched, so editing/
-    saving semantics don't change; this only changes what's drawn when not
-    in edit mode."""
+    string, and draws a clickable nav arrow over a foreign-key cell's value
+    (issue #261 — TablePlus-style inline FK cue, on top of the header
+    icon/tooltip; clicking it navigates, see EditableTableWidget.
+    _handle_fk_arrow_click). Paint-only in both cases: item.text() — what
+    copy/paste, dirty-diffing, and get_changes() all read — is untouched,
+    so editing/saving semantics don't change; this only changes what's
+    drawn when not in edit mode."""
 
     def paint(self, painter, option, index):
         is_null = index.data(Qt.DisplayRole) == "" and index.data(_IS_NULL_ROLE)
-        if not is_null:
+        owner = self.parent()
+        fk = owner._fk_info_for_column(index.column()) if owner is not None else None
+        show_arrow = fk is not None and not is_null and bool(index.data(Qt.DisplayRole))
+
+        if not is_null and not show_arrow:
             super().paint(painter, option, index)
             return
 
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-        opt.text = "NULL"
-        opt.font.setItalic(True)
-        if not (opt.state & QStyle.State_Selected):
-            opt.palette.setColor(QPalette.Text, _NULL_PLACEHOLDER_COLOR)
+        if is_null:
+            opt.text = "NULL"
+            opt.font.setItalic(True)
+            if not (opt.state & QStyle.State_Selected):
+                opt.palette.setColor(QPalette.Text, _NULL_PLACEHOLDER_COLOR)
+        elif show_arrow:
+            opt.rect = opt.rect.adjusted(0, 0, -_FK_ARROW_ZONE_PX, 0)
         widget = opt.widget
         style = widget.style() if widget else QApplication.style()
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+
+        if show_arrow:
+            painter.save()
+            arrow_rect = option.rect.adjusted(option.rect.width() - _FK_ARROW_ZONE_PX, 0, 0, 0)
+            painter.setPen(QColor("#ffffff") if (option.state & QStyle.State_Selected) else QColor("#0A84FF"))
+            painter.drawText(arrow_rect, Qt.AlignCenter, "→")
+            painter.restore()
 
 
 # ── Undo/redo command stack (issue #124) ────────────────────────────────
@@ -348,6 +386,8 @@ class EditableTableWidget(QTableWidget):
         # Client-side sort state
         self._sort_col = -1   # -1 = no active sort
         self._sort_asc = True
+
+        self._fk_map = {}   # column name -> {column, ref_table, ref_column}
 
         self.table_name = None
         # Real primary-key column name(s) for self.table_name, set via
@@ -785,6 +825,7 @@ class EditableTableWidget(QTableWidget):
         fv.customContextMenuRequested.connect(lambda _pos: self.show_context_menu(_pos))
         self.verticalScrollBar().valueChanged.connect(fv.verticalScrollBar().setValue)
         fv.verticalScrollBar().valueChanged.connect(self.verticalScrollBar().setValue)
+        fv.viewport().installEventFilter(self)
         fv.hide()
         self._frozen_view = fv
         self.update_theme(is_dark=(self.current_theme == 'dark'))
@@ -1876,6 +1917,59 @@ class EditableTableWidget(QTableWidget):
     def set_fk_map(self, fk_list: list):
         """Store FK metadata: list of {column, ref_table, ref_column} dicts."""
         self._fk_map = {fk['column']: fk for fk in (fk_list or [])}
+        self.horizontalHeader().viewport().update()
+        self.viewport().update()
+        if self._frozen_view is not None:
+            self._frozen_view.horizontalHeader().viewport().update()
+            self._frozen_view.viewport().update()
+
+    def _fk_info_for_column(self, logical_index: int) -> dict | None:
+        """FK metadata for the header at *logical_index*, by exact column
+        name (mirrors the lookup already used to build the right-click
+        "Go to ref_table.column" menu action)."""
+        item = self.horizontalHeaderItem(logical_index)
+        if item is None:
+            return None
+        return self._fk_map.get(item.text())
+
+    def _fk_arrow_rect(self, view, index):
+        """Rect, in *view*'s viewport coordinates, of the clickable nav-arrow
+        zone for an FK cell — mirrors _NullAwareDelegate.paint's geometry."""
+        rect = view.visualRect(index)
+        return rect.adjusted(rect.width() - _FK_ARROW_ZONE_PX, 0, 0, 0)
+
+    def _handle_fk_arrow_click(self, view, pos) -> bool:
+        """If *pos* (in *view*'s viewport coordinates) lands on an FK cell's
+        nav-arrow zone, emit navigate_fk and report the click handled.
+        *view* is self for the main grid or the frozen-columns overlay for a
+        pinned FK column — both share this widget's model/items. Mirrors the
+        right-click "Go to ref_table.column" menu action (issue #261)."""
+        index = view.indexAt(pos)
+        if not index.isValid():
+            return False
+        fk = self._fk_info_for_column(index.column())
+        if fk is None or index.data(_IS_NULL_ROLE):
+            return False
+        item = self.item(index.row(), index.column())
+        if item is None or not item.text():
+            return False
+        if not self._fk_arrow_rect(view, index).contains(pos):
+            return False
+        self.navigate_fk.emit(fk['ref_table'], fk['ref_column'], item.text())
+        return True
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._handle_fk_arrow_click(self, event.pos()):
+            return
+        super().mousePressEvent(event)
+
+    def eventFilter(self, obj, event):
+        if (self._frozen_view is not None and obj is self._frozen_view.viewport()
+                and event.type() == QEvent.MouseButtonPress
+                and event.button() == Qt.LeftButton
+                and self._handle_fk_arrow_click(self._frozen_view, event.pos())):
+            return True
+        return super().eventFilter(obj, event)
 
     def _quick_look_cell(self):
         """Open a resizable text viewer for the current cell value."""
