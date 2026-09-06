@@ -1190,7 +1190,11 @@ if __name__ == "__main__":
     # — e.g. QTabBar's own background — from the live OS theme regardless of
     # our QSS, which is why two machines on the same version and Dark Mode
     # setting rendered different tab colors depending on macOS version.
-    app.setStyle("Fusion")
+    # QFORGE_NATIVE_STYLE=1 is a #235 spike escape hatch to compare native
+    # rendering against Fusion; do not flip the default without a recorded
+    # go/no-go verdict on that issue.
+    if os.environ.get("QFORGE_NATIVE_STYLE") != "1":
+        app.setStyle("Fusion")
     app.setWindowIcon(QIcon(_asset_path("logo.png")))
     window = MainWindow()
     window.show()
