@@ -293,6 +293,69 @@ def test_postgres_index_scan_not_flagged():
 
 
 # ===========================================================================
+# Schema-aware checks (issue #250) — schema is a plain dict here (the same
+# shape fetch_schema_context() builds from a live db_service), so these
+# stay pure unit tests for both dialects without a live DB fixture.
+# ===========================================================================
+
+def _schema(table, columns, indexed=(), fks=()):
+    return {table.lower(): {
+        "columns": {c.lower(): t for c, t in columns.items()},
+        "indexed_columns": {c.lower() for c in indexed},
+        "fk_columns": {c.lower() for c in fks},
+    }}
+
+
+def test_full_table_scan_suggestion_names_real_column_when_schema_available():
+    rows = _full_scan_row("events", rows=250_000, possible_keys=None, filtered=2.5)
+    schema = _schema("events", {"id": "int", "status": "varchar(20)"})
+    issues = query_cost.analyze_explain_rows(
+        rows, "SELECT * FROM events WHERE status = 'pending';", schema=schema)
+    scan = next(i for i in issues if i.code == "FULL_TABLE_SCAN")
+    assert "`status`" in scan.suggestion
+    assert "column(s) used in the WHERE" not in scan.suggestion
+
+
+def test_type_mismatch_predicate_flagged_for_string_column_vs_numeric_literal():
+    schema = _schema("orders", {"id": "int", "customer_code": "varchar(20)"})
+    issues = query_cost.analyze_sql_text(
+        "SELECT * FROM orders WHERE customer_code = 12345", schema=schema)
+    assert any(i.code == "TYPE_MISMATCH_PREDICATE" for i in issues)
+
+
+def test_type_mismatch_predicate_not_flagged_for_matching_types():
+    schema = _schema("orders", {"id": "int", "customer_code": "varchar(20)"})
+    issues = query_cost.analyze_sql_text(
+        "SELECT * FROM orders WHERE customer_code = 'ABC123'", schema=schema)
+    assert not any(i.code == "TYPE_MISMATCH_PREDICATE" for i in issues)
+
+
+def test_unindexed_join_key_flagged_when_not_indexed_or_fk():
+    schema = {
+        **_schema("orders", {"id": "int", "customer_id": "int"}, indexed=["id"]),
+        **_schema("customers", {"id": "int"}, indexed=["id"]),
+    }
+    sql = "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id"
+    issues = query_cost.analyze_sql_text(sql, schema=schema)
+    join_issues = [i for i in issues if i.code == "UNINDEXED_JOIN_KEY"]
+    assert any("customer_id" in i.message for i in join_issues)
+    assert not any("`customers`.`id`" in i.message for i in join_issues)
+
+
+def test_postgres_seq_scan_suggestion_names_real_column_when_schema_available():
+    plan = {
+        "Node Type": "Seq Scan", "Relation Name": "orders",
+        "Plan Rows": 50000, "Actual Rows": 52000, "Actual Loops": 1,
+        "Actual Total Time": 12.3, "Plans": [],
+    }
+    schema = _schema("orders", {"id": "integer", "status": "text"})
+    issues = query_cost.analyze_postgres_plan(
+        plan, "SELECT * FROM orders WHERE status = 'open'", has_actuals=True, schema=schema)
+    scan = next(i for i in issues if i.code == "SEQ_SCAN")
+    assert "`status`" in scan.suggestion
+
+
+# ===========================================================================
 # Plan comparison — diff_plan_trees() (#181: multi-operator Plan
 # Comparison in Compare Queries). Pure unit tests against hand-built
 # ProfileNode trees + Issue lists — no DB needed, dialect-agnostic by

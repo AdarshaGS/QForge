@@ -47,6 +47,8 @@ _CODE_LABELS = {
     "ALWAYS_TRUE_CONDITION": "always-true condition",
     "SELECT_STAR": "select *",
     "MANY_CORRELATED_SUBQUERIES": "many correlated subqueries",
+    "TYPE_MISMATCH_PREDICATE": "type-mismatched predicate",
+    "UNINDEXED_JOIN_KEY": "unindexed join key",
 }
 
 
@@ -331,10 +333,299 @@ def _scan_verdict(est_rows: int, has_predicate: bool, has_index_candidate: bool)
 
 
 # ===========================================================================
+# Schema-aware checks — optional. Every function below degrades to "find
+# nothing" (never raises, never fabricates) when schema is unavailable, so
+# a caller with no db_service (the standalone query_analyzer.py CLI) or a
+# connection that fails to introspect keeps today's schema-blind behavior.
+# ===========================================================================
+
+_ALIAS_STOPWORDS = {
+    "ON", "WHERE", "INNER", "LEFT", "RIGHT", "OUTER", "FULL", "CROSS",
+    "JOIN", "USING", "GROUP", "ORDER", "HAVING", "LIMIT", "SET", "VALUES",
+    "AS", "NATURAL", "STRAIGHT_JOIN", "LATERAL",
+}
+
+_TABLE_REF_RE = re.compile(
+    r"\b(?:FROM|JOIN)\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?", re.IGNORECASE)
+
+
+def _parse_table_aliases(sql: str) -> dict:
+    """Best-effort {alias_or_table_lower: real_table_name} map built from
+    FROM/JOIN clauses (a table with no alias maps to itself). Conservative
+    — a shape this regex doesn't recognize is simply absent from the map,
+    never guessed."""
+    aliases: dict = {}
+    flat = sql.replace("`", " ").replace('"', " ")
+    for m in _TABLE_REF_RE.finditer(flat):
+        table, alias = m.group(1), m.group(2)
+        aliases[table.lower()] = table
+        if alias and alias.upper() not in _ALIAS_STOPWORDS:
+            aliases[alias.lower()] = table
+    return aliases
+
+
+def fetch_schema_context(db_service, tables) -> "dict | None":
+    """Best-effort {table_lower: {"columns": {col_lower: type_str},
+    "indexed_columns": {col_lower, ...}, "fk_columns": {col_lower, ...}}}
+    for *tables* (real table names, not aliases) via db_service's cached
+    schema calls (get_columns/get_indexes/get_foreign_keys — issue #256's
+    per-connection cache, so repeated calls across rows/queries are cheap).
+
+    None if db_service is falsy or nothing could be fetched (e.g. every
+    name is a CTE/derived-table alias that SHOW COLUMNS rejects) — callers
+    must treat that the same as "no schema available", never raise."""
+    if not db_service or not tables:
+        return None
+    context: dict = {}
+    for table in tables:
+        if not table or str(table).startswith("<"):
+            continue
+        try:
+            columns = {}
+            for c in db_service.get_columns(table) or []:
+                name = c.get("Field") if hasattr(c, "get") else None
+                typ = c.get("Type") if hasattr(c, "get") else None
+                if name:
+                    columns[str(name).lower()] = str(typ or "").lower()
+            if not columns:
+                continue  # not a real, introspectable table — skip silently
+
+            indexed_columns = set()
+            for idx in db_service.get_indexes(table) or []:
+                for col in str(idx.get("columns", "")).split(","):
+                    col = col.strip().lower()
+                    if col:
+                        indexed_columns.add(col)
+
+            fk_columns = {
+                str(fk["column"]).lower()
+                for fk in (db_service.get_foreign_keys(table) or [])
+                if fk.get("column")
+            }
+
+            context[table.lower()] = {
+                "columns": columns,
+                "indexed_columns": indexed_columns,
+                "fk_columns": fk_columns,
+            }
+        except Exception as ex:
+            logger.debug(f"query_cost: schema fetch failed for table {table!r}: {ex}")
+    return context or None
+
+
+_NUMERIC_TYPE_RE = re.compile(
+    r"^(?:tiny|small|medium|big)?int|^decimal|^numeric|^float|^double|^real|"
+    r"^bit|^serial|^bigserial|^smallserial|^money", re.IGNORECASE)
+_STRING_TYPE_RE = re.compile(
+    r"^(?:var|n)?char|^text|^enum|^set|^uuid|^json", re.IGNORECASE)
+
+
+def _column_type_category(type_str: str) -> str:
+    """"numeric" / "string" / "" (date/bool/unknown — never flagged) from a
+    dialect's own column-type string (MySQL's COLUMN_TYPE / SHOW COLUMNS
+    "Type", or Postgres's information_schema.data_type)."""
+    t = (type_str or "").strip().lower()
+    if _NUMERIC_TYPE_RE.match(t):
+        return "numeric"
+    if _STRING_TYPE_RE.match(t):
+        return "string"
+    return ""
+
+
+def _looks_numeric(literal: str) -> bool:
+    return bool(re.match(r"^-?\d+(\.\d+)?$", literal.strip()))
+
+
+_WHERE_LITERAL_RE = re.compile(
+    r"\b(?:(\w+)\.)?(\w+)\s*(?:=|<>|!=|<=|>=|<|>)\s*"
+    r"(?:'([^']*)'|(-?\d+(?:\.\d+)?))"
+)
+
+
+def _check_type_mismatches(sql: str, schema: dict, alias_map: dict) -> list:
+    """Flag a WHERE/ON predicate comparing a column against a literal of
+    the wrong broad type — a VARCHAR column against a bare numeric literal
+    forces MySQL/Postgres to cast the *column* on every row, silently
+    defeating any index on it; the reverse (numeric column vs. a
+    non-numeric-looking string) is very likely a bug either way."""
+    issues: list = []
+    flat = sql.replace("`", " ").replace('"', " ")
+    table_values = set(alias_map.values())
+    only_table = next(iter(table_values)) if len(table_values) == 1 else None
+    seen: set = set()
+
+    for m in _WHERE_LITERAL_RE.finditer(flat):
+        alias, col, str_lit, num_lit = m.groups()
+        table = alias_map.get(alias.lower()) if alias else only_table
+        if not table:
+            continue
+        table_schema = schema.get(table.lower())
+        if not table_schema:
+            continue
+        col_type = table_schema["columns"].get(col.lower())
+        if not col_type:
+            continue
+        category = _column_type_category(col_type)
+        if not category:
+            continue
+
+        mismatch = (
+            (category == "numeric" and str_lit is not None and not _looks_numeric(str_lit))
+            or (category == "string" and num_lit is not None)
+        )
+        if not mismatch:
+            continue
+
+        key = (table.lower(), col.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        literal_repr = f"'{str_lit}'" if str_lit is not None else num_lit
+        issues.append(Issue(
+            severity="MEDIUM",
+            code="TYPE_MISMATCH_PREDICATE",
+            message=f"`{table}`.`{col}` is {col_type.upper()} but is compared against "
+                    f"{literal_repr} — a mismatched literal type that can force an "
+                    f"implicit cast of the column, silently defeating any index on it.",
+            suggestion=f"Compare `{col}` against a same-typed literal (quote it if "
+                       f"`{col}` is a string column, or drop the quotes if it's "
+                       f"numeric) so an index on `{col}` can be used.",
+        ))
+    return issues
+
+
+_ON_CLAUSE_RE = re.compile(
+    r"\bON\b(.*?)(?=\bJOIN\b|\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_COL_EQ_COL_RE = re.compile(r"(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)")
+
+
+def _check_unindexed_join_keys(sql: str, schema: dict, alias_map: dict) -> list:
+    """Flag a JOIN ON column that is neither indexed nor a declared foreign
+    key on its table — every join against it forces a scan of that table's
+    matching rows rather than an index lookup."""
+    issues: list = []
+    flat = sql.replace("`", " ").replace('"', " ")
+    seen: set = set()
+
+    for on_m in _ON_CLAUSE_RE.finditer(flat):
+        for m in _COL_EQ_COL_RE.finditer(on_m.group(1)):
+            a1, c1, a2, c2 = m.groups()
+            for alias, col in ((a1, c1), (a2, c2)):
+                table = alias_map.get(alias.lower())
+                if not table:
+                    continue
+                table_schema = schema.get(table.lower())
+                if not table_schema:
+                    continue
+                col_lower = col.lower()
+                if col_lower not in table_schema["columns"]:
+                    continue  # not a real column on this table — don't guess
+                if (col_lower in table_schema["indexed_columns"]
+                        or col_lower in table_schema["fk_columns"]):
+                    continue
+                key = (table.lower(), col_lower)
+                if key in seen:
+                    continue
+                seen.add(key)
+                issues.append(Issue(
+                    severity="HIGH",
+                    code="UNINDEXED_JOIN_KEY",
+                    message=f"JOIN key `{table}`.`{col}` has no index and is not a "
+                            f"declared foreign key — every join against it forces a "
+                            f"scan of `{table}` rather than an index lookup.",
+                    suggestion=f"Add an index on `{table}`(`{col}`), or declare the "
+                               f"foreign key relationship if one exists.",
+                ))
+    return issues
+
+
+def _candidate_columns_for_table(sql: str, table: str, schema: dict, alias_map: dict) -> list:
+    """Real column name(s) from schema referenced in a WHERE/JOIN predicate
+    against *table* (which may itself be an alias) — used to name the
+    actual column in an index recommendation instead of a generic 'the
+    column(s)' phrase. [] if schema doesn't know this table or no
+    predicate column resolves, never guessed."""
+    real_table = alias_map.get(table.lower(), table)
+    table_schema = schema.get(real_table.lower())
+    if not table_schema:
+        return []
+
+    flat = sql.replace("`", " ").replace('"', " ")
+    cols: set = set()
+    for ref_name, tbl in alias_map.items():
+        if tbl.lower() != real_table.lower():
+            continue
+        for m in re.finditer(rf"\b{re.escape(ref_name)}\.(\w+)\b", flat, re.IGNORECASE):
+            col = m.group(1).lower()
+            if col in table_schema["columns"]:
+                cols.add(col)
+
+    if len(set(alias_map.values())) == 1:
+        where_m = re.search(
+            r"\bWHERE\b(.*?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|\bHAVING\b|$)",
+            flat, re.IGNORECASE | re.DOTALL,
+        )
+        if where_m:
+            for m in re.finditer(
+                    r"\b(\w+)\s*(?:=|<>|!=|<=|>=|<|>|LIKE\b|IN\b)",
+                    where_m.group(1), re.IGNORECASE):
+                col = m.group(1).lower()
+                if col in table_schema["columns"]:
+                    cols.add(col)
+
+    return sorted(cols)
+
+
+def _tables_from_mysql_rows(rows: list, alias_map: dict) -> set:
+    out: set = set()
+    for r in rows:
+        t = str(r.get("table", "") or "")
+        if t and not t.startswith("<"):
+            out.add(alias_map.get(t.lower(), t))
+    return out
+
+
+def _tables_from_pg_plan(node: dict) -> set:
+    out: set = set()
+    rel = node.get("Relation Name")
+    if rel:
+        out.add(rel)
+    for child in node.get("Plans", []) or []:
+        out |= _tables_from_pg_plan(child)
+    return out
+
+
+def _tables_from_profile_tree(node) -> set:
+    out: set = set()
+    if node is None:
+        return out
+    if node.table and not str(node.table).startswith("<"):
+        out.add(node.table)
+    for child in node.children:
+        out |= _tables_from_profile_tree(child)
+    return out
+
+
+def _index_suggestion(sql: str, table: str, schema: "dict | None", alias_map: dict, verb: str = "Add an index on") -> str:
+    """The FULL_TABLE_SCAN / NO_POSSIBLE_KEYS / SEQ_SCAN suggestion text —
+    names the real candidate column(s) when schema resolved them, else
+    falls back to today's generic wording."""
+    cols = _candidate_columns_for_table(sql, table, schema, alias_map) if schema else []
+    if cols:
+        col_list = ", ".join(f"`{c}`" for c in cols)
+        return (f"{verb} {col_list} for `{table}` — EXPLAIN reports no usable index "
+                f"(possible_keys=NULL) for that condition.")
+    return (f"{verb} the column(s) used in the WHERE / JOIN condition for `{table}` "
+            f"— EXPLAIN reports no usable index (possible_keys=NULL) for that condition.")
+
+
+# ===========================================================================
 # Static SQL-text rules — dialect independent
 # ===========================================================================
 
-def analyze_sql_text(sql: str) -> list:
+def analyze_sql_text(sql: str, schema: "dict | None" = None) -> list:
     """Rule-based SQL text analysis independent of EXPLAIN."""
     issues: list = []
     upper = sql.upper()
@@ -413,6 +704,14 @@ def analyze_sql_text(sql: str) -> list:
                        "joined back to the main query (one scan instead of N scans).",
         ))
 
+    if schema:
+        try:
+            alias_map = _parse_table_aliases(sql)
+            issues += _check_type_mismatches(sql, schema, alias_map)
+            issues += _check_unindexed_join_keys(sql, schema, alias_map)
+        except Exception as ex:
+            logger.debug(f"query_cost: schema-aware text checks failed: {ex}")
+
     return issues
 
 
@@ -420,10 +719,11 @@ def analyze_sql_text(sql: str) -> list:
 # MySQL — classic tabular EXPLAIN (pre-run)
 # ===========================================================================
 
-def analyze_explain_rows(rows: list, sql: str) -> list:
+def analyze_explain_rows(rows: list, sql: str, schema: "dict | None" = None) -> list:
     """MySQL classic EXPLAIN — one issue-detection pass per row."""
     issues: list = []
     total_rows_examined = 0
+    alias_map = _parse_table_aliases(sql) if schema else {}
 
     for row in rows:
         select_type = str(row.get("select_type", "")).upper()
@@ -448,9 +748,7 @@ def analyze_explain_rows(rows: list, sql: str) -> list:
                 message=f"Table `{tbl}` is read with a full scan (type=ALL, "
                         f"~{est_rows:,} estimated rows) — {reason}.",
                 suggestion=(
-                    f"Add an index on the column(s) used in the WHERE / JOIN "
-                    f"condition for `{tbl}` — EXPLAIN reports no usable index "
-                    f"(possible_keys=NULL) for that condition."
+                    _index_suggestion(sql, str(tbl), schema, alias_map)
                     if recommend_index else ""
                 ),
             ))
@@ -465,6 +763,7 @@ def analyze_explain_rows(rows: list, sql: str) -> list:
             else:
                 severity = {"medium": "MEDIUM", "large": "HIGH", "huge": "CRITICAL"}[tier]
                 recommend_index = True
+            cols = _candidate_columns_for_table(sql, str(tbl), schema, alias_map) if schema and recommend_index else []
             issues.append(Issue(
                 severity=severity,
                 code="NO_POSSIBLE_KEYS",
@@ -472,8 +771,10 @@ def analyze_explain_rows(rows: list, sql: str) -> list:
                         f"path (type={typ}, possible_keys=NULL, "
                         f"~{est_rows:,} estimated rows).",
                 suggestion=(
-                    f"Inspect the JOIN / WHERE predicates touching `{tbl}` "
-                    f"and create a covering index."
+                    (f"Create a covering index on {', '.join(f'`{c}`' for c in cols)} "
+                     f"for `{tbl}`." if cols else
+                     f"Inspect the JOIN / WHERE predicates touching `{tbl}` "
+                     f"and create a covering index.")
                     if recommend_index else ""
                 ),
             ))
@@ -536,7 +837,7 @@ def analyze_explain_rows(rows: list, sql: str) -> list:
                        "filter column, or use CTEs to pre-filter data.",
         ))
 
-    issues += analyze_sql_text(sql)
+    issues += analyze_sql_text(sql, schema)
     return issues
 
 
@@ -623,7 +924,9 @@ def _annotate_tree_from_explain_rows(node: "ProfileNode | None", rows: list) -> 
     walk(node)
 
 
-def _walk_mysql_profile(node: "ProfileNode", issues: list, sql: str) -> None:
+def _walk_mysql_profile(node: "ProfileNode", issues: list, sql: str,
+                         schema: "dict | None" = None, alias_map: "dict | None" = None) -> None:
+    alias_map = alias_map or {}
     desc_lower = node.node_type.lower()
     if "table scan" in desc_lower or "full scan" in desc_lower:
         # Same table-size/predicate/candidate-index evidence as the
@@ -645,9 +948,11 @@ def _walk_mysql_profile(node: "ProfileNode", issues: list, sql: str) -> None:
             message=f"Full scan of `{node.table or '?'}` — {node.rows_actual:,} actual "
                     f"rows over {node.loops} loop(s); {reason}.",
             suggestion=(
-                f"Add an index on the column(s) filtering `{node.table or 'this table'}` "
-                f"— EXPLAIN reports no usable index (possible_keys=NULL) for that condition."
-                if recommend_index else ""
+                _index_suggestion(sql, node.table or "?", schema, alias_map, verb="Add an index on")
+                if recommend_index and node.table else
+                (f"Add an index on the column(s) filtering this table — EXPLAIN reports "
+                 f"no usable index (possible_keys=NULL) for that condition."
+                 if recommend_index else "")
             ),
         ))
     if node.rows_estimated and node.rows_actual > node.rows_estimated * 10 and node.rows_actual > 1000:
@@ -661,14 +966,15 @@ def _walk_mysql_profile(node: "ProfileNode", issues: list, sql: str) -> None:
                        "Refresh table statistics.",
         ))
     for child in node.children:
-        _walk_mysql_profile(child, issues, sql)
+        _walk_mysql_profile(child, issues, sql, schema, alias_map)
 
 
-def analyze_mysql_profile(root: "ProfileNode | None", sql: str) -> list:
+def analyze_mysql_profile(root: "ProfileNode | None", sql: str, schema: "dict | None" = None) -> list:
     issues: list = []
+    alias_map = _parse_table_aliases(sql) if schema else {}
     if root:
-        _walk_mysql_profile(root, issues, sql)
-    issues += analyze_sql_text(sql)
+        _walk_mysql_profile(root, issues, sql, schema, alias_map)
+    issues += analyze_sql_text(sql, schema)
     return issues
 
 
@@ -695,9 +1001,13 @@ def _pg_node_to_profile(node: dict) -> "ProfileNode":
     return p
 
 
-def _walk_postgres_plan(node: dict, issues: list, has_actuals: bool) -> None:
+def _walk_postgres_plan(node: dict, issues: list, has_actuals: bool,
+                         sql: str = "", schema: "dict | None" = None,
+                         alias_map: "dict | None" = None) -> None:
+    alias_map = alias_map or {}
     node_type = node.get("Node Type", "")
     tbl = node.get("Relation Name", "") or node.get("Alias", "?")
+    real_tbl = node.get("Relation Name") or alias_map.get(str(tbl).lower(), tbl)
     plan_rows = _int(node.get("Plan Rows", 0))
     actual_rows = _int(node.get("Actual Rows", 0)) if has_actuals else plan_rows
 
@@ -707,7 +1017,10 @@ def _walk_postgres_plan(node: dict, issues: list, has_actuals: bool) -> None:
             code="SEQ_SCAN",
             message=f"Sequential scan on `{tbl}` "
                     f"(~{(actual_rows if has_actuals else plan_rows):,} rows).",
-            suggestion=f"Add an index on the column(s) used to filter or join `{tbl}`.",
+            suggestion=(
+                _index_suggestion(sql, real_tbl, schema, alias_map)
+                if schema else f"Add an index on the column(s) used to filter or join `{tbl}`."
+            ),
         ))
 
     sort_method = node.get("Sort Method", "")
@@ -743,14 +1056,16 @@ def _walk_postgres_plan(node: dict, issues: list, has_actuals: bool) -> None:
             ))
 
     for child in node.get("Plans", []) or []:
-        _walk_postgres_plan(child, issues, has_actuals)
+        _walk_postgres_plan(child, issues, has_actuals, sql, schema, alias_map)
 
 
-def analyze_postgres_plan(plan_root: dict, sql: str, has_actuals: bool = False) -> list:
+def analyze_postgres_plan(plan_root: dict, sql: str, has_actuals: bool = False,
+                           schema: "dict | None" = None) -> list:
     issues: list = []
+    alias_map = _parse_table_aliases(sql) if schema else {}
     if plan_root:
-        _walk_postgres_plan(plan_root, issues, has_actuals)
-    issues += analyze_sql_text(sql)
+        _walk_postgres_plan(plan_root, issues, has_actuals, sql, schema, alias_map)
+    issues += analyze_sql_text(sql, schema)
     return issues
 
 
@@ -809,7 +1124,9 @@ def estimate_cost(db_service, sql: str) -> CostEstimate:
         if dialect == "mysql":
             df = db_service.execute_query(f"EXPLAIN {clean}")
             rows = df.to_dict("records")
-            issues = analyze_explain_rows(rows, sql)
+            alias_map = _parse_table_aliases(sql)
+            schema = fetch_schema_context(db_service, _tables_from_mysql_rows(rows, alias_map))
+            issues = analyze_explain_rows(rows, sql, schema)
 
             # Best-effort: EXPLAIN FORMAT=TREE (MySQL 8.0.16+) gives the same
             # node tree as EXPLAIN ANALYZE minus the actual-time figures —
@@ -844,7 +1161,8 @@ def estimate_cost(db_service, sql: str) -> CostEstimate:
             raw = df.iloc[0, 0]
             plan_list = raw if isinstance(raw, list) else json.loads(raw)
             plan_root = plan_list[0]["Plan"]
-            issues = analyze_postgres_plan(plan_root, sql, has_actuals=False)
+            schema = fetch_schema_context(db_service, _tables_from_pg_plan(plan_root))
+            issues = analyze_postgres_plan(plan_root, sql, has_actuals=False, schema=schema)
             native_cost = float(plan_root["Total Cost"]) if "Total Cost" in plan_root else None
             estimated_rows = _int(plan_root.get("Plan Rows")) if "Plan Rows" in plan_root else None
             return CostEstimate(
@@ -884,7 +1202,10 @@ def build_profile(db_service, sql: str) -> QueryProfile:
                 except Exception as classic_ex:
                     logger.debug(f"query_cost: classic EXPLAIN unavailable for profile annotation: {classic_ex}")
 
-            issues = analyze_mysql_profile(root, sql)
+            alias_map = _parse_table_aliases(sql)
+            profile_tables = {alias_map.get(t.lower(), t) for t in _tables_from_profile_tree(root)}
+            schema = fetch_schema_context(db_service, profile_tables)
+            issues = analyze_mysql_profile(root, sql, schema)
             total_ms = root.time_ms if root else 0.0
             return QueryProfile(dialect, total_ms, root, issues)
 
@@ -895,7 +1216,8 @@ def build_profile(db_service, sql: str) -> QueryProfile:
             plan_list = raw if isinstance(raw, list) else json.loads(raw)
             plan_root_raw = plan_list[0]["Plan"]
             root = _pg_node_to_profile(plan_root_raw)
-            issues = analyze_postgres_plan(plan_root_raw, sql, has_actuals=True)
+            schema = fetch_schema_context(db_service, _tables_from_pg_plan(plan_root_raw))
+            issues = analyze_postgres_plan(plan_root_raw, sql, has_actuals=True, schema=schema)
             total_ms = float(plan_list[0].get("Execution Time", root.time_ms) or root.time_ms)
             return QueryProfile(dialect, total_ms, root, issues)
 
