@@ -10,13 +10,15 @@ This dialog only ever returns SQL text via get_sql(); the caller
 actually executing it against the database — same convention as
 StructureEditorDialog.
 """
-from PySide6.QtCore import Qt
+import copy
+
+from PySide6.QtCore import Qt, QObject, QThread, Signal
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget,
-    QTextEdit, QVBoxLayout, QWidget,
+    QMessageBox, QProgressBar, QPushButton, QSpinBox, QTableWidget,
+    QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from services import mock_data_generator as gen
@@ -34,11 +36,67 @@ _PREVIEW_STYLE = (
 _MAX_ROW_COUNT = 10_000
 _PREVIEW_ROW_CAP = 500
 
+# Issue #217 — below this, generation runs inline (sub-second, thread setup
+# would be pure overhead); at/above it, generation moves to a background
+# QThread with a progress indicator so a large run can't freeze the window.
+_BACKGROUND_ROW_THRESHOLD = 1_000
+
 # Generators with no configurable options — the Options button is disabled.
 _NO_OPTIONS = {"uuid", "boolean", "email", "first_name", "last_name",
                "full_name", "phone", "address", "city", "company", "job",
                "lorem_text", "null", "foreign_key", "omit",
                "json_object", "array", "geometry"}
+
+
+def _build_single_result(columns, row_count, specs, fk_pools, unique_columns, table_name, dialect):
+    """Pure (no Qt) single-table generation step (issue #217) — the actual
+    work `_GenerationWorker` runs off the UI thread. Kept as a standalone
+    function so it's testable without a QThread/event loop."""
+    df = gen.generate_dataframe(columns, row_count, specs, fk_pools, unique_columns=unique_columns)
+    sql = gen.build_insert_sql(df, table_name, dialect=dialect)
+    return {"df": df, "sql": sql}
+
+
+def _build_chain_result(chain, plans, external_pool_fn, dialect):
+    """Pure (no Qt) multi-table (issue #215) generation step for issue
+    #217's background worker — see _build_single_result."""
+    dataframes = gen.generate_chain_dataframes(chain, plans, external_pool_fn=external_pool_fn)
+    sql_parts = []
+    generated_pk_columns = []
+    for table in chain.tables:
+        df = dataframes.get(table)
+        if df is None or df.empty:
+            continue
+        sql_parts.append(gen.build_insert_sql(df, table, dialect=dialect))
+        plan = plans.get(table)
+        if plan and len(plan.primary_keys) == 1:
+            generated_pk_columns.append((table, plan.primary_keys[0]))
+    sql = "\n\n".join(p for p in sql_parts if p)
+    return {"dataframes": dataframes, "sql": sql, "generated_pk_columns": generated_pk_columns}
+
+
+class _GenerationWorker(QObject):
+    """Runs one of the pure functions above on a QThread (issue #217),
+    following _QueryWorker's shape in ui/connection_panel.py — but with no
+    DB connection of its own: any FK pool this needs was already resolved
+    to a plain in-memory dict on the main thread before the thread starts
+    (see MockDataDialog._regenerate_chain's prefetch step), so nothing
+    here ever touches self.db_service or a live connection from a
+    background thread."""
+    done = Signal(dict)
+    errored = Signal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        try:
+            result = self._fn()
+        except Exception as ex:
+            self.errored.emit(str(ex))
+            return
+        self.done.emit(result)
 
 
 class _OptionsDialog(QDialog):
@@ -149,6 +207,16 @@ class _OptionsDialog(QDialog):
 
 
 class MockDataDialog(QDialog):
+    # Issue #217 — bridge signals owned by this QDialog (main-thread
+    # affinity), exactly like ui/connection_panel.py's _QueryWorker usage
+    # (worker.done.connect(lambda ...: self._q_done.emit(...))). A signal
+    # connected straight to a plain closure/lambda has no QObject to infer
+    # thread affinity from, so Qt can't reliably queue delivery back to the
+    # main thread — connecting through a Signal *owned by this QObject* to
+    # a real bound method is what makes the cross-thread delivery correct.
+    _gen_result_ready = Signal(dict, int)
+    _gen_error = Signal(str, int)
+
     def __init__(self, table_name: str, columns: list[dict],
                  primary_keys: list[str], foreign_keys: list[dict],
                  generated_columns: list[str], dialect: str = "mysql",
@@ -279,10 +347,19 @@ class MockDataDialog(QDialog):
         self._tabs.addTab(self._sql_view, "SQL")
         layout.addWidget(self._tabs, stretch=1)
 
+        # Issue #217 — indeterminate while a background generation run is in
+        # flight; hidden otherwise. Real progress isn't reported since the
+        # actual bottleneck (Faker calls per row) isn't a fixed-cost
+        # per-row loop worth instrumenting — just proof the app is alive.
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 0)
+        self._progress_bar.setVisible(False)
+        layout.addWidget(self._progress_bar)
+
         action_row = QHBoxLayout()
-        regen_btn = QPushButton("Regenerate")
-        regen_btn.clicked.connect(self._regenerate)
-        action_row.addWidget(regen_btn)
+        self._regen_btn = QPushButton("Regenerate")
+        self._regen_btn.clicked.connect(self._regenerate)
+        action_row.addWidget(self._regen_btn)
         copy_btn = QPushButton("Copy SQL")
         copy_btn.clicked.connect(self._copy_sql)
         action_row.addWidget(copy_btn)
@@ -290,11 +367,18 @@ class MockDataDialog(QDialog):
         layout.addLayout(action_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("Insert into Database…")
+        self._ok_button = buttons.button(QDialogButtonBox.Ok)
+        self._ok_button.setText("Insert into Database…")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        self._run_token = 0
+        self._gen_thread = None
+        self._gen_worker = None
+        self._pending_on_done = None
+        self._gen_result_ready.connect(self._on_gen_result_ready)
+        self._gen_error.connect(self._on_gen_error)
         self._regenerate()
 
     # ─── Column config grid ────────────────────────────────────────────────
@@ -512,6 +596,69 @@ class MockDataDialog(QDialog):
         else:
             self._regenerate_single()
 
+    def _set_busy(self, busy: bool):
+        self._progress_bar.setVisible(busy)
+        self._regen_btn.setEnabled(not busy)
+        self._ok_button.setEnabled(not busy)
+
+    def _start_generation(self, fn, on_done, total_rows: int = 0):
+        """Run *fn* (one of the pure _build_*_result functions above) and
+        deliver its result dict to *on_done*. Below _BACKGROUND_ROW_THRESHOLD
+        this just calls *fn* inline — a sub-second call, so QThread
+        setup/teardown would be pure overhead, and every existing caller
+        (including tests) keeps seeing Regenerate complete synchronously.
+        At/above the threshold (issue #217's actual concern — a large row
+        count risking a frozen window) it runs on a background QThread
+        instead, with a monotonic run token to discard a stale result if
+        the user changes settings and clicks Regenerate again before the
+        previous run finished."""
+        self._run_token += 1
+        token = self._run_token
+        if total_rows < _BACKGROUND_ROW_THRESHOLD:
+            on_done(fn())
+            return
+        self._set_busy(True)
+        self._pending_on_done = on_done
+
+        thread = QThread(self)
+        worker = _GenerationWorker(fn)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        # Bridge to this QDialog's own signals (see class docstring comment
+        # above _gen_result_ready) — cheap re-emit from whichever thread
+        # calls it, safe to call from the worker thread.
+        worker.done.connect(lambda result: self._gen_result_ready.emit(result, token))
+        worker.errored.connect(lambda message: self._gen_error.emit(message, token))
+        # Same quit/deleteLater convention as _QueryWorker's usage in
+        # ui/connection_panel.py.
+        worker.done.connect(thread.quit)
+        worker.errored.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        # Keep references alive for the run's duration (same as _QueryWorker
+        # in ui/connection_panel.py) — nothing else holds them otherwise.
+        self._gen_thread = thread
+        self._gen_worker = worker
+        thread.start()
+
+    def _on_gen_result_ready(self, result: dict, token: int):
+        self._gen_thread = None
+        self._gen_worker = None
+        on_done, self._pending_on_done = self._pending_on_done, None
+        if token == self._run_token:
+            self._set_busy(False)
+            if on_done:
+                on_done(result)
+
+    def _on_gen_error(self, message: str, token: int):
+        self._gen_thread = None
+        self._gen_worker = None
+        self._pending_on_done = None
+        if token == self._run_token:
+            self._set_busy(False)
+            QMessageBox.critical(self, "Error", f"Mock data generation failed:\n{message}")
+
     def _regenerate_single(self):
         row_count = self._row_count_spin.value()
         fk_pools = {
@@ -539,12 +686,26 @@ class MockDataDialog(QDialog):
                 )
         self._warning_label.setText("⚠ " + "; ".join(warnings) if warnings else "")
 
-        df = gen.generate_dataframe(self._columns, row_count, self._specs, fk_pools,
-                                     unique_columns=self._unique_columns)
-        self._populate_preview(df)
-        self._last_sql = gen.build_insert_sql(df, self._table_name, dialect=self._dialect)
-        self._sql_view.setPlainText(self._last_sql or "-- No columns selected to insert.")
-        self._generated_pk_columns = []
+        # fk_pools is already plain data (a cached, already-fetched sample) —
+        # the only thing handed to the background thread below, alongside a
+        # deep copy of self._specs so a mid-run edit to the column grid
+        # can't race the worker reading the same ColumnSpec objects.
+        specs_snapshot = copy.deepcopy(self._specs)
+        columns, table_name, dialect, unique_columns = (
+            self._columns, self._table_name, self._dialect, self._unique_columns,
+        )
+
+        def _done(result):
+            self._populate_preview(result["df"])
+            self._last_sql = result["sql"]
+            self._sql_view.setPlainText(self._last_sql or "-- No columns selected to insert.")
+            self._generated_pk_columns = []
+
+        self._start_generation(
+            lambda: _build_single_result(columns, row_count, specs_snapshot, fk_pools,
+                                          unique_columns, table_name, dialect),
+            _done, total_rows=row_count,
+        )
 
     def _regenerate_chain(self):
         chain = self._dependency_chain
@@ -557,52 +718,72 @@ class MockDataDialog(QDialog):
             unique_columns=self._unique_columns, enum_values=self._enum_values,
         )
 
-        dataframes = gen.generate_chain_dataframes(chain, plans, external_pool_fn=self._sample_external)
-
-        root_df = dataframes.get(self._table_name)
-        if root_df is not None:
-            self._populate_preview(root_df)
-            extra = [t for t in chain.tables if t != self._table_name and dataframes.get(t) is not None]
-            if extra:
-                current = self._tabs.tabText(0)
-                self._tabs.setTabText(
-                    0, f"{current}  (+{len(extra)} ancestor table{'s' if len(extra) != 1 else ''})"
-                )
-
-        sql_parts = []
-        self._generated_pk_columns = []
+        # Issue #217: pre-resolve every external FK pool this chain could
+        # need *before* threading, so the background worker never touches
+        # self.db_service (not thread-safe to share with the main thread's
+        # own use of that same connection). Mirrors exactly which edges
+        # generate_chain_dataframes would otherwise call external_pool_fn
+        # for: a declared external edge, or a parent table that's being
+        # reused (row_count <= 0) rather than freshly generated.
         for table in chain.tables:
-            df = dataframes.get(table)
-            if df is None or df.empty:
-                continue
-            sql_parts.append(gen.build_insert_sql(df, table, dialect=self._dialect))
             plan = plans.get(table)
-            if plan and len(plan.primary_keys) == 1:
-                self._generated_pk_columns.append((table, plan.primary_keys[0]))
-
-        self._last_sql = "\n\n".join(p for p in sql_parts if p)
-        self._sql_view.setPlainText(self._last_sql or "-- No columns selected to insert.")
-
-        notes = []
-        if chain.truncated:
-            notes.append("dependency chain was too large — only part of it is included")
-        if any(chain.external_edges.values()):
-            notes.append(
-                "some references use existing data instead of freshly generated "
-                "rows (self-referencing or circular foreign keys)"
-            )
-        for table, plan in plans.items():
-            df = dataframes.get(table)
-            if df is None or plan.row_count <= 0:
+            if not plan or plan.row_count <= 0:
                 continue
-            not_null_cols = {c["Field"] for c in plan.columns if c.get("Null") == "NO"}
+            ext_cols = chain.external_edges.get(table, set())
             for fk in plan.foreign_keys:
-                col = fk["column"]
-                if col in df.columns and col in not_null_cols and df[col].isna().any():
-                    notes.append(
-                        f"'{table}.{col}' references an empty table — the insert will fail (NOT NULL)"
+                column, ref_table, ref_column = fk.get("column"), fk.get("ref_table"), fk.get("ref_column")
+                if not ref_table or not ref_column:
+                    continue
+                ref_plan = plans.get(ref_table)
+                if column in ext_cols or not ref_plan or ref_plan.row_count <= 0:
+                    self._sample_external(ref_table, ref_column)
+        pool_cache_snapshot = dict(self._fk_pool_cache)
+        plans_snapshot = copy.deepcopy(plans)
+        dialect = self._dialect
+
+        def _done(result):
+            dataframes = result["dataframes"]
+            root_df = dataframes.get(self._table_name)
+            if root_df is not None:
+                self._populate_preview(root_df)
+                extra = [t for t in chain.tables if t != self._table_name and dataframes.get(t) is not None]
+                if extra:
+                    current = self._tabs.tabText(0)
+                    self._tabs.setTabText(
+                        0, f"{current}  (+{len(extra)} ancestor table{'s' if len(extra) != 1 else ''})"
                     )
-        self._warning_label.setText("⚠ " + "; ".join(notes) if notes else "")
+
+            self._last_sql = result["sql"]
+            self._sql_view.setPlainText(self._last_sql or "-- No columns selected to insert.")
+            self._generated_pk_columns = result["generated_pk_columns"]
+
+            notes = []
+            if chain.truncated:
+                notes.append("dependency chain was too large — only part of it is included")
+            if any(chain.external_edges.values()):
+                notes.append(
+                    "some references use existing data instead of freshly generated "
+                    "rows (self-referencing or circular foreign keys)"
+                )
+            for table, plan in plans.items():
+                df = dataframes.get(table)
+                if df is None or plan.row_count <= 0:
+                    continue
+                not_null_cols = {c["Field"] for c in plan.columns if c.get("Null") == "NO"}
+                for fk in plan.foreign_keys:
+                    col = fk["column"]
+                    if col in df.columns and col in not_null_cols and df[col].isna().any():
+                        notes.append(
+                            f"'{table}.{col}' references an empty table — the insert will fail (NOT NULL)"
+                        )
+            self._warning_label.setText("⚠ " + "; ".join(notes) if notes else "")
+
+        total_rows = sum(p.row_count for p in plans.values() if p.row_count > 0)
+        self._start_generation(
+            lambda: _build_chain_result(chain, plans_snapshot,
+                                         lambda t, c: pool_cache_snapshot.get((t, c), []), dialect),
+            _done, total_rows=total_rows,
+        )
 
     def _populate_preview(self, df):
         # QTableWidgetItem construction, not DataFrame generation, is what

@@ -4,6 +4,7 @@ generated INSERT, a NOT NULL column set to "Always NULL" must warn, and the
 Preview grid must never render more rows than the row count that actually
 freezes the UI, regardless of how many rows were requested."""
 import os
+import time
 
 import pytest
 
@@ -13,7 +14,9 @@ pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
 
 from services.mock_data_generator import build_dependency_chain
-from ui.mock_data_dialog import _MAX_ROW_COUNT, _PREVIEW_ROW_CAP, MockDataDialog
+from ui.mock_data_dialog import (
+    _BACKGROUND_ROW_THRESHOLD, _MAX_ROW_COUNT, _PREVIEW_ROW_CAP, MockDataDialog,
+)
 
 _app = QApplication.instance() or QApplication([])
 
@@ -202,6 +205,29 @@ def test_ancestor_with_existing_rows_defaults_to_reuse_not_generate():
     # fallback for the reused ancestor share one cache entry, not two queries.
     assert sampled == [("customers", "id")]
     assert dlg.generated_pk_columns() == [("orders", "id")]  # root only — customers was reused, not generated
+
+
+# ─── Background generation + progress UI (issue #217) ─────────────────────
+
+def test_large_row_count_generates_on_background_thread():
+    dlg = _make_dialog(columns=[_col("id", "int(11)", nullable="NO"), _col("name", "varchar(50)")],
+                        primary_keys=["id"])
+    requested = _BACKGROUND_ROW_THRESHOLD + 50
+    dlg._row_count_spin.setValue(requested)
+    dlg._regenerate()
+
+    assert dlg._gen_thread is not None  # dispatched to a background thread, not run inline
+    assert dlg._regen_btn.isEnabled() is False
+    assert dlg._progress_bar.isVisible() is True
+
+    deadline = time.time() + 10
+    while dlg._gen_thread is not None and time.time() < deadline:
+        QApplication.processEvents()
+
+    assert dlg._gen_thread is None
+    assert dlg._regen_btn.isEnabled() is True
+    assert dlg._progress_bar.isVisible() is False
+    assert dlg.get_sql().count("INSERT INTO") == requested
 
 
 def test_chain_mode_warns_when_not_null_fk_column_has_empty_pool():
