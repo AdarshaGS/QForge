@@ -1,3 +1,4 @@
+import re
 import time
 import pymysql
 import pandas as pd
@@ -809,6 +810,89 @@ class DbService:
             pass
         return []
 
+    _MYSQL_ENUM_RE = re.compile(r"^enum\((.*)\)$", re.IGNORECASE)
+    _MYSQL_ENUM_ITEM_RE = re.compile(r"'((?:[^']|'')*)'")
+
+    def get_enum_values(self, table_name: str, column: str) -> list[str] | None:
+        """Real allowed-value set for an ENUM-typed *column*, or None if it
+        isn't one (issue #211). MySQL's `Type` string already spells the
+        values out (`enum('a','b')`) — no extra query. Postgres enums are a
+        named type (`udt_name`), so the labels live in `pg_enum`."""
+        try:
+            columns = self.get_columns(table_name)
+            col = next((c for c in columns if c.get("Field") == column), None)
+            if not col:
+                return None
+            if self.db_type == "mysql":
+                m = self._MYSQL_ENUM_RE.match((col.get("Type") or "").strip())
+                if not m:
+                    return None
+                return [item.replace("''", "'") for item in self._MYSQL_ENUM_ITEM_RE.findall(m.group(1))]
+            elif self.db_type == "postgresql":
+                if (col.get("Type") or "") != "USER-DEFINED":
+                    return None
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT e.enumlabel
+                    FROM pg_enum e
+                    JOIN pg_type t ON t.oid = e.enumtypid
+                    WHERE t.typname = %s
+                    ORDER BY e.enumsortorder
+                """, (col.get("udt_name"),))
+                rows = [r[0] for r in cursor.fetchall()]
+                cursor.close()
+                return rows or None
+        except Exception:
+            pass
+        return None
+
+    _CHECK_IN_RE = re.compile(
+        r"[`\"]?(\w+)[`\"]?\s*(?:=\s*ANY\s*\(\s*ARRAY\s*\[(.*?)\]|IN\s*\((.*?)\))",
+        re.IGNORECASE | re.DOTALL,
+    )
+    _CHECK_ITEM_RE = re.compile(r"'((?:[^']|'')*)'")
+
+    def get_check_constraint_values(self, table_name: str) -> dict[str, list[str]]:
+        """Best-effort {column: [allowed values]} for simple
+        `col IN ('a','b',...)` / `col = ANY (ARRAY['a','b',...])` shaped
+        CHECK constraints (issue #211) — anything more complex (ranges,
+        multi-column, regex) is silently skipped, never raised, and that
+        column just falls back to today's generic generation."""
+        result: dict[str, list[str]] = {}
+        try:
+            cursor = self.connection.cursor()
+            if self.db_type == "mysql":
+                cursor.execute("""
+                    SELECT cc.CHECK_CLAUSE
+                    FROM information_schema.CHECK_CONSTRAINTS cc
+                    JOIN information_schema.TABLE_CONSTRAINTS tc
+                         ON tc.CONSTRAINT_NAME = cc.CONSTRAINT_NAME
+                        AND tc.CONSTRAINT_SCHEMA = cc.CONSTRAINT_SCHEMA
+                    WHERE tc.TABLE_SCHEMA = DATABASE() AND tc.TABLE_NAME = %s
+                """, (table_name,))
+                clauses = [r["CHECK_CLAUSE"] for r in cursor.fetchall()]
+            elif self.db_type == "postgresql":
+                cursor.execute("""
+                    SELECT pg_get_constraintdef(oid)
+                    FROM pg_constraint
+                    WHERE conrelid = %s::regclass AND contype = 'c'
+                """, (table_name,))
+                clauses = [r[0] for r in cursor.fetchall()]
+            else:
+                clauses = []
+            cursor.close()
+            for clause in clauses:
+                m = self._CHECK_IN_RE.search(clause or "")
+                if not m:
+                    continue
+                column, items_src = m.group(1), (m.group(2) or m.group(3) or "")
+                values = [v.replace("''", "'") for v in self._CHECK_ITEM_RE.findall(items_src)]
+                if values:
+                    result[column] = values
+        except Exception:
+            return {}
+        return result
+
     def get_estimated_row_count(self, table_name: str) -> int | None:
         """Fast, stats-based row-count estimate — reads catalog metadata
         instead of scanning the table, so it stays instant on tables too
@@ -1215,14 +1299,19 @@ class DbService:
             cursor = self.connection.cursor()
             cursor.execute("""
                 SELECT column_name as "Field", data_type as "Type",
-                       is_nullable as "Null", column_default as "Default"
+                       is_nullable as "Null", column_default as "Default",
+                       udt_name as "udt_name"
                 FROM information_schema.columns
                 WHERE table_name = %s
                 ORDER BY ordinal_position
             """, (table_name,))
             result = cursor.fetchall()
-            # Convert to dict format similar to MySQL
-            return [{"Field": row[0], "Type": row[1], "Null": row[2], "Default": row[3]}
+            # Convert to dict format similar to MySQL. udt_name disambiguates
+            # what "Type" alone can't: ARRAY columns (element type, e.g.
+            # "_int4") and USER-DEFINED columns (enum/PostGIS geometry type
+            # name) — see mock_data_generator.infer_generator (issues #211, #214).
+            return [{"Field": row[0], "Type": row[1], "Null": row[2], "Default": row[3],
+                     "udt_name": row[4]}
                     for row in result]
 
         else:
