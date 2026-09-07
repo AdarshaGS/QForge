@@ -615,7 +615,7 @@ class ConnectionPanel(QWidget):
         self._schema_loading = False
         self._schema_loading_stale = False
         self._schema_loading_refresh = False
-        self._schema_loading_label = None
+        self._schema_loading_phase = None
         self._schema_tables_seen = 0
         self._schema_retry_item = None
         self._schema_fetch_t0 = None  # perf_metrics: set by _spawn_schema_fetch, read by _on_schema_loaded
@@ -1173,7 +1173,7 @@ class ConnectionPanel(QWidget):
         self._schema_loading = True
         self._schema_loading_stale = stale
         self._schema_loading_refresh = refreshing
-        self._schema_loading_label = label
+        self._schema_loading_phase = label
         self._schema_tables_seen = 0
         self._schema_load_start = time.time()
         self._schema_progress_bar.show()
@@ -1192,8 +1192,8 @@ class ConnectionPanel(QWidget):
         elapsed = time.time() - self._schema_load_start
         if self._schema_tables_seen:
             text = f"{self._schema_tables_seen:,} table(s) found — loading details… {elapsed:.1f}s"
-        elif self._schema_loading_label:
-            text = f"{self._schema_loading_label}… {elapsed:.1f}s"
+        elif self._schema_loading_phase:
+            text = f"{self._schema_loading_phase}… {elapsed:.1f}s"
         elif self._schema_loading_stale:
             text = f"Cached schema (stale) — refreshing… {elapsed:.1f}s"
         elif self._schema_loading_refresh:
