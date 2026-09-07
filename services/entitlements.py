@@ -63,11 +63,14 @@ class Entitlements:
 
     def limit(self, limit: Limit) -> int | None:
         """None means unlimited."""
-        table = self._pro_limits if self.edition() is Edition.PRO else self._free_limits
+        if config.ALL_FEATURES_FREE or self.edition() is Edition.PRO:
+            table = self._pro_limits
+        else:
+            table = self._free_limits
         return table.get(limit.value)
 
     def is_enabled(self, feature: Feature) -> bool:
-        if self.edition() is Edition.PRO:
+        if config.ALL_FEATURES_FREE or self.edition() is Edition.PRO:
             return True
         return feature.value not in self._pro_only_features
 

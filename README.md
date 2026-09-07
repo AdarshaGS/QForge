@@ -37,17 +37,20 @@ app and user settings are stored under `~/Library/Application Support/QForge`.
 ## Free vs. Pro
 
 QForge Free covers everyday database work with no license required and no
-internet connection needed: MySQL/PostgreSQL connections, the SQL
-editor and result grid, the schema explorer, and a basic ER diagram, each
-capped at a sensible limit —
+internet connection needed: unlimited connections, the SQL editor and result
+grid, the schema explorer, the query analyzer (cost/profile and query
+compare with `EXPLAIN`), and a basic ER diagram. A few things are capped or
+reserved for Pro —
 
 | | Free | Pro |
 | --- | --- | --- |
-| Saved connections | 5 | Unlimited |
+| Saved connections | Unlimited | Unlimited |
 | Query tabs per connection | 5 | Unlimited |
-| Query history | 20 entries | 100 entries |
+| Query history | 100 entries | Unlimited |
 | ER diagram | First 10 tables | Full diagram |
 | Schema Compare | — | ✓ |
+| Data Compare | — | ✓ |
+| Impact Analysis (find usages / dependents) | — | ✓ |
 
 Reaching a limit, or opening a Pro-only feature, shows an in-app "Upgrade to
 Pro" dialog explaining what's gated and why — it never blocks a basic

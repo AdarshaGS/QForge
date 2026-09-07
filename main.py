@@ -15,7 +15,7 @@ from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon, QAction
 from services.db_service import DbService
 from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
-from services.entitlements import Edition, entitlements
+from services.entitlements import Edition, Feature, entitlements
 from services.license_manager import license_manager
 from ui.command_palette import show_command_palette
 from ui.connection_dialog import ConnectionDialog
@@ -1015,9 +1015,13 @@ class MainWindow(QMainWindow):
         """Keeps the menu bar's Pro-affordance labels in sync with the
         current edition — called after license activate/deactivate and
         after a remote entitlement-config fetch changes what's gated."""
-        is_free = entitlements.edition() is Edition.FREE
-        self.schema_compare_action.setText("Compare Schemas… (Pro)" if is_free else "Compare Schemas…")
-        self.license_action.setText("Upgrade to Pro…" if is_free else "License…")
+        schema_compare_gated = not entitlements.is_enabled(Feature.SCHEMA_COMPARE)
+        self.schema_compare_action.setText(
+            "Compare Schemas… (Pro)" if schema_compare_gated else "Compare Schemas…"
+        )
+        self.license_action.setText(
+            "Upgrade to Pro…" if entitlements.edition() is Edition.FREE else "License…"
+        )
 
     # ─── Theme ───────────────────────────────────────────────────────────────
 

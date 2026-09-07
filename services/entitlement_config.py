@@ -26,13 +26,21 @@ ENTITLEMENT_CONFIG_URL = (
     "https://raw.githubusercontent.com/AdarshaGS/QForge-releases/main/entitlements-config.json"
 )
 
+# Master kill switch for monetization: when True, services/entitlements.py's
+# limit()/is_enabled() ignore the actual license edition and always grant
+# Pro-level limits and features to everyone. All the Free/Pro plumbing below
+# (limits, PRO_ONLY_FEATURES, the license/edition machinery) stays intact and
+# untouched — flip this back to False to restore normal Free/Pro gating with
+# no other code changes.
+ALL_FEATURES_FREE = True
+
 # ── Bundled defaults (offline fallback) ─────────────────────────────────────
 
 FREE_LIMITS = {
-    "max_connections": 5,
+    "max_connections": None,  # unlimited for everyone — not a distinguishing limit
     "max_query_tabs": 5,
     "saved_queries": None,  # unlimited on Free too — not a distinguishing limit
-    "query_history": 20,
+    "query_history": 100,
     "er_diagram_tables": 10,
 }
 
@@ -42,9 +50,7 @@ PRO_LIMITS = {
     "max_query_tabs": None,
     "saved_queries": None,
     "er_diagram_tables": None,
-    # Not a monetization limit — just storage sanity, matches the app's
-    # original hardcoded QueryHistory.MAX_HISTORY.
-    "query_history": 100,
+    "query_history": None,
 }
 
 PRO_ONLY_FEATURES = {"schema_compare", "advanced_erd", "data_compare", "impact_analysis"}
@@ -53,9 +59,8 @@ PRICING_URL = "https://qforge-licensing-production.up.railway.app/#pricing"
 PRICE_LABEL = "$49/lifetime"
 
 PRO_BENEFITS = [
-    "Unlimited connections & query tabs",
-    "Unlimited saved queries",
-    "Full query history",
+    "Unlimited query tabs",
+    "Unlimited query history",
     "Full ER diagrams",
     "Schema Compare",
     "Data Compare",

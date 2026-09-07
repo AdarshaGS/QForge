@@ -15,7 +15,7 @@ GITHUB_USER = "AdarshaGS"
 # app. Releases are published to this separate public repo instead — see
 # .github/workflows/build-release.yml's "release" job.
 GITHUB_REPO = "QForge-releases"
-APP_VERSION  = "1.4.1"        # bump this, commit, then tag as v<APP_VERSION> to release
+APP_VERSION  = "1.5.0"        # bump this, commit, then tag as v<APP_VERSION> to release
 
 
 def _vtuple(tag: str) -> tuple:

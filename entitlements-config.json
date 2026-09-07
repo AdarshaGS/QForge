@@ -2,10 +2,10 @@
   "_comment": "Live Free/Pro entitlement override, fetched by every QForge install at startup (services/entitlement_config.py / utils/entitlement_fetcher.py). Edit and push to this file to change a limit or the price for every installed copy without shipping a new release. A malformed or missing key here is ignored per-key and falls back to the app's bundled default for that key only.",
 
   "free_limits": {
-    "max_connections": 5,
+    "max_connections": null,
     "max_query_tabs": 5,
     "saved_queries": null,
-    "query_history": 20,
+    "query_history": 100,
     "er_diagram_tables": 10
   },
 
@@ -14,22 +14,21 @@
     "max_query_tabs": null,
     "saved_queries": null,
     "er_diagram_tables": null,
-    "query_history": 100
+    "query_history": null
   },
 
-  "pro_only_features": ["schema_compare", "advanced_erd", "query_verifier", "data_compare"],
+  "pro_only_features": ["schema_compare", "advanced_erd", "data_compare", "impact_analysis"],
 
   "pricing_url": "https://qforge-licensing-production.up.railway.app/#pricing",
   "price_label": "$49/lifetime",
 
   "pro_benefits": [
-    "Unlimited connections & query tabs",
-    "Unlimited saved queries",
-    "Full query history",
+    "Unlimited query tabs",
+    "Unlimited query history",
     "Full ER diagrams",
     "Schema Compare",
-    "Query Verifier",
     "Data Compare",
+    "Impact Analysis (find usages / dependents)",
     "Priority support"
   ]
 }
