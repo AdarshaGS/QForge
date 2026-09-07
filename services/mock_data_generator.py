@@ -31,6 +31,50 @@ from utils.df_export import _to_sql_inserts
 
 _fake = Faker()
 
+# Curated subset of Faker's supported locales (issue #218) — not every one
+# it ships, just a reasonable spread of what a real connected database's
+# audience is likely to be. (display name, Faker locale code).
+SUPPORTED_LOCALES = [
+    ("English (US)", "en_US"),
+    ("English (UK)", "en_GB"),
+    ("English (India)", "en_IN"),
+    ("English (Australia)", "en_AU"),
+    ("English (Canada)", "en_CA"),
+    ("German", "de_DE"),
+    ("French", "fr_FR"),
+    ("Spanish (Spain)", "es_ES"),
+    ("Spanish (Mexico)", "es_MX"),
+    ("Italian", "it_IT"),
+    ("Portuguese (Brazil)", "pt_BR"),
+    ("Portuguese (Portugal)", "pt_PT"),
+    ("Dutch", "nl_NL"),
+    ("Japanese", "ja_JP"),
+    ("Chinese (Simplified)", "zh_CN"),
+    ("Korean", "ko_KR"),
+    ("Russian", "ru_RU"),
+    ("Polish", "pl_PL"),
+]
+
+
+def configure(locale: str | None = None, seed: int | None = None) -> None:
+    """(Re)configure the module's shared Faker instance (issues #216, #218).
+    *locale*=None keeps the default English (US) provider; an unsupported
+    locale string falls back to it too rather than raising. *seed*=None
+    leaves the random state alone — both are opt-in, so existing "just
+    generate something plausible" behavior is unchanged unless a caller
+    actually asks for a seed/locale. Faker keeps its own `Random` instance
+    separate from the stdlib `random` module, so reproducibility needs
+    both seeded — global `random.seed` alone isn't enough."""
+    global _fake
+    try:
+        _fake = Faker(locale) if locale else Faker()
+    except Exception:
+        _fake = Faker()
+    if seed is not None:
+        random.seed(seed)
+        _fake.seed_instance(seed)
+
+
 GENERATOR_LABELS = {
     "integer": "Integer",
     "float": "Float",

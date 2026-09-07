@@ -11,6 +11,7 @@ actually executing it against the database — same convention as
 StructureEditorDialog.
 """
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -222,6 +223,23 @@ class MockDataDialog(QDialog):
         self._row_count_spin.setRange(1, _MAX_ROW_COUNT)
         self._row_count_spin.setValue(10)
         top_row.addWidget(self._row_count_spin)
+
+        # Issue #216 — optional seed; blank means unseeded (today's
+        # behavior, unchanged). Issue #218 — locale, defaulting to
+        # English (US), the historical hardcoded behavior.
+        top_row.addWidget(QLabel("Seed (optional):"))
+        self._seed_edit = QLineEdit()
+        self._seed_edit.setValidator(QIntValidator(0, 2_147_483_647, self))
+        self._seed_edit.setFixedWidth(90)
+        self._seed_edit.setPlaceholderText("random")
+        top_row.addWidget(self._seed_edit)
+
+        top_row.addWidget(QLabel("Locale:"))
+        self._locale_combo = QComboBox()
+        for display_name, code in gen.SUPPORTED_LOCALES:
+            self._locale_combo.addItem(display_name, code)
+        top_row.addWidget(self._locale_combo)
+
         top_row.addStretch()
         layout.addLayout(top_row)
 
@@ -482,6 +500,13 @@ class MockDataDialog(QDialog):
         return self._generated_pk_columns
 
     def _regenerate(self):
+        # Issues #216/#218 — re-applied on every Regenerate (not just once
+        # at dialog construction) so a fixed seed reproduces byte-identical
+        # SQL across repeated clicks, and changing the locale mid-session
+        # takes effect immediately.
+        seed_text = self._seed_edit.text().strip()
+        gen.configure(locale=self._locale_combo.currentData(),
+                      seed=int(seed_text) if seed_text else None)
         if self._include_deps_check is not None and self._include_deps_check.isChecked():
             self._regenerate_chain()
         else:

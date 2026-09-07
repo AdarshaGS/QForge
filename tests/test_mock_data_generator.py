@@ -326,3 +326,27 @@ def test_json_and_array_generators_produce_valid_literals():
     df = gen.generate_dataframe(columns, 5, specs)
     assert all(json.loads(v) for v in df["attrs"])
     assert all(re.match(r"^\{.*\}$", v) for v in df["tags"])
+
+
+# ─── Seed control for reproducibility (issue #216) ─────────────────────────
+
+def test_configure_with_seed_makes_generation_reproducible():
+    columns = [_col("name", "varchar(100)"), _col("age", "int(11)")]
+    specs = {
+        "name": gen.ColumnSpec(generator="full_name"),
+        "age": gen.ColumnSpec(generator="integer"),
+    }
+    gen.configure(seed=42)
+    first = gen.generate_dataframe(columns, 20, specs)
+    gen.configure(seed=42)
+    second = gen.generate_dataframe(columns, 20, specs)
+    assert first.equals(second)
+    gen.configure()  # reset for other tests in this module
+
+
+# ─── Locale selection (issue #218) ─────────────────────────────────────────
+
+def test_configure_with_locale_does_not_raise():
+    gen.configure(locale="fr_FR")
+    assert gen._fake.first_name()
+    gen.configure()  # reset for other tests in this module
