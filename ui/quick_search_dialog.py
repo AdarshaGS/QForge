@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QLabel,
+    QCheckBox,
     QStyle,
     QStyledItemDelegate,
 )
@@ -136,7 +137,8 @@ class QuickSearchDialog(QDialog):
 
     def __init__(self, all_items, parent=None, column_items=None,
                  recency_scores=None, recent_items=None, sources=None,
-                 empty_state_label="Recent", empty_state_limit=15):
+                 empty_state_label="Recent", empty_state_limit=15,
+                 broaden_items=None, broaden_column_items=None):
         super().__init__(parent)
 
         # Add Cmd+W shortcut to close dialog
@@ -152,6 +154,20 @@ class QuickSearchDialog(QDialog):
         # Columns are kept out of the default result set (issue #241) but
         # stay searchable via the explicit "c:" prefix below.
         self.column_items = self._normalize(column_items or [])
+
+        # issue #266: global search defaults to whatever *all_items*/
+        # *column_items* the caller scoped it to (normally just the active
+        # connection). When the caller also has other open connections, it
+        # passes the unscoped superset here and a checkbox lets the user
+        # explicitly broaden the search to all of them — kept off by
+        # default so results from unrelated DBs don't pollute the list.
+        self._scoped_items = self.all_items
+        self._scoped_column_items = self.column_items
+        self._broaden_items = self._normalize(broaden_items) if broaden_items is not None else None
+        self._broaden_column_items = (
+            self._normalize(broaden_column_items) if broaden_column_items is not None else None
+        )
+        self._searching_all = False
         # issue #242: {(item_type, display_text): score}, higher = more
         # recently used — breaks ties within a match tier. Items absent
         # from this dict sort last within their tier (score treated as 0).
@@ -207,6 +223,11 @@ class QuickSearchDialog(QDialog):
             QLabel {
                 color: #999;
             }
+            QCheckBox {
+                color: #999;
+                font-size: 12px;
+                spacing: 6px;
+            }
         """)
         
         self.init_ui()
@@ -240,7 +261,17 @@ class QuickSearchDialog(QDialog):
         self.search_input.textChanged.connect(self.filter_items)
         self.search_input.installEventFilter(self)  # Install event filter for arrow keys
         layout.addWidget(self.search_input)
-        
+
+        # issue #266: only offered when the caller actually has other open
+        # connections to broaden into — a single-connection search has
+        # nothing to scope in the first place.
+        if self._broaden_items is not None:
+            other_count = max(len(self.sources) - 1, 0)
+            label = f"Search all connections (+{other_count} more)" if other_count else "Search all connections"
+            self.scope_checkbox = QCheckBox(label)
+            self.scope_checkbox.toggled.connect(self._on_scope_toggled)
+            layout.addWidget(self.scope_checkbox)
+
         # Results count
         self.count_label = QLabel()
         self.count_label.setStyleSheet("color: #888; font-size: 12px; margin: 0 5px;")
@@ -356,6 +387,19 @@ class QuickSearchDialog(QDialog):
         matching_items = [e for tier in tiers for e in tier]
         self._render_results(matching_items, None)
 
+    def _on_scope_toggled(self, checked):
+        """issue #266: swap the active item set between the default
+        single-connection scope and the full cross-connection superset,
+        then re-run whatever's currently typed against the new scope."""
+        self._searching_all = checked
+        if checked:
+            self.all_items = self._broaden_items
+            self.column_items = self._broaden_column_items or []
+        else:
+            self.all_items = self._scoped_items
+            self.column_items = self._scoped_column_items
+        self.filter_items(self.search_input.text())
+
     def _recency_of(self, entry):
         item_type, display_text, payload, source_idx, extra = entry
         return self.recency_scores.get((item_type, display_text), 0)
@@ -369,10 +413,12 @@ class QuickSearchDialog(QDialog):
         tuple stored in Qt.UserRole; item text is just the plain label
         (+ connection suffix)."""
         for item_type, display_text, payload, source_idx, extra in matching_items[:limit]:
-            # issue #243: disambiguate which connection a result came from,
-            # only when this dialog is actually searching more than one.
+            # issue #243/#266: disambiguate which connection a result came
+            # from — only meaningful (and only shown) while actually
+            # searching more than one, i.e. the "Search all connections"
+            # checkbox is on.
             suffix = ""
-            if len(self.sources) > 1 and 0 <= source_idx < len(self.sources):
+            if self._searching_all and len(self.sources) > 1 and 0 <= source_idx < len(self.sources):
                 suffix = f"  ({self.sources[source_idx]})"
             item = QListWidgetItem(f"{display_text}{suffix}")
             item.setData(Qt.UserRole, (item_type, display_text, payload, source_idx, extra))

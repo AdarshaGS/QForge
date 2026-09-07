@@ -463,26 +463,40 @@ class MainWindow(QMainWindow):
 
     def show_quick_search(self):
         """With one connection open, defer entirely to its own Quick Search
-        (unchanged UX). With several, search all of them at once — each
-        result is tagged with which connection it came from, and selecting
-        one switches to that connection's tab before acting on it."""
+        (unchanged UX). With several, default to searching just the active
+        connection (issue #266 — results from unrelated DBs otherwise
+        pollute the list); a checkbox in the dialog lets the user
+        explicitly broaden to all open connections at once, each result
+        then tagged with which connection it came from. Selecting a result
+        switches to its connection's tab before acting on it."""
         if len(self._panels) <= 1:
             if self._panels:
                 self._panels[0].show_quick_search()
             return
 
+        active_idx = self.conn_tab_bar.currentIndex()
+        if not (0 <= active_idx < len(self._panels)):
+            active_idx = 0
         sources = [panel.label for panel in self._panels]
+
+        active_panel = self._panels[active_idx]
+        scoped_items = [(t, d, p, active_idx) for t, d, p in active_panel._gather_quick_search_items()]
+        scoped_columns = [(t, d, p, active_idx) for t, d, p in active_panel._gather_column_items()]
+
         all_items = []
         column_items = []
         for idx, panel in enumerate(self._panels):
             all_items += [(t, d, p, idx) for t, d, p in panel._gather_quick_search_items()]
             column_items += [(t, d, p, idx) for t, d, p in panel._gather_column_items()]
 
-        if not all_items and not column_items:
+        if not scoped_items and not scoped_columns and not all_items and not column_items:
             QMessageBox.information(self, "No Items", "Nothing to search yet")
             return
 
-        dialog = QuickSearchDialog(all_items, self, column_items=column_items, sources=sources)
+        dialog = QuickSearchDialog(
+            scoped_items, self, column_items=scoped_columns, sources=sources,
+            broaden_items=all_items, broaden_column_items=column_items,
+        )
         dialog.item_selected.connect(self._on_quick_search_cross_panel)
         dialog.exec()
 

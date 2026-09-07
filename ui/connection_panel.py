@@ -614,6 +614,8 @@ class ConnectionPanel(QWidget):
         self._schema_load_start = 0.0
         self._schema_loading = False
         self._schema_loading_stale = False
+        self._schema_loading_refresh = False
+        self._schema_loading_label = None
         self._schema_tables_seen = 0
         self._schema_retry_item = None
         self._schema_fetch_t0 = None  # perf_metrics: set by _spawn_schema_fetch, read by _on_schema_loaded
@@ -706,7 +708,8 @@ class ConnectionPanel(QWidget):
         # here (issue #68).
 
         # Cmd+Shift+R — refresh schema
-        QShortcut(QKeySequence("Ctrl+Shift+R"), self).activated.connect(self.load_schema)
+        QShortcut(QKeySequence("Ctrl+Shift+R"), self).activated.connect(
+            lambda: self.load_schema(notify=True))
 
         # ── Category filter: All Tables / Views / Functions, with live
         # counts — a flat single-category list instead of an always-nested
@@ -1082,6 +1085,12 @@ class ConnectionPanel(QWidget):
         instantly from disk and the live refresh underneath is otherwise
         completely silent: same tree, no ticker, no marker, nothing to tell
         the user anything happened at all."""
+        # Issue #265: an explicit "Refresh Schema" while one is already in
+        # flight is a no-op rather than piling on a second concurrent fetch
+        # — the tree/toast from the first one still lands normally.
+        if notify and self._schema_loading:
+            return
+
         # Don't attempt schema load if not connected — except while an
         # optimistic background connect is in flight (self._connecting):
         # the live fetch below uses its own dedicated connection anyway
@@ -1121,6 +1130,14 @@ class ConnectionPanel(QWidget):
             # it's known (_on_schema_tables_ready, ahead of the slower
             # dbs/views/functions round-trips per issue #16).
             self._start_schema_loading_indicator()
+        elif notify and not self._schema_loading:
+            # Issue #265: an explicit refresh repaints instantly from a
+            # fresh (non-stale) cache, same as any other cache hit — but
+            # unlike the silent initial-connect case, the user asked for
+            # this one and the live fetch underneath can still take a
+            # while on a large schema, so show the same indicator instead
+            # of leaving it looking finished (or stuck) until the toast.
+            self._start_schema_loading_indicator(refreshing=True)
 
         self._notify_schema_refresh = notify
         self._spawn_schema_fetch(dict(self.config))
@@ -1141,13 +1158,22 @@ class ConnectionPanel(QWidget):
             self._start_schema_loading_indicator(stale=True)
         return True
 
-    def _start_schema_loading_indicator(self, stale: bool = False):
+    def _start_schema_loading_indicator(self, stale: bool = False, refreshing: bool = False,
+                                         label: str = None):
         """Show the sidebar's progress bar with a live elapsed-time ticker
         for the duration of the in-flight fetch (issue #57), in its busy/
         indeterminate mode since the total amount of schema work isn't
-        known up front."""
+        known up front. *refreshing* (issue #265) covers an explicit
+        "Refresh Schema" over a cache that's still fresh — distinct from
+        *stale*, which means the cache itself has expired. *label*
+        (issue #267) overrides the phase text outright — e.g. "Switching
+        database" — for callers whose in-flight operation is more specific
+        than a plain schema load; still yields to the table-count text the
+        moment tables are seen, same as every other phase here."""
         self._schema_loading = True
         self._schema_loading_stale = stale
+        self._schema_loading_refresh = refreshing
+        self._schema_loading_label = label
         self._schema_tables_seen = 0
         self._schema_load_start = time.time()
         self._schema_progress_bar.show()
@@ -1166,8 +1192,12 @@ class ConnectionPanel(QWidget):
         elapsed = time.time() - self._schema_load_start
         if self._schema_tables_seen:
             text = f"{self._schema_tables_seen:,} table(s) found — loading details… {elapsed:.1f}s"
+        elif self._schema_loading_label:
+            text = f"{self._schema_loading_label}… {elapsed:.1f}s"
         elif self._schema_loading_stale:
             text = f"Cached schema (stale) — refreshing… {elapsed:.1f}s"
+        elif self._schema_loading_refresh:
+            text = f"Refreshing schema… {elapsed:.1f}s"
         else:
             text = f"Loading schema… {elapsed:.1f}s"
         self._schema_loading_label.setText(text)
@@ -1502,8 +1532,10 @@ class ConnectionPanel(QWidget):
                 "Still connecting to the database — try switching in a moment.")
             return
 
-        self.schema_tree.clear()
-        self.schema_tree.addTopLevelItem(QTreeWidgetItem(["Switching schema…"]))
+        # Issue #267: same progress bar/ticker as the initial schema load,
+        # instead of a static tree row.
+        self._clear_schema_state()
+        self._start_schema_loading_indicator(label="Switching schema")
         from PySide6.QtWidgets import QApplication as _QApp
         _QApp.processEvents()
 
@@ -1549,9 +1581,13 @@ class ConnectionPanel(QWidget):
                 "Still connecting to the database — try switching in a moment.")
             return
 
-        # Show spinner in schema tree
-        self.schema_tree.clear()
-        self.schema_tree.addTopLevelItem(QTreeWidgetItem(["Switching database…"]))
+        # Issue #267: same progress bar/ticker used for the initial schema
+        # load, not just a static tree row — and disable the existing
+        # tabs/results while the switch is in flight so nothing looks (or
+        # is) interactive against a connection that's mid-switch.
+        self._clear_schema_state()
+        self._start_schema_loading_indicator(label="Switching database")
+        self.tabs.setEnabled(False)
         from PySide6.QtWidgets import QApplication as _QApp
         _QApp.processEvents()
 
@@ -1566,6 +1602,7 @@ class ConnectionPanel(QWidget):
             try:
                 self.db_service.select_db(new_db)
             except Exception as ex:
+                self.tabs.setEnabled(True)
                 self._on_schema_error(str(ex))
                 return
             perf_metrics.record("database", "db_switch", (time.perf_counter() - _switch_t0) * 1000)
@@ -1605,6 +1642,7 @@ class ConnectionPanel(QWidget):
     def _on_db_switch_done(self, new_db: str, error: str, switch_t0: float):
         self._connecting = False
         if error:
+            self.tabs.setEnabled(True)
             self._update_pill_label()
             self._on_schema_error(error)
             return
@@ -1620,6 +1658,11 @@ class ConnectionPanel(QWidget):
         # database — every query in this tab would then run against the
         # wrong database with no indication.
         self.config["database"] = new_db
+        # Issue #267: the connection itself has now confirmed the switch —
+        # re-enable tabs/results. The schema tree still shows the loading
+        # indicator (started in _switch_database) until the fetch below
+        # completes or a cache hit repaints it.
+        self.tabs.setEnabled(True)
         self._update_pill_label()
 
         # Issue #71: populate instantly from disk if this database was
@@ -1874,6 +1917,7 @@ class ConnectionPanel(QWidget):
             mock_data_action = menu.addAction("Generate Mock Data…")
         refresh_action = menu.addAction("Refresh Schema")
         refresh_action.setShortcut(QKeySequence("Ctrl+Shift+R"))  # mirrors the real global binding below
+        refresh_action.setEnabled(not self._schema_loading)  # issue #265: no re-trigger mid-refresh
         menu.addSeparator()
         if not is_view:
             truncate_action = menu.addAction("Truncate…")
