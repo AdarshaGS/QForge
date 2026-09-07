@@ -8,33 +8,35 @@ messages once committed — don't duplicate them here. Replace stale sections
 outright rather than appending to them. Do not record passwords, tokens,
 hostnames, customer data, or unredacted SQL.
 
-## Current state (as of 2026-09-06)
+## Current state (as of 2026-09-07)
 
-**Branch:** `master`. **Issue #250 is committed, pushed, and closed**
-(commit `3ca2c31`, comment posted with implementation summary). The repo's
-remote also moved to `AdarshaGS/QForge` (capitalized) during this session —
-`git push` still worked via the old URL (GitHub redirects), but update the
-remote if that stops working: `git remote set-url origin
+**Branch:** `master`. **Both #250 and #237 are committed, pushed, and
+closed:**
+- #250: commit `3ca2c31`, comment posted with implementation summary.
+- #237: commit `4d516a7`, comment posted, issue closed. Staged/committed
+  cleanly as exactly 5 files (`ui/connection_panel.py`,
+  `ui/table_view_widget.py`, the two new `tests/*_237.py` files,
+  `ai/flush-context.md`) — the pre-existing unrelated files that were
+  sitting staged in the index (see below) were explicitly `git restore
+  --staged`d first so they didn't ride along into this commit.
+
+The repo's remote also moved to `AdarshaGS/QForge` (capitalized) earlier
+this session — `git push` still works via the old URL (GitHub redirects),
+but update the remote if that stops working: `git remote set-url origin
 https://github.com/AdarshaGS/QForge.git`.
 
-**Issue #237 (background the remaining blocking DB calls in
-ConnectionPanel) is now fully implemented and uncommitted** — all three of
-the issue's priority tiers, not just the highest one; see below. `git
-status` shows `ui/connection_panel.py` as `MM` (both staged and unstaged
-changes) — something staged a mid-flight snapshot of this file earlier in
-the session (likely alongside the #250 commit); `git diff HEAD --
-ui/connection_panel.py` (staged+unstaged combined) is the authoritative
-view of the real diff, not `git diff` alone.
-
 **Pre-existing unrelated modifications still uncommitted in the working
-tree** (not touched by this or any #237/#250 work, do not attribute to
-either): `README.md`, `entitlements-config.json`,
-`services/entitlement_config.py`, `tests/test_entitlements.py`.
+tree** (not touched by any #237/#250 work, do not attribute to either):
+`README.md`, `entitlements-config.json`, `services/entitlement_config.py`,
+`tests/test_entitlements.py`. These were found already staged in the index
+at various points this session (likely from work outside this
+conversation) — always check `git diff --cached --stat` before any future
+commit in this tree to make sure they don't ride along unintentionally.
 `graphify-out/*` is no longer tracked by git as of this session (upstream
 untracked it as a regenerable cache in a commit pulled down mid-session) —
 it will still appear on disk as ignored/untracked files, that's expected.
 
-### #237 work (uncommitted — all 3 priority tiers):
+### #237 work — committed `4d516a7`, pushed, commented, closed (all 3 priority tiers):
 - `ui/connection_panel.py` — new shared helper `_run_bg_db(fn, on_done,
   on_error=None, config=None)`: opens a fresh *dedicated* `DbService`,
   calls `fn(dedicated_db)` on a `threading.Thread`, delivers the result/
@@ -183,21 +185,21 @@ window** — that's the standing gap across every commit above.
 
 ## Exact next step
 
-1. `git status --short` first — confirm nothing unexpected changed, and
-   don't stage the pre-existing unrelated files (README, entitlements,
-   test_entitlements) into a #237 commit. `ui/connection_panel.py` shows
-   `MM` — use `git diff HEAD -- ui/connection_panel.py` (not plain `git
-   diff`) to see the real, complete diff before committing it.
-2. **#237 is implemented (all 3 tiers) but uncommitted and unverified
-   against a real server** — no live MySQL/Postgres in this environment.
-   Next: run `tests/test_connection_panel_bg_db_237.py` and
-   `tests/test_table_view_widget_structure_tab_237.py` plus the full
-   suite, then manually exercise each of the ~15 converted call sites
-   against a real connection (large-table export/copy/truncate/drop, CSV
-   import with cancel, switching a Postgres connection's database,
-   generating mock data, create/drop database, new/alter table/clone
-   table) before considering this done. Only then commit + comment/close
-   on the GitHub issue.
+1. `git status --short` first, and check `git diff --cached --stat` before
+   any future commit — the pre-existing unrelated files (README,
+   entitlements, test_entitlements) have shown up already staged more than
+   once this session from work outside this conversation; don't let them
+   ride along into an unrelated commit.
+2. **#237 is done: committed as `4d516a7`, pushed to origin/master, GitHub
+   comment posted, issue closed** — but still **unverified against a real
+   server**, no live MySQL/Postgres in this environment. Worth running
+   `tests/test_connection_panel_bg_db_237.py` +
+   `tests/test_table_view_widget_structure_tab_237.py` plus the full suite,
+   then manually exercising each of the ~15 converted call sites against a
+   real connection (large-table export/copy/truncate/drop, CSV import with
+   cancel, switching a Postgres connection's database, generating mock
+   data, create/drop database, new/alter/clone table) before trusting it
+   beyond the unit tests + manual review already done.
 3. **#250 is done: committed as `3ca2c31`, pushed to origin/master, GitHub
    comment posted, issue closed.** Only gap left: nothing in it has been
    run through pytest or the actual Analyze Query dialog UI — worth doing
