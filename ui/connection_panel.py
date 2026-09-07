@@ -3047,18 +3047,20 @@ class ConnectionPanel(QWidget):
 
     def _schema_for_table(self, table_name: str) -> tuple:
         """(columns, primary_keys, foreign_keys, generated_columns,
-        unique_columns) for *table_name* — the same calls
+        unique_columns, enum_values) for *table_name* — the same calls
         show_mock_data_generator always made for the root table, factored
         out so issue #215's ancestor panel can fetch the same shape lazily,
         per ancestor, only once the user actually opts into "Include
         dependent tables". unique_columns (issue #210) is the set of
-        single-column UNIQUE-indexed column names."""
+        single-column UNIQUE-indexed column names; enum_values (issue #211)
+        is {column: [real allowed values]} for ENUM/simple-CHECK columns."""
         return (
             self.db_service.get_columns(table_name),
             self.db_service.get_primary_keys(table_name),
             self.db_service.get_foreign_keys(table_name),
             self.db_service.get_generated_columns(table_name),
             self._unique_columns(table_name),
+            self._enum_check_values(table_name),
         )
 
     def _unique_columns(self, table_name: str) -> set:
@@ -3072,6 +3074,30 @@ class ConnectionPanel(QWidget):
                     if idx.get("unique") and len(idx.get("columns") or []) == 1}
         except Exception:
             return set()
+
+    def _enum_check_values(self, table_name: str) -> dict:
+        """{column: [real allowed values]} for *table_name* (issue #211) —
+        merges simple IN(...)-shaped CHECK constraints with real ENUM value
+        lists (MySQL ENUM columns, Postgres enum types). Never raises; a
+        column this can't resolve just keeps today's generic generation."""
+        values: dict = {}
+        try:
+            values.update(self.db_service.get_check_constraint_values(table_name))
+        except Exception:
+            pass
+        try:
+            for col in self.db_service.get_columns(table_name):
+                name = col.get("Field")
+                if name in values:
+                    continue
+                col_type = (col.get("Type") or "")
+                if col_type.lower().startswith("enum(") or col_type == "USER-DEFINED":
+                    enum_vals = self.db_service.get_enum_values(table_name, name)
+                    if enum_vals:
+                        values[name] = enum_vals
+        except Exception:
+            pass
+        return values
 
     def _existing_row_count(self, table_name: str) -> int:
         """Best-effort "does this ancestor table already have rows"
@@ -3134,6 +3160,7 @@ class ConnectionPanel(QWidget):
             foreign_keys = self.db_service.get_foreign_keys(table_name)
             generated_columns = self.db_service.get_generated_columns(table_name)
             unique_columns = self._unique_columns(table_name)
+            enum_values = self._enum_check_values(table_name)
         except Exception as ex:
             QMessageBox.critical(self, "Error", f"Could not load schema for {table_name}:\n{ex}")
             return
@@ -3149,7 +3176,7 @@ class ConnectionPanel(QWidget):
             dialect=self.db_service.db_type, fk_sampler=self._sample_fk_values,
             dependency_chain=dependency_chain, schema_fetcher=self._schema_for_table,
             existing_row_count_fetcher=self._existing_row_count, pk_offset_fetcher=self._pk_offset,
-            unique_columns=unique_columns,
+            unique_columns=unique_columns, enum_values=enum_values,
             parent=self,
         )
         if not dialog.exec():

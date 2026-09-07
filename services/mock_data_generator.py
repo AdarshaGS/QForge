@@ -80,17 +80,24 @@ def _type_bucket(sql_type: str) -> str:
     return "string"
 
 
-def infer_generator(column: dict, is_pk: bool = False, is_fk: bool = False) -> str:
+def infer_generator(column: dict, is_pk: bool = False, is_fk: bool = False,
+                     allowed_values: list | None = None) -> str:
     """Default generator for a column, from its name and `get_columns()`
     type string. A foreign-key column always wins (referential integrity
     matters more than name/type guessing); a lone integer primary key
     defaults to "omit" — inserting an explicit value for what's almost
-    always an auto-increment column is more likely to error than help."""
+    always an auto-increment column is more likely to error than help.
+    *allowed_values* (issue #211) — a real ENUM or simple `IN (...)` CHECK
+    value set introspected for this column — wins over every name/type
+    guess below it: picking from the schema's own allowed set is always
+    more correct than a heuristic."""
     if is_fk:
         return "foreign_key"
     bucket = _type_bucket(column.get("Type", ""))
     if is_pk and bucket == "integer":
         return "omit"
+    if allowed_values:
+        return "value_list"
 
     name = (column.get("Field") or "").lower()
 
@@ -464,6 +471,7 @@ class TablePlan:
     row_count: int = 0          # 0 means "reuse existing rows, don't generate"
     pk_offset: int = None       # MAX(existing pk) + 1, pre-fetched by the caller
     unique_columns: set = field(default_factory=set)  # single-column UNIQUE indexes (issue #210)
+    enum_values: dict = field(default_factory=dict)   # column -> real ENUM/CHECK value set (issue #211)
 
 
 def _internal_target_columns(chain: DependencyChain, plans: dict) -> dict:
@@ -514,9 +522,10 @@ def generate_chain_dataframes(chain: DependencyChain, plans: dict,
                 continue
             is_pk = name == lone_pk
             is_fk = name in fk_map
-            generator = infer_generator(col, is_pk=is_pk, is_fk=is_fk)
+            allowed_values = plan.enum_values.get(name)
+            generator = infer_generator(col, is_pk=is_pk, is_fk=is_fk, allowed_values=allowed_values)
             include = generator != "omit"
-            options = {}
+            options = {"values": allowed_values} if generator == "value_list" and allowed_values else {}
             if name in my_targets and generator == "omit":
                 # A lone integer PK some descendant needs to reference —
                 # force it into memory instead of leaving it to the DB.

@@ -287,3 +287,11 @@ def test_value_list_generator_only_produces_allowed_values():
                                        options={"values": allowed, "weights": [1, 5, 1]})}
     df = gen.generate_dataframe(columns, 30, specs)
     assert set(df["status"].tolist()) <= set(allowed)
+
+
+# ─── Enum / CHECK-constraint awareness (issue #211) ────────────────────────
+
+def test_infer_generator_prefers_allowed_values_over_string_bucket():
+    column = _col("status", "varchar(20)")
+    generator = gen.infer_generator(column, allowed_values=["active", "inactive"])
+    assert generator == "value_list"
