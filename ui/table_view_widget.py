@@ -130,6 +130,8 @@ class TableViewWidget(QWidget):
     _page_load_errored = Signal(str)
     _commit_done = Signal(object)
     _commit_errored = Signal(str)
+    _structure_load_done = Signal(object)   # (cols, idxs, fks) — issue #237
+    _structure_load_errored = Signal(str)
 
     def __init__(self, db_service, table_name, config=None, parent=None):
         super().__init__(parent)
@@ -184,6 +186,8 @@ class TableViewWidget(QWidget):
         self._page_load_errored.connect(self._on_page_load_failed)
         self._commit_done.connect(self._apply_commit_result)
         self._commit_errored.connect(self._on_commit_failed)
+        self._structure_load_done.connect(self._apply_structure_result)
+        self._structure_load_errored.connect(self._on_structure_load_failed)
 
         # Load first page of data
         self.reset_and_load_first_page()
@@ -1222,17 +1226,31 @@ class TableViewWidget(QWidget):
             search.setFocus()
 
     def _load_structure_tab(self):
+        """Issue #237: get_columns/get_foreign_keys/get_indexes run on a
+        background thread via the tab's own dedicated connection
+        (_get_worker_db(), same as load_table_data()) instead of blocking
+        the UI thread."""
         self._structure_loaded = True
-        try:
-            cols = self.db_service.get_columns(self.table_name)
-            fks = self.db_service.get_foreign_keys(self.table_name)
+        sig_done, sig_error = self._structure_load_done, self._structure_load_errored
+
+        def _worker():
             try:
-                idxs = self.db_service.get_indexes(self.table_name)
-            except Exception:
-                idxs = []
-        except Exception as ex:
-            QMessageBox.warning(self, "Structure", f"Could not load structure:\n{ex}")
-            return
+                db = self._get_worker_db()
+                cols = db.get_columns(self.table_name)
+                fks = db.get_foreign_keys(self.table_name)
+                try:
+                    idxs = db.get_indexes(self.table_name)
+                except Exception:
+                    idxs = []
+            except Exception as ex:
+                sig_error.emit(str(ex))
+            else:
+                sig_done.emit((cols, idxs, fks))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_structure_result(self, result):
+        cols, idxs, fks = result
         _fill_columns_table(self.col_tbl, cols)
         _fill_indexes_table(self.idx_tbl, idxs)
         _fill_fk_table(self.fk_tbl, fks)
@@ -1240,6 +1258,9 @@ class TableViewWidget(QWidget):
         self.view_tabs.setTabText(col_i, f"Columns ({len(cols)})")
         self.view_tabs.setTabText(idx_i, f"Indexes ({len(idxs)})")
         self.view_tabs.setTabText(fk_i, f"Foreign Keys ({len(fks)})")
+
+    def _on_structure_load_failed(self, msg: str):
+        QMessageBox.warning(self, "Structure", f"Could not load structure:\n{msg}")
 
     # ─── Structure editor ─────────────────────────────────────────────────────
 

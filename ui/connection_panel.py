@@ -15,6 +15,7 @@ import re
 import threading
 import queue
 import gzip
+import uuid
 
 from PySide6.QtCore import Qt, Signal, QThread, QObject
 from PySide6.QtWidgets import (
@@ -539,6 +540,26 @@ class ConnectionPanel(QWidget):
     _export_finished_sig = Signal(list)       # failures: list[str]
     _export_errored_sig  = Signal(str)
     _export_cancelled_sig = Signal()
+    # Generic op_id-keyed bridge for one-off background DB operations
+    # (issue #237) — every call site below is a single request/response
+    # against a *dedicated* connection (never self.db_service), so one
+    # pair of signals dispatches to whichever on_done/on_error callback
+    # _run_bg_db() registered for that op_id, instead of one bespoke
+    # Signal per call site.
+    _bg_op_done  = Signal(str, object)   # (op_id, result)
+    _bg_op_error = Signal(str, str)      # (op_id, error_message)
+    # Bridge signals for the CSV import batched-write loop (issue #237) —
+    # progress/cancellation cross the thread boundary via signals since the
+    # QProgressDialog itself must only ever be touched from the main thread.
+    _csv_import_progress    = Signal(int)        # rows completed so far
+    _csv_import_write_done  = Signal(int, int)   # (inserted, errors)
+    _csv_import_write_error = Signal(str)
+    # Bridge signal for _switch_database()'s non-MySQL (real reconnect)
+    # path (issue #237) — same self._connecting guard as
+    # _connect_in_background(), since this touches self.db_service itself
+    # rather than a dedicated connection (switching *is* changing what
+    # self.db_service points to).
+    _db_switch_done = Signal(str, str, float)   # (new_db, error, switch_t0)
 
     def __init__(self, config: dict, db_service: DbService,
                  query_history: QueryHistory, saved_queries: SavedQueries = None,
@@ -614,6 +635,16 @@ class ConnectionPanel(QWidget):
         self._export_finished_sig.connect(self._on_export_finished, Qt.QueuedConnection)
         self._export_errored_sig.connect(self._on_export_errored, Qt.QueuedConnection)
         self._export_cancelled_sig.connect(self._on_export_cancelled, Qt.QueuedConnection)
+        self._bg_ops: dict = {}   # op_id -> (on_done, on_error) for _run_bg_db()
+        self._bg_op_done.connect(self._on_bg_op_done, Qt.QueuedConnection)
+        self._bg_op_error.connect(self._on_bg_op_error, Qt.QueuedConnection)
+        self._csv_import_progress_dialog = None
+        self._csv_import_table = None
+        self._csv_import_t0 = None
+        self._csv_import_progress.connect(self._on_csv_import_progress, Qt.QueuedConnection)
+        self._csv_import_write_done.connect(self._on_csv_import_write_done, Qt.QueuedConnection)
+        self._csv_import_write_error.connect(self._on_csv_import_write_error, Qt.QueuedConnection)
+        self._db_switch_done.connect(self._on_db_switch_done, Qt.QueuedConnection)
         self.health_changed.connect(self._update_tab_status_bars, Qt.QueuedConnection)
         self._column_cache: dict = {}   # {table: [col, ...]} for autocomplete
         self._column_details_cache: dict = {}   # {table: [{name,type,nullable,default,key}, ...]}
@@ -1213,6 +1244,56 @@ class ConnectionPanel(QWidget):
             # its own. Now that db_service is genuinely live, retry those.
             self._reload_errored_table_tabs()
 
+    def _run_bg_db(self, fn, on_done, on_error=None, config: dict = None):
+        """Run `fn(dedicated_db) -> result` on a background thread against a
+        fresh *dedicated* DbService — never self.db_service, which the main
+        thread may be using concurrently (query tabs, table views, schema
+        fetch) — then deliver the result via `on_done(result)` or the
+        exception message via `on_error(message)` (default: a generic error
+        dialog), both called back on the main thread. One dedicated
+        connection per call, opened and closed around `fn` alone.
+
+        Issue #237: the shared shape for every one-off background DB
+        operation below (quick copy/export, CSV import write, truncate/
+        drop, mock data insert, metadata fetch for a dialog, …) — same
+        dedicated-connection + thread + Qt-signal-bridge pattern already
+        used by _spawn_schema_fetch/_connect_in_background/
+        SchemaCompareDialog, just genericized via an op_id instead of one
+        bespoke Signal per call site."""
+        op_id = uuid.uuid4().hex
+        self._bg_ops[op_id] = (on_done, on_error)
+        cfg = dict(config) if config is not None else dict(self.config)
+        sig_done, sig_error = self._bg_op_done, self._bg_op_error
+
+        def _worker():
+            db = DbService()
+            try:
+                db.connect(cfg)
+                result = fn(db)
+            except Exception as ex:
+                sig_error.emit(op_id, str(ex))
+                return
+            finally:
+                try:
+                    db.disconnect()
+                except Exception:
+                    pass
+            sig_done.emit(op_id, result)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_bg_op_done(self, op_id: str, result):
+        on_done, _ = self._bg_ops.pop(op_id, (None, None))
+        if on_done:
+            on_done(result)
+
+    def _on_bg_op_error(self, op_id: str, error: str):
+        _, on_error = self._bg_ops.pop(op_id, (None, None))
+        if on_error:
+            on_error(error)
+        else:
+            QMessageBox.critical(self, "Error", error)
+
     def _on_schema_tables_ready(self, tables: list, columns: dict,
                                  column_details: dict = None, foreign_keys: dict = None):
         """Push tables/columns to autocomplete as soon as they're fetched —
@@ -1328,36 +1409,56 @@ class ConnectionPanel(QWidget):
         self._schema_retry_item = retry
         logger.error(f"Schema load error: {msg}")
 
-    def _load_databases(self) -> bool:
-        """Blocking DB-list fetch used by refresh/create/drop-database flows.
-        Returns True on success, False if the fetch failed — callers that
-        need to surface that (e.g. refresh_databases) check the result."""
-        try:
-            db_type = self.db_service.db_type
-            if db_type == "mysql":
-                df = self.db_service.execute_query("SHOW DATABASES")
-                dbs = [d for d in df.iloc[:, 0].tolist()
-                       if d not in ("information_schema", "mysql",
-                                    "performance_schema", "sys")]
-                self._available_dbs = dbs
-                current_db = self.config.get("database", "")
-                if current_db not in dbs and dbs:
-                    current_db = dbs[0]
-                    self.config["database"] = current_db
+    @staticmethod
+    def _fetch_db_list(db) -> list:
+        """The actual DB-list query, dialect-aware — runs inside
+        _load_databases()'s dedicated background connection (issue #237)."""
+        db_type = db.db_type
+        if db_type == "mysql":
+            df = db.execute_query("SHOW DATABASES")
+            return [d for d in df.iloc[:, 0].tolist()
+                    if d not in ("information_schema", "mysql",
+                                 "performance_schema", "sys")]
+        elif db_type == "postgresql":
+            df = db.execute_query(
+                "SELECT datname FROM pg_database WHERE datistemplate = false")
+            return df["datname"].tolist()
+        return []
+
+    def _load_databases(self, on_done=None):
+        """DB-list fetch used by refresh/create/drop-database flows, on a
+        dedicated background connection (issue #237). *on_done(ok: bool)*,
+        if given, is called back on the main thread once self._available_dbs
+        is up to date — callers that need the result (e.g. refresh_databases,
+        drop_database's picker) pass one instead of reading it synchronously
+        right after calling this."""
+        def _done(dbs):
+            self._available_dbs = dbs
+            current_db = self.config.get("database", "")
+            if self.db_service.db_type == "mysql" and current_db not in dbs and dbs:
+                # Self-heal: the configured database no longer exists.
+                # Runs here (main thread, after the background fetch has
+                # already returned) rather than in the worker — this
+                # mutates the shared self.db_service.connection, which only
+                # the main thread may touch.
+                current_db = dbs[0]
+                self.config["database"] = current_db
+                try:
                     self.db_service.connection.select_db(current_db)
-            elif db_type == "postgresql":
-                df = self.db_service.execute_query(
-                    "SELECT datname FROM pg_database WHERE datistemplate = false")
-                self._available_dbs = df["datname"].tolist()
-            else:
-                self._available_dbs = []
+                except Exception as ex:
+                    logger.error(f"Failed to self-heal to database {current_db}: {ex}")
             self._update_pill_label()
-            return True
-        except Exception as ex:
-            logger.error(f"Failed to load databases: {ex}")
+            if on_done:
+                on_done(True)
+
+        def _error(err):
+            logger.error(f"Failed to load databases: {err}")
             self._available_dbs = []
             self._update_pill_label()
-            return False
+            if on_done:
+                on_done(False)
+
+        self._run_bg_db(self._fetch_db_list, _done, _error)
 
     def _update_pill_label(self):
         current_db = self.config.get("database", "") or "(no database)"
@@ -1459,40 +1560,65 @@ class ConnectionPanel(QWidget):
         # auth round-trip, or (potentially tunnelled) SSH setup. Previously
         # every switch paid the full disconnect+reconnect cost, which is
         # where the multi-second freeze reported in issue #23 actually came
-        # from. Postgres connections are bound to one database for
-        # their lifetime, so they still need a real reconnect — done
-        # synchronously (as before) so nothing else can use the shared
-        # connection mid-reconnect. The (potentially slower) schema listing
-        # always runs on a background thread over its OWN dedicated
-        # connection (services/schema_snapshot.py) either way.
-        _switch_t0 = time.perf_counter()
+        # from — left synchronous here by design.
         if self.db_service.db_type == "mysql" and self.db_service.connection:
+            _switch_t0 = time.perf_counter()
             try:
                 self.db_service.select_db(new_db)
             except Exception as ex:
                 self._on_schema_error(str(ex))
                 return
-        else:
+            perf_metrics.record("database", "db_switch", (time.perf_counter() - _switch_t0) * 1000)
+            self._commit_database_switch(new_db)
+            return
+
+        # Postgres connections are bound to one database for their
+        # lifetime, so switching needs a real disconnect+reconnect — issue
+        # #237: that now runs on a background thread, guarded by
+        # self._connecting exactly the way _connect_in_background() is
+        # (nothing else touches self.db_service until _on_db_switch_done
+        # fires). The (potentially slower) schema listing always runs on a
+        # background thread over its OWN dedicated connection
+        # (services/schema_snapshot.py) either way.
+        self._connecting = True
+        self._update_pill_label()
+        # Schemas are per-database — a schema pinned in the old database
+        # may not exist in new_db, so don't carry it over (SET search_path
+        # to a nonexistent schema silently resolves nothing rather than
+        # erroring, which would look identical to "no tables" here).
+        new_config = dict(self.config, database=new_db)
+        new_config.pop("schema", None)
+        switch_t0 = time.perf_counter()
+        sig_done = self._db_switch_done
+
+        def _worker():
             try:
                 self.db_service.disconnect()
-                # Schemas are per-database — a schema pinned in the old
-                # database may not exist in new_db, so don't carry it over
-                # (SET search_path to a nonexistent schema silently resolves
-                # nothing rather than erroring, which would look identical
-                # to "no tables" here).
-                self.config.pop("schema", None)
-                self.db_service.connect(dict(self.config, database=new_db))
+                self.db_service.connect(new_config)
             except Exception as ex:
-                self._on_schema_error(str(ex))
-                return
-        perf_metrics.record("database", "db_switch", (time.perf_counter() - _switch_t0) * 1000)
+                sig_done.emit(new_db, str(ex), switch_t0)
+            else:
+                sig_done.emit(new_db, "", switch_t0)
 
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_db_switch_done(self, new_db: str, error: str, switch_t0: float):
+        self._connecting = False
+        if error:
+            self._update_pill_label()
+            self._on_schema_error(error)
+            return
+        perf_metrics.record("database", "db_switch", (time.perf_counter() - switch_t0) * 1000)
+        self.config.pop("schema", None)
+        self._commit_database_switch(new_db)
+
+    def _commit_database_switch(self, new_db: str):
         # Only commit the switch to tracked state/the pill once the
         # connection has actually confirmed it. Setting these eagerly
-        # (before the try/except above) meant a failed switch left the UI
-        # and self.config claiming new_db while the live connection was
-        # still silently on the old database — every query in this tab
-        # would then run against the wrong database with no indication.
+        # meant a failed switch left the UI and self.config claiming
+        # new_db while the live connection was still silently on the old
+        # database — every query in this tab would then run against the
+        # wrong database with no indication.
         self.config["database"] = new_db
         self._update_pill_label()
 
@@ -1538,47 +1664,55 @@ class ConnectionPanel(QWidget):
             QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        try:
-            self.db_service.execute_update(sql)
-        except Exception as ex:
-            QMessageBox.critical(self, "Create Database Failed", str(ex))
-            return
-        QMessageBox.information(self, "Success", f"Database '{name}' created.")
-        self._load_databases()
+        def _done(_):
+            QMessageBox.information(self, "Success", f"Database '{name}' created.")
+            self._load_databases()
+
+        def _error(msg):
+            QMessageBox.critical(self, "Create Database Failed", msg)
+
+        # Issue #237: DDL runs on a dedicated background connection.
+        self._run_bg_db(lambda db: db.execute_update(sql), _done, _error)
 
     def refresh_databases(self):
         """Issue #138: previously ran _load_databases() with no visual
         feedback at all — a slow/remote connection looked frozen and a
-        failure was silent. Busy cursor covers the "in progress" window
-        (the fetch is synchronous), a toast confirms the outcome either
-        way, matching the pattern already used for query-done toasts."""
+        failure was silent. Busy cursor covers the "in progress" window;
+        a toast confirms the outcome either way, matching the pattern
+        already used for query-done toasts. Issue #237: the fetch itself
+        now runs on a dedicated background connection."""
         if not self._check_db_management_supported():
             return
         from PySide6.QtWidgets import QApplication as _QApp
         _QApp.setOverrideCursor(Qt.WaitCursor)
-        try:
-            ok = self._load_databases()
-        finally:
-            _QApp.restoreOverrideCursor()
 
-        from utils.toast import show_toast
-        if ok:
-            n = len(self._available_dbs)
-            show_toast(
-                self, f"Database list refreshed — {n} found",
-                icon="✓", kind="success",
-            )
-        else:
-            show_toast(
-                self, "Failed to refresh database list",
-                icon="⚠", kind="warning",
-            )
+        def _on_result(ok: bool):
+            _QApp.restoreOverrideCursor()
+            from utils.toast import show_toast
+            if ok:
+                n = len(self._available_dbs)
+                show_toast(
+                    self, f"Database list refreshed — {n} found",
+                    icon="✓", kind="success",
+                )
+            else:
+                show_toast(
+                    self, "Failed to refresh database list",
+                    icon="⚠", kind="warning",
+                )
+
+        self._load_databases(on_done=_on_result)
 
     def drop_database(self):
         if not self._check_db_management_supported():
             return
-        if not self._available_dbs:
-            self._load_databases()
+        if self._available_dbs:
+            self._show_drop_database_picker()
+        else:
+            self._load_databases(
+                on_done=lambda ok: self._show_drop_database_picker() if ok else None)
+
+    def _show_drop_database_picker(self):
         if not self._available_dbs:
             QMessageBox.information(self, "Drop Database", "No databases found.")
             return
@@ -1607,13 +1741,16 @@ class ConnectionPanel(QWidget):
             QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        try:
-            self.db_service.execute_update(sql)
-        except Exception as ex:
-            QMessageBox.critical(self, "Drop Database Failed", str(ex))
-            return
-        QMessageBox.information(self, "Success", f"Database '{name}' dropped.")
-        self._load_databases()
+
+        def _done(_):
+            QMessageBox.information(self, "Success", f"Database '{name}' dropped.")
+            self._load_databases()
+
+        def _error(msg):
+            QMessageBox.critical(self, "Drop Database Failed", msg)
+
+        # Issue #237: DDL runs on a dedicated background connection.
+        self._run_bg_db(lambda db: db.execute_update(sql), _done, _error)
 
     # ─── Schema tree interaction ──────────────────────────────────────────────
 
@@ -2662,21 +2799,27 @@ class ConnectionPanel(QWidget):
 
     def show_structure_editor(self):
         dialog = StructureEditorDialog(self.db_service.db_type, parent=self)
-        if dialog.exec():
-            try:
-                sql = dialog.get_sql()
-                if not self._guard_write(sql):
-                    return
-                reply = QMessageBox.question(
-                    self, "Create Table",
-                    f"Execute the following SQL?\n\n{sql}",
-                    QMessageBox.Yes | QMessageBox.No)
-                if reply == QMessageBox.Yes:
-                    self.db_service.execute_update(sql)
-                    QMessageBox.information(self, "Success", "Table created successfully")
-                    self.load_schema()
-            except Exception as ex:
-                QMessageBox.critical(self, "Error", str(ex))
+        if not dialog.exec():
+            return
+        sql = dialog.get_sql()
+        if not self._guard_write(sql):
+            return
+        reply = QMessageBox.question(
+            self, "Create Table",
+            f"Execute the following SQL?\n\n{sql}",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        def _done(_):
+            QMessageBox.information(self, "Success", "Table created successfully")
+            self.load_schema()
+
+        def _error(msg):
+            QMessageBox.critical(self, "Error", msg)
+
+        # Issue #237: DDL runs on a dedicated background connection.
+        self._run_bg_db(lambda db: db.execute_update(sql), _done, _error)
 
     def _show_function_context_menu(self, name: str, position):
         menu = QMenu(self)
@@ -2744,55 +2887,67 @@ class ConnectionPanel(QWidget):
 
 
     def show_alter_table_editor(self, table_name: str):
-        try:
-            existing_columns = self.db_service.get_columns(table_name)
-        except Exception as ex:
-            QMessageBox.critical(self, "Error",
-                                 f"Could not load columns for {table_name}:\n{ex}")
-            return
+        def _got_columns(existing_columns):
+            dialog = StructureEditorDialog(
+                db_type=self.db_service.db_type,
+                table_name=table_name,
+                existing_columns=existing_columns,
+                parent=self)
 
-        dialog = StructureEditorDialog(
-            db_type=self.db_service.db_type,
-            table_name=table_name,
-            existing_columns=existing_columns,
-            parent=self)
+            if not dialog.exec():
+                return
+            sql = dialog.get_sql()
+            if sql.strip().startswith("--"):
+                QMessageBox.information(self, "No Changes", sql)
+                return
+            if not self._guard_write(sql):
+                return
 
-        if dialog.exec():
-            try:
-                sql = dialog.get_sql()
-                if sql.strip().startswith("--"):
-                    QMessageBox.information(self, "No Changes", sql)
-                    return
-                if not self._guard_write(sql):
-                    return
+            # Issue #236: silent check (no upgrade nag) — warn about any
+            # column this ALTER drops that other schema objects depend
+            # on. Cheap metadata query per dropped column — left on the
+            # main connection, same as the other "lowest priority"
+            # metadata-only calls in issue #237.
+            impact = ""
+            if entitlements.is_enabled(Feature.IMPACT_ANALYSIS):
+                texts = []
+                for col in dialog.get_dropped_columns():
+                    report = dependency_analyzer.find_column_dependents(
+                        self.db_service, table_name, col)
+                    text = impact_warning_text(report)
+                    if text:
+                        texts.append(text)
+                if texts:
+                    impact = "\n\n".join(texts) + "\n\n"
 
-                # Issue #236: silent check (no upgrade nag) — warn about
-                # any column this ALTER drops that other schema objects
-                # depend on.
-                impact = ""
-                if entitlements.is_enabled(Feature.IMPACT_ANALYSIS):
-                    texts = []
-                    for col in dialog.get_dropped_columns():
-                        report = dependency_analyzer.find_column_dependents(
-                            self.db_service, table_name, col)
-                        text = impact_warning_text(report)
-                        if text:
-                            texts.append(text)
-                    if texts:
-                        impact = "\n\n".join(texts) + "\n\n"
+            reply = QMessageBox.question(
+                self, "Alter Table",
+                f"{impact}Execute the following SQL?\n\n{sql}",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
 
-                reply = QMessageBox.question(
-                    self, "Alter Table",
-                    f"{impact}Execute the following SQL?\n\n{sql}",
-                    QMessageBox.Yes | QMessageBox.No)
-                if reply == QMessageBox.Yes:
-                    for stmt in query_classifier.split_statements(sql):
-                        self.db_service.execute_update(stmt)
-                    QMessageBox.information(
-                        self, "Success", f"Table {table_name} altered successfully")
-                    self.load_schema()
-            except Exception as ex:
-                QMessageBox.critical(self, "Error", str(ex))
+            def _run(db):
+                for stmt in query_classifier.split_statements(sql):
+                    db.execute_update(stmt)
+
+            def _done(_):
+                QMessageBox.information(
+                    self, "Success", f"Table {table_name} altered successfully")
+                self.load_schema()
+
+            def _error(msg):
+                QMessageBox.critical(self, "Error", msg)
+
+            # Issue #237: ALTER runs on a dedicated background connection.
+            self._run_bg_db(_run, _done, _error)
+
+        def _error(msg):
+            QMessageBox.critical(self, "Error", f"Could not load columns for {table_name}:\n{msg}")
+
+        # Issue #237: the columns fetch that seeds the dialog runs on a
+        # dedicated background connection.
+        self._run_bg_db(lambda db: db.get_columns(table_name), _got_columns, _error)
 
     def _sample_fk_values(self, ref_table: str, ref_column: str, limit: int = 200) -> list:
         """Read-only sample of existing values for a foreign-key target
@@ -2911,23 +3066,25 @@ class ConnectionPanel(QWidget):
             QMessageBox.information(self, "No Data", "No columns were selected to insert.")
             return
 
-        try:
-            if not self._guard_write(sql):
-                return
-            reply = QMessageBox.question(
-                self, "Insert Mock Data",
-                f"Execute the following SQL?\n\n{sql[:2000]}" + ("\n…" if len(sql) > 2000 else ""),
-                QMessageBox.Yes | QMessageBox.No)
-            if reply != QMessageBox.Yes:
-                return
+        if not self._guard_write(sql):
+            return
+        reply = QMessageBox.question(
+            self, "Insert Mock Data",
+            f"Execute the following SQL?\n\n{sql[:2000]}" + ("\n…" if len(sql) > 2000 else ""),
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        generated_pk_columns = dialog.generated_pk_columns()
+
+        def _run(db):
             for stmt in query_classifier.split_statements(sql):
-                self.db_service.execute_update(stmt)
+                db.execute_update(stmt)
+            for gen_table, pk_column in generated_pk_columns:
+                db.bump_sequence_for_column(gen_table, pk_column)
 
-            for gen_table, pk_column in dialog.generated_pk_columns():
-                self.db_service.bump_sequence_for_column(gen_table, pk_column)
-
+        def _done(_):
             QMessageBox.information(self, "Success", f"Mock data inserted into {table_name}.")
-
             for i in range(self.tabs.count()):
                 w = self.tabs.widget(i)
                 if isinstance(w, TableViewWidget) and w.table_name == table_name:
@@ -2935,8 +3092,13 @@ class ConnectionPanel(QWidget):
                     w.current_page = 1
                     w.load_table_data()
                     break
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", str(ex))
+
+        def _error(msg):
+            QMessageBox.critical(self, "Error", msg)
+
+        # Issue #237: write cost scales with the requested row count, so
+        # this runs on a dedicated background connection.
+        self._run_bg_db(_run, _done, _error)
 
     # ─── CSV Import ──────────────────────────────────────────────────────────
 
@@ -3218,36 +3380,80 @@ class ConnectionPanel(QWidget):
             tuple(None if v == "" else v for v in row)
             for row in df.itertuples(index=False, name=None)
         ]
-        _import_t0 = time.perf_counter()
-        try:
-            inserted, errors = self.db_service.execute_batch(
-                insert_sql, rows,
-                batch_size=BATCH,
-                on_batch=lambda start, n: progress.setValue(start + n),
-                should_cancel=progress.wasCanceled,
-            )
-        except Exception as ex:
-            QMessageBox.critical(self, "Import Error", str(ex))
-            return
-        finally:
-            progress.close()
-            perf_metrics.record("import_export", "csv_import", (time.perf_counter() - _import_t0) * 1000)
+
+        # Issue #237: the batched INSERT write loop runs on a dedicated
+        # background connection instead of blocking the UI thread.
+        # Progress/cancellation cross the thread boundary via Qt signals —
+        # execute_batch()'s on_batch/should_cancel callbacks would otherwise
+        # touch the QProgressDialog and a plain bool straight from the
+        # worker thread, neither of which is safe.
+        cancel_event = threading.Event()
+        progress.canceled.connect(cancel_event.set)
+        self._csv_import_progress_dialog = progress
+        self._csv_import_table = table_name
+        self._csv_import_t0 = time.perf_counter()
+
+        cfg = dict(self.config)
+        sig_progress = self._csv_import_progress
+        sig_done = self._csv_import_write_done
+        sig_error = self._csv_import_write_error
+
+        def _worker():
+            db = DbService()
+            try:
+                db.connect(cfg)
+                inserted, errors = db.execute_batch(
+                    insert_sql, rows,
+                    batch_size=BATCH,
+                    on_batch=lambda start, n: sig_progress.emit(start + n),
+                    should_cancel=cancel_event.is_set,
+                )
+            except Exception as ex:
+                sig_error.emit(str(ex))
+                return
+            finally:
+                try:
+                    db.disconnect()
+                except Exception:
+                    pass
+            sig_done.emit(inserted, errors)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_csv_import_progress(self, n: int):
+        if self._csv_import_progress_dialog is not None:
+            self._csv_import_progress_dialog.setValue(n)
+
+    def _on_csv_import_write_done(self, inserted: int, errors: int):
+        dlg, table_name, t0 = (
+            self._csv_import_progress_dialog, self._csv_import_table, self._csv_import_t0)
+        self._csv_import_progress_dialog = None
+        if dlg is not None:
+            dlg.close()
+        if t0 is not None:
+            perf_metrics.record("import_export", "csv_import", (time.perf_counter() - t0) * 1000)
 
         msg = f"Imported <b>{inserted:,}</b> rows into <b>{table_name}</b>."
         if errors:
             msg += f"<br>{errors} batch(es) failed — check logs."
         QMessageBox.information(self, "Import Complete", msg)
 
-        # Refresh the open table view if it exists
-        panel = self
-        for i in range(panel.tabs.count()):
-            w = panel.tabs.widget(i)
-            from ui.table_view_widget import TableViewWidget
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
             if isinstance(w, TableViewWidget) and w.table_name == table_name:
                 w._warn_and_discard_changes()
                 w.current_page = 1
                 w.load_table_data()
                 break
+
+    def _on_csv_import_write_error(self, msg: str):
+        dlg, t0 = self._csv_import_progress_dialog, self._csv_import_t0
+        self._csv_import_progress_dialog = None
+        if dlg is not None:
+            dlg.close()
+        if t0 is not None:
+            perf_metrics.record("import_export", "csv_import", (time.perf_counter() - t0) * 1000)
+        QMessageBox.critical(self, "Import Error", msg)
 
     # ─── Table context-menu operations (issue #142) ────────────────────────────
 
@@ -3284,27 +3490,49 @@ class ConnectionPanel(QWidget):
         QApplication.clipboard().setText(ddl)
 
     def _copy_insert_script(self, table_name: str):
-        try:
-            df = self.db_service.execute_query(
-                f"SELECT {self.db_service.content_select_list(table_name)} FROM {table_name}")  # nosec B608
-        except Exception as ex:
-            QMessageBox.critical(self, "Copy Script Error", f"Could not read table:\n{ex}")
-            return
-        if df.empty:
-            QMessageBox.information(self, "Copy Script", f"'{table_name}' has no rows to script.")
-            return
-        QApplication.clipboard().setText(_to_sql_inserts(df, table_name, dialect=self.db_service.db_type))
+        """Issue #237: runs the full-table SELECT on a dedicated background
+        connection instead of blocking the UI thread on a possibly huge
+        table — the dialect's own DbService.content_select_list() needs
+        that dedicated connection too, so it's read inside the worker."""
+        dialect = self.db_service.db_type
+
+        def _fetch(db):
+            return db.execute_query(
+                f"SELECT {db.content_select_list(table_name)} FROM {table_name}")  # nosec B608
+
+        def _done(df):
+            QApplication.restoreOverrideCursor()
+            if df.empty:
+                QMessageBox.information(self, "Copy Script", f"'{table_name}' has no rows to script.")
+                return
+            QApplication.clipboard().setText(_to_sql_inserts(df, table_name, dialect=dialect))
+
+        def _error(msg):
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Copy Script Error", f"Could not read table:\n{msg}")
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._run_bg_db(_fetch, _done, _error)
 
     def _export_table_data_only(self, table_name: str):
         """Export just the rows (context menu's "Export Table Data") without
         the ExportScopeDialog's structure/data/both prompt — same CSV/JSON/
-        Excel/SQL-inserts picker _export_table() already uses for "data"."""
-        try:
-            df = self.db_service.execute_query(f"SELECT * FROM {table_name}")  # nosec B608
-        except Exception as ex:
-            QMessageBox.critical(self, "Export Error", f"Could not read table:\n{ex}")
-            return
-        export_dataframe(self, df, f"{table_name}.csv", table_name)
+        Excel/SQL-inserts picker _export_table() already uses for "data".
+        Issue #237: the full-table SELECT runs on a dedicated background
+        connection instead of blocking the UI thread."""
+        def _fetch(db):
+            return db.execute_query(f"SELECT * FROM {table_name}")  # nosec B608
+
+        def _done(df):
+            QApplication.restoreOverrideCursor()
+            export_dataframe(self, df, f"{table_name}.csv", table_name)
+
+        def _error(msg):
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Export Error", f"Could not read table:\n{msg}")
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._run_bg_db(_fetch, _done, _error)
 
     def _export_table_as_sql(self, table_name: str):
         """Export structure + data as a single .sql file (context menu's
@@ -3345,13 +3573,22 @@ class ConnectionPanel(QWidget):
         cols_sql = ", ".join(
             (f"`{c}`" if db_type == "mysql" else f'"{c}"') for c in selected
         )
-        try:
-            df = self.db_service.execute_query(
-                f"SELECT {cols_sql} FROM {table_name}")  # nosec B608
-        except Exception as ex:
-            QMessageBox.critical(self, "Export Error", f"Could not read table:\n{ex}")
-            return
-        export_dataframe(self, df, f"{table_name}.csv", table_name)
+
+        # Issue #237: the full-table SELECT runs on a dedicated background
+        # connection instead of blocking the UI thread.
+        def _fetch(db):
+            return db.execute_query(f"SELECT {cols_sql} FROM {table_name}")  # nosec B608
+
+        def _done(df):
+            QApplication.restoreOverrideCursor()
+            export_dataframe(self, df, f"{table_name}.csv", table_name)
+
+        def _error(msg):
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Export Error", f"Could not read table:\n{msg}")
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._run_bg_db(_fetch, _done, _error)
 
     def _new_table(self):
         """StructureEditorDialog already supports a "New Table" mode
@@ -3360,18 +3597,25 @@ class ConnectionPanel(QWidget):
         dialog = StructureEditorDialog(db_type=self.db_service.db_type, parent=self)
         if not dialog.exec():
             return
-        try:
-            sql = dialog.get_sql()
-            if not sql.strip() or sql.strip().startswith("--"):
-                return
-            if not self._guard_write(sql):
-                return
+        sql = dialog.get_sql()
+        if not sql.strip() or sql.strip().startswith("--"):
+            return
+        if not self._guard_write(sql):
+            return
+
+        def _run(db):
             for stmt in query_classifier.split_statements(sql):
-                self.db_service.execute_update(stmt)
+                db.execute_update(stmt)
+
+        def _done(_):
             QMessageBox.information(self, "Success", "Table created successfully.")
             self.load_schema()
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", str(ex))
+
+        def _error(msg):
+            QMessageBox.critical(self, "Error", msg)
+
+        # Issue #237: DDL runs on a dedicated background connection.
+        self._run_bg_db(_run, _done, _error)
 
     def _new_view(self):
         """No dedicated CREATE VIEW UI exists — open a fresh SQL tab with a
@@ -3403,13 +3647,18 @@ class ConnectionPanel(QWidget):
             QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        try:
-            self.db_service.execute_update(sql)
-        except Exception as ex:
-            QMessageBox.critical(self, "Clone Table Failed", str(ex))
-            return
-        QMessageBox.information(self, "Success", f"'{table_name}' cloned to '{new_name}'.")
-        self.load_schema()
+
+        def _done(_):
+            QMessageBox.information(self, "Success", f"'{table_name}' cloned to '{new_name}'.")
+            self.load_schema()
+
+        def _error(msg):
+            QMessageBox.critical(self, "Clone Table Failed", msg)
+
+        # Issue #237: CREATE TABLE ... AS SELECT runs on a dedicated
+        # background connection — on a large source table this can take a
+        # while server-side.
+        self._run_bg_db(lambda db: db.execute_update(sql), _done, _error)
 
     def _truncate_table(self, table_name: str):
         quoted = self._qualified_name(table_name, quote=True)
@@ -3423,13 +3672,17 @@ class ConnectionPanel(QWidget):
             QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        try:
-            self.db_service.execute_update(sql)
-        except Exception as ex:
-            QMessageBox.critical(self, "Truncate Failed", str(ex))
-            return
-        QMessageBox.information(self, "Success", f"'{table_name}' truncated.")
-        self._refresh_open_table_tab(table_name)
+
+        def _done(_):
+            QMessageBox.information(self, "Success", f"'{table_name}' truncated.")
+            self._refresh_open_table_tab(table_name)
+
+        def _error(msg):
+            QMessageBox.critical(self, "Truncate Failed", msg)
+
+        # Issue #237: TRUNCATE runs on a dedicated background connection —
+        # can take a while on a huge table.
+        self._run_bg_db(lambda db: db.execute_update(sql), _done, _error)
 
     def _delete_table(self, table_name: str):
         kind = "VIEW" if self._active_category == "views" else "TABLE"
@@ -3439,7 +3692,9 @@ class ConnectionPanel(QWidget):
             return
 
         # Issue #236: silent check (no upgrade nag — this runs on every
-        # drop, not just an explicit Impact Analysis click).
+        # drop, not just an explicit Impact Analysis click). Cheap metadata
+        # query — left on the main connection like the other metadata-only
+        # calls (issue #237's "lowest priority" tier).
         impact = ""
         if entitlements.is_enabled(Feature.IMPACT_ANALYSIS):
             report = dependency_analyzer.find_table_dependents(self.db_service, table_name)
@@ -3454,18 +3709,22 @@ class ConnectionPanel(QWidget):
             QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        try:
-            self.db_service.execute_update(sql)
-        except Exception as ex:
-            QMessageBox.critical(self, "Delete Failed", str(ex))
-            return
-        QMessageBox.information(self, "Success", f"'{table_name}' deleted.")
-        for i in range(self.tabs.count()):
-            w = self.tabs.widget(i)
-            if isinstance(w, TableViewWidget) and w.table_name == table_name:
-                self.tabs.removeTab(i)
-                break
-        self.load_schema()
+
+        def _done(_):
+            QMessageBox.information(self, "Success", f"'{table_name}' deleted.")
+            for i in range(self.tabs.count()):
+                w = self.tabs.widget(i)
+                if isinstance(w, TableViewWidget) and w.table_name == table_name:
+                    self.tabs.removeTab(i)
+                    break
+            self.load_schema()
+
+        def _error(msg):
+            QMessageBox.critical(self, "Delete Failed", msg)
+
+        # Issue #237: DROP/TRUNCATE runs on a dedicated background
+        # connection — can take a while on a huge table.
+        self._run_bg_db(lambda db: db.execute_update(sql), _done, _error)
 
     def _refresh_open_table_tab(self, table_name: str):
         for i in range(self.tabs.count()):
