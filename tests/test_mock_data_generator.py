@@ -276,3 +276,14 @@ def test_generate_dataframe_dedupes_unique_column():
     }
     df = gen.generate_dataframe(columns, 50, specs, unique_columns={"email"})
     assert df["email"].nunique() == len(df)
+
+
+# ─── Categorical / weighted value-list generator (issue #213) ─────────────
+
+def test_value_list_generator_only_produces_allowed_values():
+    columns = [_col("status", "varchar(20)")]
+    allowed = ["pending", "shipped", "delivered"]
+    specs = {"status": gen.ColumnSpec(generator="value_list",
+                                       options={"values": allowed, "weights": [1, 5, 1]})}
+    df = gen.generate_dataframe(columns, 30, specs)
+    assert set(df["status"].tolist()) <= set(allowed)

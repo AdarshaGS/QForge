@@ -51,6 +51,7 @@ GENERATOR_LABELS = {
     "null": "Always NULL",
     "foreign_key": "Foreign Key Reference",
     "custom_pattern": "Custom Pattern",
+    "value_list": "Value List (Weighted)",
     "omit": "Omit (let database assign)",
 }
 GENERATORS = tuple(GENERATOR_LABELS.keys())
@@ -236,6 +237,21 @@ def _gen_lorem_text(spec: ColumnSpec, seq: int):
     return _fake.sentence()
 
 
+def _gen_value_list(spec: ColumnSpec, seq: int):
+    """Categorical picker (issue #213) — a status/type-shaped column with a
+    user-entered value list, and optional parallel weights via
+    `options["weights"]`. Falls back to uniform choice when weights are
+    absent or don't line up 1:1 with values (a malformed weights list
+    shouldn't crash generation, just lose the weighting)."""
+    values = spec.options.get("values") or []
+    if not values:
+        return None
+    weights = spec.options.get("weights")
+    if weights and len(weights) == len(values):
+        return random.choices(values, weights=weights, k=1)[0]  # nosec B311 -- mock/sample data, not security-sensitive
+    return random.choice(values)  # nosec B311 -- mock/sample data, not security-sensitive
+
+
 _SIMPLE_GENERATORS = {
     "integer": _gen_integer,
     "float": _gen_float,
@@ -255,6 +271,7 @@ _SIMPLE_GENERATORS = {
     "job": lambda spec, seq: _fake.job(),
     "lorem_text": _gen_lorem_text,
     "null": lambda spec, seq: None,
+    "value_list": _gen_value_list,
 }
 
 

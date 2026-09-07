@@ -107,6 +107,17 @@ class _OptionsDialog(QDialog):
             pattern_edit = QLineEdit(options.get("pattern", "ITEM-{seq}"))
             layout.addWidget(pattern_edit)
             self._fields["pattern"] = pattern_edit
+        elif generator == "value_list":
+            layout.addWidget(QLabel("Values (comma-separated):"))
+            values_edit = QLineEdit(", ".join(str(v) for v in options.get("values", [])))
+            layout.addWidget(values_edit)
+            layout.addWidget(QLabel(
+                "Weights (optional, comma-separated, same count as values):"
+            ))
+            weights_edit = QLineEdit(", ".join(str(w) for w in options.get("weights", [])))
+            layout.addWidget(weights_edit)
+            self._fields["values"] = values_edit
+            self._fields["weights"] = weights_edit
         else:
             layout.addWidget(QLabel("This generator has no options."))
 
@@ -116,6 +127,16 @@ class _OptionsDialog(QDialog):
         layout.addWidget(buttons)
 
     def options(self) -> dict:
+        if self._generator == "value_list":
+            values = [v.strip() for v in self._fields["values"].text().split(",") if v.strip()]
+            weights_text = [w.strip() for w in self._fields["weights"].text().split(",") if w.strip()]
+            result = {"values": values}
+            if len(weights_text) == len(values):
+                try:
+                    result["weights"] = [float(w) for w in weights_text]
+                except ValueError:
+                    pass  # malformed weight — fall back to uniform, don't block Options from closing
+            return result
         result = {}
         for key, widget in self._fields.items():
             if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
