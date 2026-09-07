@@ -510,11 +510,16 @@ class DbService:
             return True
         keywords = (
             'lost connection', 'server has gone away', 'broken pipe',
-            'connection reset', 'connection closed', 'interface error',
+            'connection reset', 'interface error',
             'server closed', 'operationalerror', 'not connected',
             'connection refused', 'timed out',
         )
-        return any(k in msg for k in keywords)
+        # Issue #220: matched literal 'connection closed' before, which
+        # missed psycopg2's actual "connection already closed" — matching
+        # both words independently (in order) survives that kind of
+        # word-order/insertion variant instead of needing every driver's
+        # exact phrasing enumerated.
+        return ('connection' in msg and 'closed' in msg) or any(k in msg for k in keywords)
 
     def kill_current_query(self):
         """Best-effort: kill the running query on the server side.
