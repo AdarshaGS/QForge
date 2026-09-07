@@ -862,6 +862,15 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        file_menu.addSeparator()
+
+        act = file_menu.addAction("Preferences…")
+        act.setShortcut("Ctrl+,")
+        act.triggered.connect(self.show_preferences)
+        # issue #264: PreferencesRole relocates this into the app menu on
+        # macOS ("QForge > Settings…") instead of leaving it in File.
+        act.setMenuRole(QAction.MenuRole.PreferencesRole)
+
         act = file_menu.addAction("Quit")
         act.setShortcut("Ctrl+Q")
         act.triggered.connect(self.close)
@@ -888,11 +897,6 @@ class MainWindow(QMainWindow):
         act = view_menu.addAction("Command Palette")
         act.setShortcut("Ctrl+Shift+P")
         act.triggered.connect(lambda: show_command_palette(menubar, self))
-
-        view_menu.addSeparator()
-
-        self.theme_action = view_menu.addAction("Switch to Light Theme")
-        self.theme_action.triggered.connect(self.toggle_theme)
 
         view_menu.addSeparator()
 
@@ -1052,13 +1056,13 @@ class MainWindow(QMainWindow):
             self._on_health_changed(panel, getattr(panel, '_last_health', 'idle'))
 
     def toggle_theme(self):
-        if self.current_theme == "dark":
-            self.current_theme = "light"
-            self.theme_action.setText("Switch to Dark Theme")
-        else:
-            self.current_theme = "dark"
-            self.theme_action.setText("Switch to Light Theme")
+        self.current_theme = "light" if self.current_theme == "dark" else "dark"
         self.apply_theme()
+
+    def show_preferences(self):
+        from ui.preferences_dialog import PreferencesDialog
+        dialog = PreferencesDialog(self, self)
+        dialog.exec()
 
     # ─── Zoom ────────────────────────────────────────────────────────────────
 
