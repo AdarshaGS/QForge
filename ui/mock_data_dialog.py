@@ -36,7 +36,8 @@ _PREVIEW_ROW_CAP = 500
 # Generators with no configurable options — the Options button is disabled.
 _NO_OPTIONS = {"uuid", "boolean", "email", "first_name", "last_name",
                "full_name", "phone", "address", "city", "company", "job",
-               "lorem_text", "null", "foreign_key", "omit"}
+               "lorem_text", "null", "foreign_key", "omit",
+               "json_object", "array", "geometry"}
 
 
 class _OptionsDialog(QDialog):
@@ -203,7 +204,12 @@ class MockDataDialog(QDialog):
             is_fk = field_name in self._fk_map
             allowed_values = self._enum_values.get(field_name)
             generator = gen.infer_generator(col, is_pk=is_pk, is_fk=is_fk, allowed_values=allowed_values)
-            options = {"values": allowed_values} if generator == "value_list" and allowed_values else {}
+            if generator == "value_list" and allowed_values:
+                options = {"values": allowed_values}
+            elif generator == "array":
+                options = {"element_bucket": gen.array_element_bucket(col)}
+            else:
+                options = {}
             self._specs[field_name] = gen.ColumnSpec(
                 generator=generator, include=generator != "omit", options=options,
             )

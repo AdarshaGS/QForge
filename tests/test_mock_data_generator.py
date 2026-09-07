@@ -1,11 +1,14 @@
+import json
+import re
+
 import sqlparse
 
 from services import mock_data_generator as gen
 from services.query_classifier import classify, split_statements
 
 
-def _col(field, sql_type, nullable="YES"):
-    return {"Field": field, "Type": sql_type, "Null": nullable, "Default": None}
+def _col(field, sql_type, nullable="YES", udt_name=None):
+    return {"Field": field, "Type": sql_type, "Null": nullable, "Default": None, "udt_name": udt_name}
 
 
 def test_infer_generator_uses_column_name_heuristics():
@@ -307,3 +310,19 @@ def test_address_and_city_columns_agree_on_same_row():
     }
     df = gen.generate_dataframe(columns, 20, specs)
     assert all(row.city in row.address for row in df.itertuples())
+
+
+# ─── Postgres jsonb / array / geometry generators (issue #214) ────────────
+
+def test_json_and_array_generators_produce_valid_literals():
+    columns = [_col("attrs", "jsonb"), _col("tags", "ARRAY", udt_name="_text")]
+    assert gen.infer_generator(columns[0]) == "json_object"
+    assert gen.infer_generator(columns[1]) == "array"
+    assert gen.array_element_bucket(columns[1]) == "string"
+    specs = {
+        "attrs": gen.ColumnSpec(generator="json_object"),
+        "tags": gen.ColumnSpec(generator="array", options={"element_bucket": "string"}),
+    }
+    df = gen.generate_dataframe(columns, 5, specs)
+    assert all(json.loads(v) for v in df["attrs"])
+    assert all(re.match(r"^\{.*\}$", v) for v in df["tags"])

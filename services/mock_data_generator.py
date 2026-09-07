@@ -15,6 +15,7 @@ and more realistic pool of values than a hand-rolled word list. Numeric,
 UUID, and custom-pattern generation stays on the stdlib (`random`/`uuid`)
 since Faker offers nothing more "real" there.
 """
+import json
 import random
 import re
 import string
@@ -52,6 +53,9 @@ GENERATOR_LABELS = {
     "foreign_key": "Foreign Key Reference",
     "custom_pattern": "Custom Pattern",
     "value_list": "Value List (Weighted)",
+    "json_object": "JSON Object",
+    "array": "Array",
+    "geometry": "Geometry (Point)",
     "omit": "Omit (let database assign)",
 }
 GENERATORS = tuple(GENERATOR_LABELS.keys())
@@ -98,6 +102,18 @@ def infer_generator(column: dict, is_pk: bool = False, is_fk: bool = False,
         return "omit"
     if allowed_values:
         return "value_list"
+
+    # Postgres jsonb/array/geometry and MySQL/Postgres json (issue #214) —
+    # "Type" alone can't distinguish these ("ARRAY"/"USER-DEFINED" are
+    # generic information_schema labels), so column also carries `udt_name`
+    # (see db_service._fetch_columns) for the real element/type name.
+    type_lower = (column.get("Type") or "").lower()
+    if type_lower.startswith("json"):
+        return "json_object"
+    if type_lower == "array":
+        return "array"
+    if type_lower == "user-defined" and (column.get("udt_name") or "") in ("geometry", "geography"):
+        return "geometry"
 
     name = (column.get("Field") or "").lower()
 
@@ -258,6 +274,63 @@ def _gen_lorem_text(spec: ColumnSpec, seq: int):
     return _fake.sentence()
 
 
+def array_element_bucket(column: dict) -> str:
+    """Type bucket for a Postgres array column's *element* type (issue
+    #214), from `udt_name` (e.g. "_int4" -> "int4", "_text" -> "text") —
+    callers pass this into a "array"-generator ColumnSpec's
+    `options["element_bucket"]` right after `infer_generator` returns
+    "array", since infer_generator itself only returns the generator id."""
+    return _type_bucket((column.get("udt_name") or "").lstrip("_") or "text")
+
+
+def _gen_json_object(spec: ColumnSpec, seq: int):
+    """A small, realistic-shaped JSON object (issue #214) — not an attempt
+    to model any real schema, just plausible-looking jsonb/json content."""
+    return json.dumps({
+        "id": seq + 1,
+        "name": _fake.word(),
+        "value": random.randint(1, 100),  # nosec B311 -- mock/sample data, not security-sensitive
+    })
+
+
+_ARRAY_ELEMENT_GENERATORS = {
+    "integer": _gen_integer, "float": _gen_float, "string": _gen_string,
+    "uuid": _gen_uuid, "boolean": _gen_boolean, "date": _gen_date, "datetime": _gen_datetime,
+}
+
+
+def _array_literal_item(value) -> str:
+    if isinstance(value, bool):
+        return "t" if value else "f"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return '"' + str(value).replace('"', '\\"') + '"'
+
+
+def _gen_array(spec: ColumnSpec, seq: int):
+    """Postgres array literal text (issue #214), e.g. "{1,2,3}" or
+    '{"a","b"}' — a plain string, so it flows through _sql_value_literal's
+    existing string-quoting path with no dedicated array support needed
+    there. Element type comes from `options["element_bucket"]`
+    (array_element_bucket()), falling back to "string" if unset (e.g. the
+    user manually picked "array" for a column that wasn't inferred as
+    one)."""
+    bucket = spec.options.get("element_bucket", "string")
+    elem_fn = _ARRAY_ELEMENT_GENERATORS.get(bucket, _gen_string)
+    count = random.randint(2, 5)  # nosec B311 -- mock/sample data, not security-sensitive
+    items = [elem_fn(ColumnSpec(generator=bucket, options=spec.options), seq) for _ in range(count)]
+    return "{" + ",".join(_array_literal_item(v) for v in items) + "}"
+
+
+def _gen_geometry(spec: ColumnSpec, seq: int):
+    """Basic PostGIS point as WKT text (issue #214) — Postgres/PostGIS
+    accept a plain quoted WKT string for a geometry/geography column via
+    an assignment cast, so no dedicated SQL-literal handling is needed."""
+    lon = round(random.uniform(-180, 180), 6)  # nosec B311 -- mock/sample data, not security-sensitive
+    lat = round(random.uniform(-90, 90), 6)  # nosec B311 -- mock/sample data, not security-sensitive
+    return f"POINT({lon} {lat})"
+
+
 def _gen_value_list(spec: ColumnSpec, seq: int):
     """Categorical picker (issue #213) — a status/type-shaped column with a
     user-entered value list, and optional parallel weights via
@@ -291,6 +364,9 @@ _SIMPLE_GENERATORS = {
     "lorem_text": _gen_lorem_text,
     "null": lambda spec, seq: None,
     "value_list": _gen_value_list,
+    "json_object": _gen_json_object,
+    "array": _gen_array,
+    "geometry": _gen_geometry,
 }
 
 
@@ -547,7 +623,12 @@ def generate_chain_dataframes(chain: DependencyChain, plans: dict,
             allowed_values = plan.enum_values.get(name)
             generator = infer_generator(col, is_pk=is_pk, is_fk=is_fk, allowed_values=allowed_values)
             include = generator != "omit"
-            options = {"values": allowed_values} if generator == "value_list" and allowed_values else {}
+            if generator == "value_list" and allowed_values:
+                options = {"values": allowed_values}
+            elif generator == "array":
+                options = {"element_bucket": array_element_bucket(col)}
+            else:
+                options = {}
             if name in my_targets and generator == "omit":
                 # A lone integer PK some descendant needs to reference —
                 # force it into memory instead of leaving it to the DB.
