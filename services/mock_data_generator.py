@@ -267,9 +267,45 @@ def _generate_value(spec: ColumnSpec, seq: int, pool: list):
     return fn(spec, seq) if fn else None
 
 
+# Generators drawn from a fixed/constrained pool (a live FK sample, an
+# enum/CHECK/value-list, a coin flip) can't be "disambiguated" by mutating
+# the value without breaking the constraint that pool represents — a
+# UNIQUE + FK column just accepts an eventual duplicate once the pool is
+# exhausted, same as a UNIQUE + boolean column always would.
+_UNDISAMBIGUATABLE_GENERATORS = {"foreign_key", "value_list", "boolean", "null"}
+_UNIQUE_RETRY_ATTEMPTS = 20
+
+
+def _dedupe_unique(spec: ColumnSpec, seq: int, pool: list, seen: set, value):
+    """Re-roll *value* against *seen* (issue #210) for a UNIQUE-constrained
+    column, then fall back to a deterministic disambiguation for
+    freeform generators (append "-{seq}" to a string, offset a number by
+    {seq}) — but only for generators where mutating the value can't
+    violate some other constraint the value is drawn from; see
+    _UNDISAMBIGUATABLE_GENERATORS."""
+    if value is None or value not in seen:
+        return value
+    for _ in range(_UNIQUE_RETRY_ATTEMPTS):
+        value = _generate_value(spec, seq, pool)
+        if value is None or value not in seen:
+            return value
+    if spec.generator in _UNDISAMBIGUATABLE_GENERATORS:
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        bumped = value + seq + 1
+        while bumped in seen:
+            bumped += 1
+        return bumped
+    disambiguated = f"{value}-{seq}"
+    while disambiguated in seen:
+        disambiguated = f"{disambiguated}-{seq}"
+    return disambiguated
+
+
 def generate_dataframe(columns: list[dict], row_count: int,
                         specs: dict[str, ColumnSpec],
-                        fk_pools: dict[str, list] | None = None) -> pd.DataFrame:
+                        fk_pools: dict[str, list] | None = None,
+                        unique_columns: set | None = None) -> pd.DataFrame:
     """Build a synthetic DataFrame for *columns* (as returned by
     `DbService.get_columns`). Only columns whose spec has `include=True`
     are produced — callers exclude generated columns and "omit"-generator
@@ -277,9 +313,13 @@ def generate_dataframe(columns: list[dict], row_count: int,
     with `include=True`. `fk_pools[column]` should hold real values sampled
     from the referenced table/column (a read, so this works even on
     read-only connections) for any column using the "foreign_key"
-    generator; an empty pool yields NULL."""
+    generator; an empty pool yields NULL. `unique_columns` (issue #210) —
+    names of single-column UNIQUE-constrained columns — get dedup-tracked
+    across the whole run so a nontrivial row count doesn't produce a
+    UNIQUE-violating INSERT; see _dedupe_unique."""
     fk_pools = fk_pools or {}
     active = [c["Field"] for c in columns if specs.get(c["Field"], ColumnSpec("omit", include=False)).include]
+    seen: dict[str, set] = {name: set() for name in active if name in (unique_columns or ())}
 
     data: dict[str, list] = {name: [] for name in active}
     for seq in range(row_count):
@@ -288,7 +328,13 @@ def generate_dataframe(columns: list[dict], row_count: int,
             if spec.generator != "null" and spec.null_rate > 0 and random.random() < spec.null_rate:  # nosec B311 -- mock/sample data, not security-sensitive
                 data[name].append(None)
                 continue
-            data[name].append(_generate_value(spec, seq, fk_pools.get(name, [])))
+            pool = fk_pools.get(name, [])
+            value = _generate_value(spec, seq, pool)
+            if name in seen:
+                value = _dedupe_unique(spec, seq, pool, seen[name], value)
+                if value is not None:
+                    seen[name].add(value)
+            data[name].append(value)
     return pd.DataFrame(data, columns=active)
 
 
@@ -400,6 +446,7 @@ class TablePlan:
     generated_columns: list = field(default_factory=list)
     row_count: int = 0          # 0 means "reuse existing rows, don't generate"
     pk_offset: int = None       # MAX(existing pk) + 1, pre-fetched by the caller
+    unique_columns: set = field(default_factory=set)  # single-column UNIQUE indexes (issue #210)
 
 
 def _internal_target_columns(chain: DependencyChain, plans: dict) -> dict:
@@ -477,6 +524,7 @@ def generate_chain_dataframes(chain: DependencyChain, plans: dict,
                 # Parent was a "reuse" table (never generated) — sample it live.
                 fk_pools[name] = external_pool_fn(ref_table, ref_column)
 
-        dataframes[table] = generate_dataframe(plan.columns, plan.row_count, specs, fk_pools)
+        dataframes[table] = generate_dataframe(plan.columns, plan.row_count, specs, fk_pools,
+                                                unique_columns=plan.unique_columns)
 
     return dataframes

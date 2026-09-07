@@ -3046,17 +3046,32 @@ class ConnectionPanel(QWidget):
         return df.iloc[:, 0].dropna().tolist()
 
     def _schema_for_table(self, table_name: str) -> tuple:
-        """(columns, primary_keys, foreign_keys, generated_columns) for
-        *table_name* — the same four calls show_mock_data_generator always
-        made for the root table, factored out so issue #215's ancestor
-        panel can fetch the same shape lazily, per ancestor, only once the
-        user actually opts into "Include dependent tables"."""
+        """(columns, primary_keys, foreign_keys, generated_columns,
+        unique_columns) for *table_name* — the same calls
+        show_mock_data_generator always made for the root table, factored
+        out so issue #215's ancestor panel can fetch the same shape lazily,
+        per ancestor, only once the user actually opts into "Include
+        dependent tables". unique_columns (issue #210) is the set of
+        single-column UNIQUE-indexed column names."""
         return (
             self.db_service.get_columns(table_name),
             self.db_service.get_primary_keys(table_name),
             self.db_service.get_foreign_keys(table_name),
             self.db_service.get_generated_columns(table_name),
+            self._unique_columns(table_name),
         )
+
+    def _unique_columns(self, table_name: str) -> set:
+        """Names of *table_name*'s single-column UNIQUE indexes (issue
+        #210) — composite unique constraints are out of scope, same
+        reasoning as _sample_fk_values only handling single-column FKs.
+        Never raises; an unreadable index list just means no dedup, not a
+        blocked dialog."""
+        try:
+            return {idx["columns"][0] for idx in self.db_service.get_indexes(table_name)
+                    if idx.get("unique") and len(idx.get("columns") or []) == 1}
+        except Exception:
+            return set()
 
     def _existing_row_count(self, table_name: str) -> int:
         """Best-effort "does this ancestor table already have rows"
@@ -3118,6 +3133,7 @@ class ConnectionPanel(QWidget):
             primary_keys = self.db_service.get_primary_keys(table_name)
             foreign_keys = self.db_service.get_foreign_keys(table_name)
             generated_columns = self.db_service.get_generated_columns(table_name)
+            unique_columns = self._unique_columns(table_name)
         except Exception as ex:
             QMessageBox.critical(self, "Error", f"Could not load schema for {table_name}:\n{ex}")
             return
@@ -3133,6 +3149,7 @@ class ConnectionPanel(QWidget):
             dialect=self.db_service.db_type, fk_sampler=self._sample_fk_values,
             dependency_chain=dependency_chain, schema_fetcher=self._schema_for_table,
             existing_row_count_fetcher=self._existing_row_count, pk_offset_fetcher=self._pk_offset,
+            unique_columns=unique_columns,
             parent=self,
         )
         if not dialog.exec():

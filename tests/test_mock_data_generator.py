@@ -264,3 +264,15 @@ def test_generate_chain_dataframes_reused_table_skipped_falls_back_to_external()
     assert "customers" not in dataframes
     assert calls == [("customers", "id")]
     assert set(dataframes["orders"]["customer_id"].tolist()) <= {101, 102}
+
+
+# ─── Uniqueness constraint tracking (issue #210) ───────────────────────────
+
+def test_generate_dataframe_dedupes_unique_column():
+    columns = [_col("id", "int(11)"), _col("email", "varchar(255)")]
+    specs = {
+        "id": gen.ColumnSpec(generator="integer", options={"min": 1, "max": 5}),
+        "email": gen.ColumnSpec(generator="string", options={"length": 3}),
+    }
+    df = gen.generate_dataframe(columns, 50, specs, unique_columns={"email"})
+    assert df["email"].nunique() == len(df)

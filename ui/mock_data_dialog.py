@@ -131,7 +131,7 @@ class MockDataDialog(QDialog):
                  generated_columns: list[str], dialect: str = "mysql",
                  fk_sampler=None, dependency_chain: DependencyChain = None,
                  schema_fetcher=None, existing_row_count_fetcher=None,
-                 pk_offset_fetcher=None, parent=None):
+                 pk_offset_fetcher=None, unique_columns: set = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Generate Mock Data — {table_name}")
         self.setMinimumSize(700, 560)
@@ -171,6 +171,7 @@ class MockDataDialog(QDialog):
         lone_pk = primary_keys[0] if len(primary_keys) == 1 else None
 
         self._primary_keys = primary_keys
+        self._unique_columns = set(unique_columns or ())
 
         self._specs: dict[str, gen.ColumnSpec] = {}
         for col in self._columns:
@@ -395,10 +396,10 @@ class MockDataDialog(QDialog):
         for row, table in enumerate(self._ancestor_tables):
             self._ancestor_panel.setItem(row, 0, QTableWidgetItem(table))
             try:
-                columns, primary_keys, foreign_keys, generated_columns = self._schema_fetcher(table)
+                columns, primary_keys, foreign_keys, generated_columns, unique_columns = self._schema_fetcher(table)
                 existing = self._existing_row_count_fetcher(table) if self._existing_row_count_fetcher else 0
             except Exception:
-                columns, primary_keys, foreign_keys, generated_columns, existing = [], [], [], [], 0
+                columns, primary_keys, foreign_keys, generated_columns, unique_columns, existing = [], [], [], [], set(), 0
 
             reuse = existing > 0
             status = f"{existing:,} existing rows — will reuse" if reuse else "empty — will generate"
@@ -409,7 +410,7 @@ class MockDataDialog(QDialog):
                 self._ancestor_plans[table] = TablePlan(
                     table=table, columns=columns, primary_keys=primary_keys,
                     foreign_keys=foreign_keys, generated_columns=generated_columns,
-                    row_count=0,
+                    row_count=0, unique_columns=unique_columns,
                 )
             else:
                 spin = QSpinBox()
@@ -421,7 +422,7 @@ class MockDataDialog(QDialog):
                 self._ancestor_plans[table] = TablePlan(
                     table=table, columns=columns, primary_keys=primary_keys,
                     foreign_keys=foreign_keys, generated_columns=generated_columns,
-                    row_count=root_row_count,
+                    row_count=root_row_count, unique_columns=unique_columns,
                     pk_offset=self._pk_offset_for(table, primary_keys),
                 )
 
@@ -480,7 +481,8 @@ class MockDataDialog(QDialog):
                 )
         self._warning_label.setText("⚠ " + "; ".join(warnings) if warnings else "")
 
-        df = gen.generate_dataframe(self._columns, row_count, self._specs, fk_pools)
+        df = gen.generate_dataframe(self._columns, row_count, self._specs, fk_pools,
+                                     unique_columns=self._unique_columns)
         self._populate_preview(df)
         self._last_sql = gen.build_insert_sql(df, self._table_name, dialect=self._dialect)
         self._sql_view.setPlainText(self._last_sql or "-- No columns selected to insert.")
@@ -494,6 +496,7 @@ class MockDataDialog(QDialog):
             table=self._table_name, columns=self._columns,
             primary_keys=self._primary_keys, foreign_keys=list(self._fk_map.values()),
             generated_columns=[], row_count=root_row_count,
+            unique_columns=self._unique_columns,
         )
 
         dataframes = gen.generate_chain_dataframes(chain, plans, external_pool_fn=self._sample_external)
