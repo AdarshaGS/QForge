@@ -17,8 +17,8 @@ from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMessageBox, QProgressBar, QPushButton, QSpinBox, QTableWidget,
-    QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter,
+    QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from services import mock_data_generator as gen
@@ -226,7 +226,12 @@ class MockDataDialog(QDialog):
                  enum_values: dict = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Generate Mock Data — {table_name}")
-        self.setMinimumSize(700, 560)
+        # Issue #219 — resizable rather than a fixed-size form; the column
+        # grid and preview/SQL panes below actually use the extra space
+        # (see the QSplitter further down), instead of the grid staying
+        # pinned at a fixed height regardless of how big the window gets.
+        self.resize(900, 640)
+        self.setMinimumSize(640, 480)
 
         self._table_name = table_name
         self._dialect = dialect
@@ -285,6 +290,17 @@ class MockDataDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
+        # Issue #219 — config controls (row count/seed/locale, the
+        # dependency-chain opt-in) live in one fixed-height pane at the top
+        # of a vertical QSplitter; the column grid and preview/SQL tabs
+        # below get the growable panes, weighted so extra window height
+        # goes where it's actually useful (same QSplitter approach
+        # ui/schema_compare_dialog.py already uses).
+        splitter = QSplitter(Qt.Vertical)
+        config_widget = QWidget()
+        config_layout = QVBoxLayout(config_widget)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel("Rows to generate:"))
         self._row_count_spin = QSpinBox()
@@ -309,7 +325,7 @@ class MockDataDialog(QDialog):
         top_row.addWidget(self._locale_combo)
 
         top_row.addStretch()
-        layout.addLayout(top_row)
+        config_layout.addLayout(top_row)
 
         if self._ancestor_tables:
             self._include_deps_check = QCheckBox(
@@ -317,7 +333,7 @@ class MockDataDialog(QDialog):
                 f"{'s' if len(self._ancestor_tables) != 1 else ''} this one depends on)"
             )
             self._include_deps_check.toggled.connect(self._toggle_include_dependents)
-            layout.addWidget(self._include_deps_check)
+            config_layout.addWidget(self._include_deps_check)
 
             self._ancestor_panel = QTableWidget(0, 3)
             self._ancestor_panel.setHorizontalHeaderLabels(["Table", "Status", "Rows"])
@@ -325,18 +341,17 @@ class MockDataDialog(QDialog):
             self._ancestor_panel.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
             self._ancestor_panel.setMaximumHeight(150)
             self._ancestor_panel.setVisible(False)
-            layout.addWidget(self._ancestor_panel)
+            config_layout.addWidget(self._ancestor_panel)
         else:
             self._include_deps_check = None
             self._ancestor_panel = None
 
-        layout.addWidget(self._build_column_grid())
+        splitter.addWidget(config_widget)
+        splitter.addWidget(self._build_column_grid())
 
-        self._warning_label = QLabel("")
-        self._warning_label.setWordWrap(True)
-        self._warning_label.setStyleSheet("color: #c9622a;")
-        layout.addWidget(self._warning_label)
-
+        preview_widget = QWidget()
+        preview_layout = QVBoxLayout(preview_widget)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
         self._tabs = QTabWidget()
         self._preview_table = QTableWidget()
         self._preview_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -345,7 +360,21 @@ class MockDataDialog(QDialog):
         self._sql_view.setReadOnly(True)
         self._sql_view.setStyleSheet(_PREVIEW_STYLE)
         self._tabs.addTab(self._sql_view, "SQL")
-        layout.addWidget(self._tabs, stretch=1)
+        preview_layout.addWidget(self._tabs)
+        splitter.addWidget(preview_widget)
+
+        # config pane stays put; the column grid and preview/SQL tabs share
+        # extra window height, weighted toward preview since that's where
+        # the actual generated data/SQL is judged.
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 3)
+        layout.addWidget(splitter, stretch=1)
+
+        self._warning_label = QLabel("")
+        self._warning_label.setWordWrap(True)
+        self._warning_label.setStyleSheet("color: #c9622a;")
+        layout.addWidget(self._warning_label)
 
         # Issue #217 — indeterminate while a background generation run is in
         # flight; hidden otherwise. Real progress isn't reported since the
@@ -388,7 +417,9 @@ class MockDataDialog(QDialog):
         table.setHorizontalHeaderLabels(["Column", "Type", "Include", "Generator", "Null %", "Options"])
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        table.setMaximumHeight(240)
+        # Issue #219 — no hard height cap: this pane lives in the
+        # constructor's QSplitter and grows with the window instead of
+        # scrolling inside a fixed 240px box regardless of column count.
 
         self._include_checks: dict[str, QCheckBox] = {}
         self._generator_combos: dict[str, QComboBox] = {}
