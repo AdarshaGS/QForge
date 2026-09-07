@@ -295,3 +295,15 @@ def test_infer_generator_prefers_allowed_values_over_string_bucket():
     column = _col("status", "varchar(20)")
     generator = gen.infer_generator(column, allowed_values=["active", "inactive"])
     assert generator == "value_list"
+
+
+# ─── Correlated address/city columns (issue #212) ──────────────────────────
+
+def test_address_and_city_columns_agree_on_same_row():
+    columns = [_col("address", "varchar(255)"), _col("city", "varchar(100)")]
+    specs = {
+        "address": gen.ColumnSpec(generator="address"),
+        "city": gen.ColumnSpec(generator="city"),
+    }
+    df = gen.generate_dataframe(columns, 20, specs)
+    assert all(row.city in row.address for row in df.itertuples())

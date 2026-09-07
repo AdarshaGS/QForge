@@ -234,10 +234,24 @@ def _gen_phone(spec: ColumnSpec, seq: int):
     return _fake.phone_number()
 
 
-def _gen_address(spec: ColumnSpec, seq: int):
-    # Faker's address() embeds a newline before city/state/zip; a mock SQL
-    # value should stay on one line.
+def _gen_address(spec: ColumnSpec, seq: int, context: dict | None = None):
+    """Issue #212: when this table also has a "city"-generator column,
+    *context["city"]* carries this row's already-generated city so the two
+    columns agree, built from street_address() + that city rather than
+    Faker's own address() (which bundles its own independently-random
+    city and can't be reliably parsed back apart across locales).
+    Faker's address() embeds a newline before city/state/zip when there's
+    no shared city to correlate with; a mock SQL value should stay on one
+    line either way."""
+    if context and "city" in context:
+        return f"{_fake.street_address()}, {context['city']}"
     return _fake.address().replace("\n", ", ")
+
+
+def _gen_city(spec: ColumnSpec, seq: int, context: dict | None = None):
+    if context and "city" in context:
+        return context["city"]
+    return _fake.city()
 
 
 def _gen_lorem_text(spec: ColumnSpec, seq: int):
@@ -272,8 +286,6 @@ _SIMPLE_GENERATORS = {
     "last_name": lambda spec, seq: _fake.last_name(),
     "full_name": lambda spec, seq: _fake.name(),
     "phone": _gen_phone,
-    "address": _gen_address,
-    "city": lambda spec, seq: _fake.city(),
     "company": lambda spec, seq: _fake.company(),
     "job": lambda spec, seq: _fake.job(),
     "lorem_text": _gen_lorem_text,
@@ -282,11 +294,15 @@ _SIMPLE_GENERATORS = {
 }
 
 
-def _generate_value(spec: ColumnSpec, seq: int, pool: list):
+def _generate_value(spec: ColumnSpec, seq: int, pool: list, context: dict | None = None):
     if spec.generator == "foreign_key":
         return random.choice(pool) if pool else None  # nosec B311 -- mock/sample data, not security-sensitive
     if spec.generator == "custom_pattern":
         return _render_pattern(spec.options.get("pattern", "{seq}"), seq)
+    if spec.generator == "address":
+        return _gen_address(spec, seq, context)
+    if spec.generator == "city":
+        return _gen_city(spec, seq, context)
     fn = _SIMPLE_GENERATORS.get(spec.generator)
     return fn(spec, seq) if fn else None
 
@@ -300,7 +316,7 @@ _UNDISAMBIGUATABLE_GENERATORS = {"foreign_key", "value_list", "boolean", "null"}
 _UNIQUE_RETRY_ATTEMPTS = 20
 
 
-def _dedupe_unique(spec: ColumnSpec, seq: int, pool: list, seen: set, value):
+def _dedupe_unique(spec: ColumnSpec, seq: int, pool: list, seen: set, value, context: dict | None = None):
     """Re-roll *value* against *seen* (issue #210) for a UNIQUE-constrained
     column, then fall back to a deterministic disambiguation for
     freeform generators (append "-{seq}" to a string, offset a number by
@@ -310,7 +326,7 @@ def _dedupe_unique(spec: ColumnSpec, seq: int, pool: list, seen: set, value):
     if value is None or value not in seen:
         return value
     for _ in range(_UNIQUE_RETRY_ATTEMPTS):
-        value = _generate_value(spec, seq, pool)
+        value = _generate_value(spec, seq, pool, context)
         if value is None or value not in seen:
             return value
     if spec.generator in _UNDISAMBIGUATABLE_GENERATORS:
@@ -344,18 +360,24 @@ def generate_dataframe(columns: list[dict], row_count: int,
     fk_pools = fk_pools or {}
     active = [c["Field"] for c in columns if specs.get(c["Field"], ColumnSpec("omit", include=False)).include]
     seen: dict[str, set] = {name: set() for name in active if name in (unique_columns or ())}
+    # Issue #212: an "address" column and a "city" column on the same table
+    # get correlated via one shared per-row city rather than two
+    # independently-random Faker calls.
+    correlate_city = (any(specs[n].generator == "address" for n in active)
+                       and any(specs[n].generator == "city" for n in active))
 
     data: dict[str, list] = {name: [] for name in active}
     for seq in range(row_count):
+        context = {"city": _fake.city()} if correlate_city else None
         for name in active:
             spec = specs[name]
             if spec.generator != "null" and spec.null_rate > 0 and random.random() < spec.null_rate:  # nosec B311 -- mock/sample data, not security-sensitive
                 data[name].append(None)
                 continue
             pool = fk_pools.get(name, [])
-            value = _generate_value(spec, seq, pool)
+            value = _generate_value(spec, seq, pool, context)
             if name in seen:
-                value = _dedupe_unique(spec, seq, pool, seen[name], value)
+                value = _dedupe_unique(spec, seq, pool, seen[name], value, context)
                 if value is not None:
                     seen[name].add(value)
             data[name].append(value)
