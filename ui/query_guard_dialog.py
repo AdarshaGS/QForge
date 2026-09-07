@@ -81,11 +81,18 @@ def show_read_only_blocked(parent, connection_name: str, env: str, statements: l
 
 def show_dangerous_confirmation(parent, connection_name: str, env: str,
                                  statements: list, reasons: list,
-                                 require_typed_name: bool = False) -> bool:
+                                 require_typed_name: bool = False,
+                                 row_counts: dict = None) -> bool:
     """Shows the exact statement(s) and why they were flagged. Returns True
     only if the user explicitly confirms — when require_typed_name is set
-    (destructive DDL: DROP/TRUNCATE), Confirm stays disabled until the
-    connection's name is typed exactly."""
+    (destructive DDL: DROP/TRUNCATE, or a mass write past the row-count
+    threshold — issue #247), Confirm stays disabled until the connection's
+    name is typed exactly.
+
+    row_counts (issue #247): optional {statement: matched_row_count} —
+    only statements a caller could safely reduce to a single COUNT(*) are
+    present; anything omitted just doesn't get an estimate line, rather
+    than blocking or guessing."""
     dlg = QDialog(parent)
     dlg.setWindowTitle("Confirm — Flagged Statement")
     dlg.setMinimumWidth(520)
@@ -98,6 +105,22 @@ def show_dangerous_confirmation(parent, connection_name: str, env: str,
     reasons_label = QLabel("Why: " + "; ".join(reasons))
     reasons_label.setWordWrap(True)
     layout.addWidget(reasons_label)
+
+    if row_counts:
+        lines = []
+        for stmt in statements:
+            count = row_counts.get(stmt)
+            if count is None:
+                continue
+            preview = stmt.strip().splitlines()[0][:70]
+            if len(stmt.strip()) > 70 or len(stmt.strip().splitlines()) > 1:
+                preview += "…"
+            lines.append(f"≈ {count:,} row(s) match — {preview}")
+        if lines:
+            counts_label = QLabel("Estimated rows affected:\n" + "\n".join(lines))
+            counts_label.setWordWrap(True)
+            counts_label.setStyleSheet("font-weight: 600;")
+            layout.addWidget(counts_label)
 
     buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
     ok_btn = buttons.button(QDialogButtonBox.Ok)

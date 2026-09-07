@@ -1024,6 +1024,35 @@ class ConnectionPanel(QWidget):
         for lbl in self._category_count_labels.values():
             lbl.setText("0")
 
+    # Issue #247: a matched-row count at or above this threshold escalates
+    # an UPDATE/DELETE's confirmation to the same typed-connection-name
+    # flow as destructive DDL, not just a plain Confirm/Cancel — a
+    # WHERE clause that happens to match this many rows is exactly the
+    # "mass write" case a bare has-a-WHERE check can't catch on its own.
+    _MASS_WRITE_ROW_THRESHOLD = 1000
+
+    def _estimate_affected_rows(self, classifications: list) -> dict:
+        """Best-effort {statement: matched_row_count} for each dangerous
+        UPDATE/DELETE, via a throwaway SELECT COUNT(*) mirroring its own
+        WHERE clause (issue #247) — never mutates data, and being a plain
+        SELECT it's unaffected by read-only mode. A statement omitted
+        from the result means no safe count could be built or the count
+        query itself failed/errored; callers must treat that as "no
+        estimate", not zero."""
+        counts = {}
+        if not self.db_service or not self.db_service.connection:
+            return counts
+        for c in classifications:
+            count_sql = query_classifier.build_count_query(c)
+            if not count_sql:
+                continue
+            try:
+                df = self.db_service.execute_query(count_sql)
+                counts[c.statement] = int(df.iloc[0, 0])
+            except Exception as ex:
+                logger.warning(f"Affected-row estimate failed, showing confirmation without it: {ex}")
+        return counts
+
     def _guard_write(self, sql: str, extra_reason: str = None) -> bool:
         """Classify *sql* (one statement or a whole script) and show
         whatever dialog is needed before a write reaches the database.
@@ -1067,10 +1096,14 @@ class ConnectionPanel(QWidget):
                 reasons.append(extra_reason)
             if dangerous or extra_reason:
                 shown_statements = [c.statement for c in dangerous] or statements
-                require_typed_name = any(c.is_destructive_ddl for c in dangerous)
+                row_counts = self._estimate_affected_rows(dangerous)
+                require_typed_name = (
+                    any(c.is_destructive_ddl for c in dangerous)
+                    or any(n >= self._MASS_WRITE_ROW_THRESHOLD for n in row_counts.values())
+                )
                 return query_guard_dialog.show_dangerous_confirmation(
                     self, connection_name, env, shown_statements, reasons,
-                    require_typed_name=require_typed_name,
+                    require_typed_name=require_typed_name, row_counts=row_counts,
                 )
 
         return True

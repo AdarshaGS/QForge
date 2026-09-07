@@ -5,8 +5,8 @@
 # sqlparse upgrade, that's exactly what they're here to catch.
 
 from services.query_classifier import (
-    READ_ONLY_BLOCKED_KINDS, TRANSACTION_KINDS, classify, is_dangerous,
-    split_statements,
+    READ_ONLY_BLOCKED_KINDS, TRANSACTION_KINDS, build_count_query, classify,
+    is_dangerous, split_statements,
 )
 
 
@@ -67,6 +67,35 @@ def test_only_drop_and_truncate_are_destructive_ddl():
     assert classify("TRUNCATE users").is_destructive_ddl is True
     assert classify("ALTER TABLE x ADD COLUMN y INT").is_destructive_ddl is False
     assert classify("CREATE TABLE x (id INT)").is_destructive_ddl is False
+
+
+def test_build_count_query_mirrors_where_clause_including_alias():
+    # issue #247: an aliased table's WHERE clause references that alias, so
+    # the count query must keep it, not just the bare table name.
+    c = classify("UPDATE db.orders o SET o.status=1 WHERE o.id=5")
+    assert build_count_query(c) == "SELECT COUNT(*) FROM db.orders o WHERE o.id=5"
+
+
+def test_build_count_query_without_where_counts_whole_table():
+    c = classify("UPDATE t SET x=1")
+    assert build_count_query(c) == "SELECT COUNT(*) FROM t"
+
+
+def test_build_count_query_bails_on_multi_table_statements():
+    # A JOIN or comma-separated table list isn't reducible to one
+    # COUNT(*) without risking a wrong/misleading number — must return
+    # None (no estimate) rather than guess.
+    for sql in (
+        "DELETE FROM a JOIN b ON a.id=b.id WHERE a.x=1",
+        "UPDATE a, b SET x=1 WHERE a.id=b.id",
+        "WITH x AS (SELECT 1) UPDATE t SET a=1 WHERE id IN (SELECT id FROM x)",
+    ):
+        assert build_count_query(classify(sql)) is None, sql
+
+
+def test_build_count_query_none_for_non_where_applicable_kinds():
+    assert build_count_query(classify("DROP TABLE users")) is None
+    assert build_count_query(classify("SELECT * FROM users")) is None
 
 
 def test_delete_and_update_without_where_are_flagged_dangerous():
