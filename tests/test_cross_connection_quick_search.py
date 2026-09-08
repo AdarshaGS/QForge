@@ -37,11 +37,14 @@ class _FakePanel:
 
 
 class _FakeMainWindow(QWidget):
-    def __init__(self, panels):
+    def __init__(self, panels, active_index=0):
         super().__init__()
         self._panels = panels
         self.switched_to = []
-        self.conn_tab_bar = SimpleNamespace(setCurrentIndex=self.switched_to.append)
+        self.conn_tab_bar = SimpleNamespace(
+            setCurrentIndex=self.switched_to.append,
+            currentIndex=lambda: active_index,
+        )
         self._on_quick_search_cross_panel = types.MethodType(
             main_mod.MainWindow._on_quick_search_cross_panel, self)
 
@@ -61,10 +64,12 @@ def test_multi_panel_gathers_all_panels_tagged_by_source(monkeypatch):
     captured = {}
 
     class _StubDialog:
-        def __init__(self, items, parent, column_items=None, sources=None):
+        def __init__(self, items, parent, column_items=None, sources=None,
+                     default_source_idx=None):
             captured["items"] = items
             captured["column_items"] = column_items
             captured["sources"] = sources
+            captured["default_source_idx"] = default_source_idx
             self.item_selected = SimpleNamespace(connect=lambda fn: None)
 
         def exec(self):
@@ -75,7 +80,7 @@ def test_multi_panel_gathers_all_panels_tagged_by_source(monkeypatch):
     p1 = _FakePanel("staging", [("table", "orders", None)],
                      columns=[("column", "orders.id", "id")])
     p2 = _FakePanel("prod", [("table", "users", None)])
-    fake = _FakeMainWindow([p1, p2])
+    fake = _FakeMainWindow([p1, p2], active_index=1)
 
     main_mod.MainWindow.show_quick_search(fake)
 
@@ -83,6 +88,9 @@ def test_multi_panel_gathers_all_panels_tagged_by_source(monkeypatch):
     assert ("table", "orders", None, 0) in captured["items"]
     assert ("table", "users", None, 1) in captured["items"]
     assert ("column", "orders.id", "id", 0) in captured["column_items"]
+    # issue #275: the dialog is told which connection was active so it can
+    # default to scoping the search to just that one.
+    assert captured["default_source_idx"] == 1
 
 
 def test_multi_panel_with_nothing_to_search_shows_message(monkeypatch):

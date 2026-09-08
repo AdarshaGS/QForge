@@ -9,8 +9,10 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QAbstractItemView,
+    QAbstractItemDelegate,
     QApplication,
     QFrame,
+    QLineEdit,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QStyle,
@@ -198,6 +200,26 @@ class _NullAwareDelegate(QStyledItemDelegate):
             painter.setPen(QColor("#ffffff") if (option.state & QStyle.State_Selected) else QColor("#0A84FF"))
             painter.drawText(arrow_rect, Qt.AlignCenter, "→")
             painter.restore()
+
+    def eventFilter(self, editor, event):
+        """↑/↓ while editing a cell commit it and move to the same column
+        in the row above/below (spreadsheet-style), instead of doing
+        nothing — a single-line QLineEdit editor has no native use for
+        vertical arrow keys, so it's safe to repurpose them for
+        navigation the same way Qt already repurposes Tab/Enter."""
+        if (event.type() == QEvent.KeyPress
+                and event.key() in (Qt.Key_Up, Qt.Key_Down)
+                and isinstance(editor, QLineEdit)):
+            view = self.parent()
+            if view is not None:
+                index = view.currentIndex()
+                next_row = index.row() + (1 if event.key() == Qt.Key_Down else -1)
+                if 0 <= next_row < view.rowCount():
+                    self.commitData.emit(editor)
+                    self.closeEditor.emit(editor, QAbstractItemDelegate.NoHint)
+                    view.setCurrentCell(next_row, index.column())
+                return True
+        return super().eventFilter(editor, event)
 
 
 # ── Undo/redo command stack (issue #124) ────────────────────────────────
@@ -1062,10 +1084,24 @@ class EditableTableWidget(QTableWidget):
         if menu.actions():
             menu.exec_(hdr.mapToGlobal(position))
 
+    def _real_header_text(self, col: int) -> str:
+        """Header label for *col*, without the sort-arrow suffix
+        _apply_sort_header_labels draws into the active sort column's text
+        (' ▲'/' ▼'). Callers that use this as a SQL identifier or a lookup
+        key need the real name, not the decorated display text."""
+        item = self.horizontalHeaderItem(col)
+        if item is None:
+            return ""
+        text = item.text()
+        for arrow in (" ▲", " ▼"):
+            if text.endswith(arrow):
+                return text[:-len(arrow)]
+        return text
+
     def _logical_index_for_column_name(self, col_name: str):
         for c in range(self._real_col_count):
             item = self.horizontalHeaderItem(c)
-            if item is not None and item.text() == col_name:
+            if item is not None and self._real_header_text(c) == col_name:
                 return c
         return None
 
@@ -1235,7 +1271,13 @@ class EditableTableWidget(QTableWidget):
         super().keyPressEvent(event)
 
     def _open_cell_detail(self, item):
-        """Show a resizable read-only popup with the full cell value."""
+        """Show a resizable popup with the full cell value, editable the
+        same way typing directly into the cell is (issue #280) — Save
+        writes the new text back via item.setText(), which fires the same
+        itemChanged -> on_item_changed path a normal in-grid edit does, so
+        dirty-tracking/undo and the eventual save-time read-only guard all
+        behave identically either way; this is just a bigger text box for
+        a value too long to comfortably edit inline."""
         from PySide6.QtWidgets import QDialog, QVBoxLayout, QPlainTextEdit, QDialogButtonBox
         col_name = self.horizontalHeaderItem(item.column()).text() if self.horizontalHeaderItem(item.column()) else ""
         dlg = QDialog(self.window())
@@ -1245,7 +1287,6 @@ class EditableTableWidget(QTableWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         te = QPlainTextEdit()
         te.setPlainText(item.text())
-        te.setReadOnly(True)
         te.setFont(QApplication.font())
         te.setStyleSheet("""
             QPlainTextEdit {
@@ -1259,9 +1300,24 @@ class EditableTableWidget(QTableWidget):
             }
         """)
         layout.addWidget(te)
-        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         btns.rejected.connect(dlg.reject)
+
+        def _save():
+            new_text = te.toPlainText()
+            if new_text != item.text():
+                item.setText(new_text)
+            dlg.accept()
+
+        btns.accepted.connect(_save)
         layout.addWidget(btns)
+
+        # Ctrl+Enter saves too, mirroring the shortcut that opened this
+        # dialog — a plain Enter still just inserts a newline (SQL/JSON
+        # cell values routinely span multiple lines).
+        save_shortcut = QShortcut(QKeySequence("Ctrl+Return"), dlg)
+        save_shortcut.activated.connect(_save)
+
         dlg.exec()
 
     def apply_column_filter(self, column_index, filter_text):
@@ -1586,7 +1642,7 @@ class EditableTableWidget(QTableWidget):
         wrong row) whenever that convention didn't hold."""
         if self.primary_key_columns:
             name_to_idx = {
-                self.horizontalHeaderItem(c).text().lower(): c
+                self._real_header_text(c).lower(): c
                 for c in range(self._real_col_count)
             }
             idxs = [name_to_idx[name.lower()] for name in self.primary_key_columns
@@ -1594,6 +1650,21 @@ class EditableTableWidget(QTableWidget):
             if idxs:
                 return idxs
         return list(range(self._real_col_count))
+
+    def _primary_key_column_indices(self) -> list[int]:
+        """Column indices of the table's real primary key, or [] when none
+        is known — unlike _key_column_indices(), this never falls back to
+        every column, so callers that only want actual PK columns (e.g.
+        blanking them out on row duplication) don't accidentally treat an
+        unkeyed table's every column as a key."""
+        if not self.primary_key_columns:
+            return []
+        name_to_idx = {
+            self._real_header_text(c).lower(): c
+            for c in range(self._real_col_count)
+        }
+        return [name_to_idx[name.lower()] for name in self.primary_key_columns
+                if name.lower() in name_to_idx]
 
     def get_changes(self):
         """
@@ -1634,7 +1705,7 @@ class EditableTableWidget(QTableWidget):
             for col in range(self.columnCount()):
                 if (row, col) not in self.modified_cells:
                     continue
-                col_name = self.horizontalHeaderItem(col).text()
+                col_name = self._real_header_text(col)
                 item = self.item(row, col)
                 new_value = item.text()
 
@@ -1664,7 +1735,7 @@ class EditableTableWidget(QTableWidget):
             values = []
             
             for col in range(self._real_col_count):
-                col_name = self.horizontalHeaderItem(col).text()
+                col_name = self._real_header_text(col)
                 item = self.item(row, col)
                 value = item.text()
                 
@@ -1692,7 +1763,7 @@ class EditableTableWidget(QTableWidget):
     def _where_parts_for_row(self, row, where_cols):
         where_parts = []
         for col in where_cols:
-            col_name = self.horizontalHeaderItem(col).text()
+            col_name = self._real_header_text(col)
             item = self.item(row, col)
             original_value = item.data(Qt.UserRole)
             # See _display_data_impl's identical guard: pd.isna() on a
@@ -1836,7 +1907,7 @@ class EditableTableWidget(QTableWidget):
 
             # -- Quick Filter submenu ----------------------------------------
             if current_item:
-                col_name = (self.horizontalHeaderItem(current_item.column()).text()
+                col_name = (self._real_header_text(current_item.column())
                             if self.horizontalHeaderItem(current_item.column()) else "")
                 cell_val = current_item.text()
 
@@ -1930,7 +2001,7 @@ class EditableTableWidget(QTableWidget):
         item = self.horizontalHeaderItem(logical_index)
         if item is None:
             return None
-        return self._fk_map.get(item.text())
+        return self._fk_map.get(self._real_header_text(logical_index))
 
     def _fk_arrow_rect(self, view, index):
         """Rect, in *view*'s viewport coordinates, of the clickable nav-arrow
@@ -2005,7 +2076,7 @@ class EditableTableWidget(QTableWidget):
         # excluded, not just one sitting past real_col_count visually.
         cols = [hdr.logicalIndex(v) for v in range(self.columnCount())
                 if hdr.logicalIndex(v) < self._real_col_count]
-        headers = [self.horizontalHeaderItem(c).text()
+        headers = [self._real_header_text(c)
                    if self.horizontalHeaderItem(c) else str(c) for c in cols]
         data = []
         for r in rows:
@@ -2175,6 +2246,11 @@ class EditableTableWidget(QTableWidget):
         source_row = current.row()
         values = [self.item(source_row, col).text() if self.item(source_row, col) else ""
                   for col in range(self._real_col_count)]
+        # Don't carry the primary key over to the copy — a duplicate that
+        # reused it would either collide on save or (composite/no-PK
+        # tables) silently point at the same row it was copied from.
+        for pk_col in self._primary_key_column_indices():
+            values[pk_col] = ""
         row = source_row + 1
         self._insert_row_with_values(row, values)
         self._push_history(_RowInsertCommand(row, values))
@@ -2257,12 +2333,16 @@ class EditableTableWidget(QTableWidget):
         if not selected_rows:
             return
 
+        pk_cols = self._primary_key_column_indices()
         self._begin_batch()
         # Duplicate each row from bottom to top so a source row's index is
         # never disturbed by an insertion made earlier in this same loop.
         for source_row in reversed(selected_rows):
             values = [self.item(source_row, col).text() if self.item(source_row, col) else ""
                       for col in range(self._real_col_count)]
+            # Don't carry the primary key over to the copy — see duplicate_row.
+            for pk_col in pk_cols:
+                values[pk_col] = ""
             row = source_row + 1
             self._insert_row_with_values(row, values)
             self._push_history(_RowInsertCommand(row, values))

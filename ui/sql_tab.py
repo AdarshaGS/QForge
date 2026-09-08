@@ -41,6 +41,7 @@ from services import preferences
 from ui.column_filter_dialog import ColumnFilterDialog
 from ui.theme_manager import ThemeManager
 from ui.snippet_manager import SnippetManager
+from ui.sql_confirm_dialog import confirm_sql
 from utils.sql_errors import sql_error_hint as _sql_error_hint, sql_error_title as _sql_error_title
 from utils.logger import get_logger
 
@@ -1534,15 +1535,8 @@ class SqlTab(QWidget):
             return
         
         sql_preview = "\n".join(all_sql)
-        
-        reply = QMessageBox.question(
-            self,
-            "Commit Changes",
-            f"Execute the following SQL?\n\n{sql_preview[:500]}...",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        
-        if reply == QMessageBox.Yes:
+
+        if confirm_sql(self, "Commit Changes", sql_preview):
             self.commit_sql.emit(all_sql)
             self.commit_btn.setEnabled(False)
     

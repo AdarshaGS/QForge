@@ -1086,6 +1086,44 @@ class TableViewWidget(QWidget):
         # Reset data loading when filters change
         self.reset_and_load_first_page()
 
+    def filter_by_column_value(self, column: str, value):
+        """Filter the grid down to rows where *column* equals *value* and
+        jump to the first page. Drives the same filter-row UI
+        apply_all_filters() reads (rather than poking self.current_filter
+        directly) so the filter panel reflects what's active and "Clear
+        Filter" keeps working afterward. Used by FK-arrow/"Go to
+        ref_table.column" navigation and the grid's right-click Quick
+        Filter chips."""
+        if column not in self.columns:
+            return
+
+        # Collapse to a single filter row so this replaces, rather than
+        # adds to, whatever filter was already in place.
+        while self.filter_rows_layout.count() > 1:
+            item = self.filter_rows_layout.itemAt(self.filter_rows_layout.count() - 1)
+            if item and item.widget():
+                item.widget().deleteLater()
+                self.filter_rows_layout.removeItem(item)
+        if self.filter_rows_layout.count() == 0:
+            self.add_filter_row()
+
+        row_widget = self.filter_rows_layout.itemAt(0).widget()
+        column_combo = row_widget.findChild(QComboBox, "column_combo") if row_widget else None
+        operator_combo = row_widget.findChild(QComboBox, "operator_combo") if row_widget else None
+        value_input = row_widget.findChild(QLineEdit, "value_input") if row_widget else None
+        if not column_combo or not operator_combo or not value_input:
+            return
+
+        column_combo.setCurrentText(column)
+        operator_combo.setCurrentText("=")
+        value_input.setText(str(value))
+
+        self.filter_visible = True
+        self.filter_container.show()
+        self.filter_toggle_btn.setChecked(True)
+
+        self.apply_all_filters()
+
     def clear_all_filters(self):
         """Clear all filters and reset"""
         self.current_filter = ""

@@ -138,7 +138,7 @@ class QuickSearchDialog(QDialog):
     def __init__(self, all_items, parent=None, column_items=None,
                  recency_scores=None, recent_items=None, sources=None,
                  empty_state_label="Recent", empty_state_limit=15,
-                 broaden_items=None, broaden_column_items=None):
+                 default_source_idx=None):
         super().__init__(parent)
 
         # Add Cmd+W shortcut to close dialog
@@ -150,24 +150,25 @@ class QuickSearchDialog(QDialog):
         # meaningful (and only shown) when a caller searches more than one
         # connection at once. Single-connection callers leave this empty.
         self.sources = sources or []
+        # issue #275: cross-connection search (#243) used to always mix in
+        # every open connection's tables/columns, so a name that exists in
+        # more than one connection (a common case — staging mirrors prod's
+        # schema) showed up once per connection even though only the
+        # active one usually matters. Default to just the connection the
+        # user was already on ("this connection only") — the caller passes
+        # which one via default_source_idx — with an opt-in checkbox
+        # (added in init_ui, only when there's actually more than one
+        # source) to broaden back out to every connection when that's
+        # genuinely what's wanted.
+        self.default_source_idx = default_source_idx
+        self.search_all_connections = (
+            default_source_idx is None or len(sources or []) <= 1
+        )
         self.all_items = self._normalize(all_items)
         # Columns are kept out of the default result set (issue #241) but
         # stay searchable via the explicit "c:" prefix below.
         self.column_items = self._normalize(column_items or [])
 
-        # issue #266: global search defaults to whatever *all_items*/
-        # *column_items* the caller scoped it to (normally just the active
-        # connection). When the caller also has other open connections, it
-        # passes the unscoped superset here and a checkbox lets the user
-        # explicitly broaden the search to all of them — kept off by
-        # default so results from unrelated DBs don't pollute the list.
-        self._scoped_items = self.all_items
-        self._scoped_column_items = self.column_items
-        self._broaden_items = self._normalize(broaden_items) if broaden_items is not None else None
-        self._broaden_column_items = (
-            self._normalize(broaden_column_items) if broaden_column_items is not None else None
-        )
-        self._searching_all = False
         # issue #242: {(item_type, display_text): score}, higher = more
         # recently used — breaks ties within a match tier. Items absent
         # from this dict sort last within their tier (score treated as 0).
@@ -262,13 +263,21 @@ class QuickSearchDialog(QDialog):
         self.search_input.installEventFilter(self)  # Install event filter for arrow keys
         layout.addWidget(self.search_input)
 
-        # issue #266: only offered when the caller actually has other open
-        # connections to broaden into — a single-connection search has
-        # nothing to scope in the first place.
-        if self._broaden_items is not None:
-            other_count = max(len(self.sources) - 1, 0)
-            label = f"Search all connections (+{other_count} more)" if other_count else "Search all connections"
-            self.scope_checkbox = QCheckBox(label)
+        # Scope checkbox (issue #275) — only relevant, and only shown, when
+        # this dialog actually has more than one connection to search and a
+        # caller-chosen default (the active one) to scope down to.
+        self.scope_checkbox = None
+        if self.default_source_idx is not None and len(self.sources) > 1:
+            active_label = (
+                self.sources[self.default_source_idx]
+                if 0 <= self.default_source_idx < len(self.sources) else ""
+            )
+            self.scope_checkbox = QCheckBox(
+                f"Search all {len(self.sources)} connections "
+                f"(unchecked: {active_label} only)"
+            )
+            self.scope_checkbox.setChecked(self.search_all_connections)
+            self.scope_checkbox.setStyleSheet("color: #999; font-size: 12px;")
             self.scope_checkbox.toggled.connect(self._on_scope_toggled)
             layout.addWidget(self.scope_checkbox)
 
@@ -328,6 +337,17 @@ class QuickSearchDialog(QDialog):
                 return True
         return super().eventFilter(obj, event)
 
+    def _on_scope_toggled(self, checked: bool):
+        self.search_all_connections = checked
+        self.filter_items(self.search_input.text())
+
+    def _scoped(self, items):
+        """Restrict *items* to self.default_source_idx unless the "search
+        all connections" checkbox is checked (issue #275)."""
+        if self.search_all_connections or self.default_source_idx is None:
+            return items
+        return [e for e in items if e[3] == self.default_source_idx]
+
     def filter_items(self, search_text):
         """Filter items based on search text"""
         self.results_list.clear()
@@ -338,18 +358,19 @@ class QuickSearchDialog(QDialog):
         # table/view matches by sheer volume.
         if search_text.startswith(self.COLUMN_FILTER_PREFIX):
             search_text = search_text[len(self.COLUMN_FILTER_PREFIX):].strip()
-            source_items = self.column_items
+            source_items = self._scoped(self.column_items)
         else:
-            source_items = self.all_items
+            source_items = self._scoped(self.all_items)
 
         # Nothing typed yet: show the caller's default items (recently-used
         # for Quick Search issue #242, every command for the Command
         # Palette) instead of an empty "type to search" prompt, when the
         # caller supplied any.
         if len(search_text) < 1:
-            if self.recent_items:
+            recent = self._scoped(self.recent_items)
+            if recent:
                 self._render_results(
-                    self.recent_items, self.empty_state_label, limit=self.empty_state_limit)
+                    recent, self.empty_state_label, limit=self.empty_state_limit)
             else:
                 self.count_label.setText("Type to search...")
             return
@@ -376,9 +397,22 @@ class QuickSearchDialog(QDialog):
             elif self.fuzzy_match(search_text, display_lower):
                 fuzzy_matches.append(entry)
 
+        # issue #276: within the starts-with/contains/fuzzy tiers, a longer
+        # (or, for fuzzy, more spread-out) match is a worse match — without
+        # this, "ftask" ranked "archive_f_task" above the obviously-better
+        # "f_task" purely by alphabetical luck, since every match in a tier
+        # was otherwise treated as equally good. Sort by match tightness
+        # first so ties (including "no recency data at all", the common
+        # case for a table never opened before) fall back to something
+        # more useful than insertion order.
+        starts_with_matches.sort(key=lambda e: len(e[1]))
+        contains_matches.sort(key=lambda e: len(e[1]))
+        fuzzy_matches.sort(key=lambda e: self._fuzzy_match_score(search_text, e[1].lower()))
+
         # Within each tier, break ties by recency (issue #242) — the tier
-        # itself (exact > starts-with > contains > fuzzy) still dominates,
-        # this only reorders items that already matched equally well.
+        # itself (exact > starts-with > contains > fuzzy) still dominates;
+        # this (a stable sort) only reorders items that already matched
+        # equally well, on top of the tightness ordering just above.
         tiers = [exact_matches, starts_with_matches, contains_matches, fuzzy_matches]
         if self.recency_scores:
             for tier in tiers:
@@ -386,19 +420,6 @@ class QuickSearchDialog(QDialog):
 
         matching_items = [e for tier in tiers for e in tier]
         self._render_results(matching_items, None)
-
-    def _on_scope_toggled(self, checked):
-        """issue #266: swap the active item set between the default
-        single-connection scope and the full cross-connection superset,
-        then re-run whatever's currently typed against the new scope."""
-        self._searching_all = checked
-        if checked:
-            self.all_items = self._broaden_items
-            self.column_items = self._broaden_column_items or []
-        else:
-            self.all_items = self._scoped_items
-            self.column_items = self._scoped_column_items
-        self.filter_items(self.search_input.text())
 
     def _recency_of(self, entry):
         item_type, display_text, payload, source_idx, extra = entry
@@ -418,7 +439,7 @@ class QuickSearchDialog(QDialog):
             # searching more than one, i.e. the "Search all connections"
             # checkbox is on.
             suffix = ""
-            if self._searching_all and len(self.sources) > 1 and 0 <= source_idx < len(self.sources):
+            if self.search_all_connections and len(self.sources) > 1 and 0 <= source_idx < len(self.sources):
                 suffix = f"  ({self.sources[source_idx]})"
             item = QListWidgetItem(f"{display_text}{suffix}")
             item.setData(Qt.UserRole, (item_type, display_text, payload, source_idx, extra))
@@ -441,11 +462,29 @@ class QuickSearchDialog(QDialog):
     
     def fuzzy_match(self, search, text):
         """Check if search characters appear in order in text"""
+        return self._fuzzy_match_score(search, text) is not None
+
+    def _fuzzy_match_score(self, search, text):
+        """Greedy left-to-right subsequence match of *search* in *text*.
+        Returns a (span, len(text), first_idx) tuple where a smaller value
+        (lexicographic) is a tighter/better match, or None when *search*
+        doesn't match as a subsequence at all — same predicate fuzzy_match
+        already used, just keeping the span/position it found instead of
+        throwing them away, so equally-tiered fuzzy results can be ranked
+        by how good a match they actually are (issue #276)."""
+        if not search:
+            return None
         search_idx = 0
-        for char in text:
+        first_idx = last_idx = None
+        for i, char in enumerate(text):
             if search_idx < len(search) and char == search[search_idx]:
+                if first_idx is None:
+                    first_idx = i
+                last_idx = i
                 search_idx += 1
-        return search_idx == len(search)
+        if search_idx != len(search):
+            return None
+        return (last_idx - first_idx + 1, len(text), first_idx)
     
     def get_icon(self, item_type):
         """Get icon for item type - removed, no icons"""

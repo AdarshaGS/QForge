@@ -35,6 +35,7 @@ from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
 from services.schema_snapshot import fetch_schema_snapshot
 from ui.sql_tab import SqlTab
+from ui.sql_confirm_dialog import confirm_sql
 from ui.table_view_widget import TableViewWidget
 from ui.quick_search_dialog import QuickSearchDialog
 from ui.snippet_manager import SnippetManager
@@ -1735,11 +1736,7 @@ class ConnectionPanel(QWidget):
         sql = f"CREATE DATABASE {name}"
         if not self._guard_write(sql):
             return
-        reply = QMessageBox.question(
-            self, "Create Database",
-            f"Execute the following SQL?\n\n{sql}",
-            QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
+        if not confirm_sql(self, "Create Database", sql):
             return
         def _done(_):
             QMessageBox.information(self, "Success", f"Database '{name}' created.")
@@ -1812,11 +1809,7 @@ class ConnectionPanel(QWidget):
         sql = f"DROP DATABASE {name}"
         if not self._guard_write(sql):
             return
-        reply = QMessageBox.question(
-            self, "Drop Database",
-            f"Execute the following SQL?\n\n{sql}",
-            QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
+        if not confirm_sql(self, "Drop Database", sql):
             return
 
         def _done(_):
@@ -1828,6 +1821,77 @@ class ConnectionPanel(QWidget):
 
         # Issue #237: DDL runs on a dedicated background connection.
         self._run_bg_db(lambda db: db.execute_update(sql), _done, _error)
+
+    def clone_database(self):
+        if not self._check_db_management_supported():
+            return
+        if self._available_dbs:
+            self._show_clone_database_picker()
+        else:
+            self._load_databases(
+                on_done=lambda ok: self._show_clone_database_picker() if ok else None)
+
+    def _show_clone_database_picker(self):
+        if not self._available_dbs:
+            QMessageBox.information(self, "Clone Database", "No databases found.")
+            return
+
+        current_db = self.config.get("database")
+        dbs = list(self._available_dbs)
+        start_idx = dbs.index(current_db) if current_db in dbs else 0
+        source, ok = QInputDialog.getItem(
+            self, "Clone Database", "Database to clone:",
+            dbs, start_idx, editable=False)
+        if not ok or not source:
+            return
+        if not self._VALID_DB_NAME.match(source):
+            QMessageBox.warning(self, "Invalid Name", "Unrecognized database name.")
+            return
+
+        new_name, ok = QInputDialog.getText(
+            self, "Clone Database", "New database name:", text=f"{source}_copy")
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        if not self._VALID_DB_NAME.match(new_name):
+            QMessageBox.warning(
+                self, "Invalid Name",
+                "Database name must start with a letter or underscore and "
+                "contain only letters, digits, and underscores.")
+            return
+        if new_name in self._available_dbs:
+            QMessageBox.warning(self, "Clone Database", f"'{new_name}' already exists.")
+            return
+
+        sql = f"CREATE DATABASE {new_name}"
+        if not self._guard_write(sql):
+            return
+        warning = (
+            f"This copies every table's structure and data from '{source}' into "
+            f"the new database '{new_name}'. Depending on its size, this can "
+            "take a while."
+        )
+        if not confirm_sql(self, "Clone Database", sql, extra_text=warning):
+            return
+
+        # Issue #274: Postgres needs the connection off the template database
+        # entirely (CREATE DATABASE ... WITH TEMPLATE requires exclusive
+        # access to it) — 'postgres' is the standard always-present
+        # maintenance database. MySQL has no such restriction; the dedicated
+        # connection's own database doesn't matter since clone_database()
+        # always uses fully-qualified db.table names.
+        cfg = dict(self.config)
+        if self.db_service.db_type == "postgresql":
+            cfg["database"] = "postgres"
+
+        def _done(_):
+            QMessageBox.information(self, "Success", f"'{source}' cloned to '{new_name}'.")
+            self._load_databases()
+
+        def _error(msg):
+            QMessageBox.critical(self, "Clone Database Failed", msg)
+
+        self._run_bg_db(lambda db: db.clone_database(source, new_name), _done, _error, config=cfg)
 
     # ─── Schema tree interaction ──────────────────────────────────────────────
 
@@ -2922,11 +2986,7 @@ class ConnectionPanel(QWidget):
         sql = dialog.get_sql()
         if not self._guard_write(sql):
             return
-        reply = QMessageBox.question(
-            self, "Create Table",
-            f"Execute the following SQL?\n\n{sql}",
-            QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
+        if not confirm_sql(self, "Create Table", sql):
             return
 
         def _done(_):
@@ -3038,11 +3098,7 @@ class ConnectionPanel(QWidget):
                 if texts:
                     impact = "\n\n".join(texts) + "\n\n"
 
-            reply = QMessageBox.question(
-                self, "Alter Table",
-                f"{impact}Execute the following SQL?\n\n{sql}",
-                QMessageBox.Yes | QMessageBox.No)
-            if reply != QMessageBox.Yes:
+            if not confirm_sql(self, "Alter Table", sql, extra_text=impact):
                 return
 
             def _run(db):
@@ -3230,11 +3286,8 @@ class ConnectionPanel(QWidget):
 
         if not self._guard_write(sql):
             return
-        reply = QMessageBox.question(
-            self, "Insert Mock Data",
-            f"Execute the following SQL?\n\n{sql[:2000]}" + ("\n…" if len(sql) > 2000 else ""),
-            QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
+        preview = sql[:20000] + ("\n…" if len(sql) > 20000 else "")
+        if not confirm_sql(self, "Insert Mock Data", preview):
             return
 
         generated_pk_columns = dialog.generated_pk_columns()
@@ -3803,11 +3856,7 @@ class ConnectionPanel(QWidget):
         sql = f"CREATE TABLE {quoted_new} AS SELECT * FROM {table_name}"  # nosec B608
         if not self._guard_write(sql):
             return
-        reply = QMessageBox.question(
-            self, "Clone Table",
-            f"Execute the following SQL?\n\n{sql}",
-            QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
+        if not confirm_sql(self, "Clone Table", sql):
             return
 
         def _done(_):
@@ -3827,12 +3876,8 @@ class ConnectionPanel(QWidget):
         sql = f"TRUNCATE TABLE {quoted}"  # nosec B608
         if not self._guard_write(sql):
             return
-        reply = QMessageBox.question(
-            self, "Truncate Table",
-            f"This permanently deletes ALL rows in '{table_name}'. This cannot be undone.\n\n"
-            f"Execute the following SQL?\n\n{sql}",
-            QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
+        warning = f"This permanently deletes ALL rows in '{table_name}'. This cannot be undone."
+        if not confirm_sql(self, "Truncate Table", sql, extra_text=warning):
             return
 
         def _done(_):
@@ -3864,12 +3909,8 @@ class ConnectionPanel(QWidget):
             if text:
                 impact = text + "\n\n"
 
-        reply = QMessageBox.question(
-            self, f"Delete {kind.title()}",
-            f"{impact}This permanently drops '{table_name}' and all its data. This cannot be undone.\n\n"
-            f"Execute the following SQL?\n\n{sql}",
-            QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
+        warning = f"{impact}This permanently drops '{table_name}' and all its data. This cannot be undone."
+        if not confirm_sql(self, f"Delete {kind.title()}", sql, extra_text=warning):
             return
 
         def _done(_):
@@ -3900,18 +3941,15 @@ class ConnectionPanel(QWidget):
 
     def _gather_quick_search_items(self):
         """Build the default (item_type, display_text, payload) list for the
-        command palette: schema items, recent query history, and SQL
-        snippets. Rebuilt on every open since history/snippets change
-        independently of schema reloads. Columns are deliberately excluded
-        (issue #241): they used to dominate this list by sheer volume,
-        diluting table/view search — see _gather_column_items() for the
-        explicit "c:"-prefixed column search instead."""
+        command palette: schema items and SQL snippets. Rebuilt on every
+        open since snippets change independently of schema reloads. Columns
+        are deliberately excluded (issue #241): they used to dominate this
+        list by sheer volume, diluting table/view search — see
+        _gather_column_items() for the explicit "c:"-prefixed column search
+        instead. Query history was dropped from here too (issue #277) —
+        it's still browsable via the dedicated history sidebar/dialog
+        (show_query_history()), just not mixed into every schema search."""
         items = [(item_type, name, None) for item_type, name in self.all_schema_items]
-
-        for entry in self.query_history.get_recent_queries(limit=100):
-            query = entry.get("query", "").strip()
-            if query:
-                items.append(("history", query.replace("\n", " ")[:80], query))
 
         for trigger, data in SnippetManager().get_all().items():
             label = f"{trigger} — {data.get('name', trigger)}"
@@ -3929,21 +3967,12 @@ class ConnectionPanel(QWidget):
 
     def _gather_recency_scores(self):
         """{(item_type, display_text): score} for Quick Search tie-breaking
-        (issue #242) — higher score means more recently used. Table/view
-        opens use the monotonic counter from _record_recent_table_open();
-        history entries use their position in the already-newest-first
-        history list, since that ordering *is* their recency."""
+        (issue #242) — higher score means more recently used, from the
+        monotonic counter _record_recent_table_open() keeps per table/view."""
         scores = {}
         for name, counter in self._recent_table_opens.items():
             item_type = "view" if name in self.all_views else "table"
             scores[(item_type, name)] = counter
-
-        recent_queries = self.query_history.get_recent_queries(limit=100)
-        for idx, entry in enumerate(recent_queries):
-            query = entry.get("query", "").strip()
-            if query:
-                display_text = query.replace("\n", " ")[:80]
-                scores[("history", display_text)] = len(recent_queries) - idx
         return scores
 
     def _gather_recent_items(self, limit=8):
@@ -3996,10 +4025,6 @@ class ConnectionPanel(QWidget):
     def _on_quick_search(self, item_type, display_text, payload):
         if item_type in ("table", "view"):
             self.open_table_view(display_text)
-        elif item_type == "history":
-            tab = self._active_sql_tab()
-            if tab:
-                tab.set_query(payload)
         else:  # function, column, snippet — insert at cursor
             tab = self._active_sql_tab()
             if tab:

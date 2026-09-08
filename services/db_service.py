@@ -987,6 +987,63 @@ class DbService:
         cols = [self._q(c["Field"]) for c in self.get_columns(table_name) if c["Field"] not in generated]
         return ", ".join(cols) if cols else "*"
 
+    def _decode_mysql_bit_columns(self, cursor, rows):
+        """MySQL BIT(n) columns — the standard way to store a boolean flag
+        in a lot of schemas (`enabled BIT(1)`, etc.) — come back from
+        pymysql as raw *bytes* (b'\\x00'/b'\\x01' for BIT(1)), since pymysql
+        has no built-in converter for FIELD_TYPE.BIT. Left alone, that
+        bytes value later gets displayed and exported the same way a
+        genuine BLOB column is: as a hex string ("00"/"01" instead of a
+        plain "0"/"1", issue #278) — converts each BIT column's value in
+        every row, in place, to the plain Python int MySQL itself reports
+        when you CAST(... AS UNSIGNED) a BIT value."""
+        bit_cols = [d[0] for d in cursor.description if d[1] == pymysql.FIELD_TYPE.BIT]
+        if not bit_cols:
+            return rows
+        for row in rows:
+            for col in bit_cols:
+                value = row.get(col)
+                if isinstance(value, (bytes, bytearray)):
+                    row[col] = int.from_bytes(value, byteorder="big")
+        return rows
+
+    # TINYINT/SMALLINT/MEDIUMINT/INT/BIGINT, plus BIT (already decoded to a
+    # plain int above by the time this runs) — every MySQL column type that
+    # comes back from pymysql as a Python int rather than Decimal/float.
+    _MYSQL_INT_FIELD_TYPES = frozenset({
+        pymysql.FIELD_TYPE.TINY, pymysql.FIELD_TYPE.SHORT, pymysql.FIELD_TYPE.INT24,
+        pymysql.FIELD_TYPE.LONG, pymysql.FIELD_TYPE.LONGLONG, pymysql.FIELD_TYPE.BIT,
+    })
+
+    def _use_nullable_int_dtype(self, description, df):
+        """A MySQL integer column that has even one NULL value forces
+        pandas to promote the *whole* column to float64 when building a
+        DataFrame from row dicts — plain Python int has no NaN
+        representation, so pandas falls back to float, and NULL becomes
+        NaN. Every other value in that column then displays with a
+        spurious ".0" (issue #279) even though nothing about the column is
+        actually decimal — e.g. a nullable BIGINT foreign key showing
+        "1.0"/"2.0" instead of "1"/"2" the moment any row in the page has
+        it NULL. Casting those columns to pandas' nullable Int64 dtype
+        instead keeps NULL as pd.NA (already handled identically to NaN by
+        every isna()/isna()-style check elsewhere) without the float
+        fallback. DECIMAL/FLOAT/DOUBLE columns are a different FIELD_TYPE
+        (and pymysql already returns them as Decimal/float, not int) so
+        they're untouched — genuinely decimal data keeps showing as
+        decimal."""
+        int_cols = [d[0] for d in description if d[1] in self._MYSQL_INT_FIELD_TYPES]
+        for col in int_cols:
+            if col not in df.columns:
+                continue
+            try:
+                df[col] = df[col].astype("Int64")
+            except (TypeError, ValueError, OverflowError):
+                # A value didn't actually fit (shouldn't happen for a
+                # column MySQL itself declared integer) — leave as pandas
+                # inferred it rather than lose the data.
+                pass
+        return df
+
     def _fetch_rows(self, cursor, max_rows):
         """fetchall(), or fetchmany(max_rows) with one extra row peeked to
         detect truncation without pulling the whole result set first."""
@@ -1019,6 +1076,8 @@ class DbService:
                 rows = cursor.fetchmany(chunk_size)
                 if not rows:
                     break
+                if self.db_type == "mysql":
+                    rows = self._decode_mysql_bit_columns(cursor, rows)
                 yield columns, [tuple(r.values()) if isinstance(r, dict) else tuple(r) for r in rows]
         finally:
             cursor.close()
@@ -1033,9 +1092,12 @@ class DbService:
             cursor.execute(query)
             if cursor.description:
                 cols = [d[0] for d in cursor.description]
+                description = cursor.description
                 rows, truncated = self._fetch_rows(cursor, max_rows)
+                rows = self._decode_mysql_bit_columns(cursor, rows)
                 cursor.close()
                 df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+                df = self._use_nullable_int_dtype(description, df)
                 df.attrs["truncated"] = truncated
                 return df
             else:
@@ -1110,6 +1172,44 @@ class DbService:
                 self.clear_metadata_cache()
         except Exception as ex:
             logger.debug(f"Schema-cache invalidation check failed: {ex}")
+
+    def clone_database(self, source_db: str, new_db: str):
+        """Create *new_db* as a full copy (structure + data) of *source_db*.
+
+        PostgreSQL: `CREATE DATABASE ... WITH TEMPLATE` copies everything —
+        tables, indexes, constraints, sequences — in one statement. Postgres
+        requires exclusive access to the template while this runs, so this
+        connection must not itself be attached to *source_db*; callers
+        should connect to a different database (e.g. 'postgres') before
+        calling this.
+
+        MySQL has no single-statement equivalent, so this creates the
+        schema and then loops `CREATE TABLE ... LIKE` (preserves indexes/
+        keys, unlike the plain CTAS single-table clone uses) followed by
+        `INSERT INTO ... SELECT *` for every table in *source_db*. A
+        cross-table foreign key is copied as-is, so it still points at
+        *source_db*'s table of the same name rather than *new_db*'s — full
+        referential rewrite is out of scope here, same as MySQL's own
+        `CREATE TABLE ... LIKE` behavior.
+        """
+        qsrc, qnew = self._q(source_db), self._q(new_db)
+        if self.db_type == "postgresql":
+            self.execute_update(f"CREATE DATABASE {qnew} WITH TEMPLATE {qsrc}")
+        elif self.db_type == "mysql":
+            self.execute_update(f"CREATE DATABASE {qnew}")
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s",
+                (source_db,)
+            )
+            tables = [list(row.values())[0] for row in cursor.fetchall()]
+            cursor.close()
+            for table in tables:
+                qt = self._q(table)
+                self.execute_update(f"CREATE TABLE {qnew}.{qt} LIKE {qsrc}.{qt}")
+                self.execute_update(f"INSERT INTO {qnew}.{qt} SELECT * FROM {qsrc}.{qt}")  # nosec B608
+        else:
+            raise Exception(f"Clone database is not supported for {self.db_type}")
 
     def _execute_update_raw(self, query):
         """Internal: run DML without reconnect logic. The explicit commit()
