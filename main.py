@@ -940,6 +940,11 @@ class MainWindow(QMainWindow):
             lambda: self._current_panel() and self._current_panel().open_erd_view()
         )
 
+        act = db_menu.addAction("Visual Query Builder…")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().open_query_builder()
+        )
+
         self.schema_compare_action = db_menu.addAction("Compare Schemas…")
         self.schema_compare_action.triggered.connect(
             lambda: self._current_panel() and self._current_panel().open_schema_compare()

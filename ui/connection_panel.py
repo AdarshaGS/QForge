@@ -46,6 +46,7 @@ from ui.export_scope_dialog import ExportScopeDialog
 from ui.column_selection_dialog import ColumnSelectionDialog
 from ui.theme_manager import ThemeManager
 from ui.erd_dialog import ErdDialog
+from ui.query_builder_dialog import QueryBuilderDialog
 from ui.schema_compare_dialog import SchemaCompareDialog
 from ui.data_compare_dialog import DataCompareDialog
 from ui.mock_data_dialog import MockDataDialog
@@ -2027,6 +2028,20 @@ class ConnectionPanel(QWidget):
         dlg.view_structure.connect(self._show_table_structure)
         # Non-modal: it's a read-only viewer, so it shouldn't block the SQL
         # editor/rest of the app the way exec_() (app-modal) would.
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def open_query_builder(self):
+        """Open the Visual Query Builder canvas (VQB.2, issue #192). Builds
+        its own dedicated connection (services/erd_model.py), same as
+        open_erd_view — never touches self.db_service. Entitlements gating
+        lands in VQB.6 (issue #196); unrestricted for now."""
+        if not self.db_service or not self.db_service.connection:
+            QMessageBox.information(self, "Visual Query Builder", "Connect to a database first.")
+            return
+        dlg = QueryBuilderDialog(dict(self.config), is_dark=(self.current_theme == "dark"), parent=self)
         dlg.setAttribute(Qt.WA_DeleteOnClose)
         dlg.show()
         dlg.raise_()
