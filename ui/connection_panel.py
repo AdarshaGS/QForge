@@ -510,6 +510,11 @@ class ConnectionPanel(QWidget):
     close_requested = Signal(object)    # emits self
     # Emitted when the connection label changes.
     label_changed = Signal(object, str) # emits (self, new_label)
+    # Issue #281: picking a database from the Cmd+K switcher asks
+    # MainWindow to open it as its own connection tab, rather than
+    # switching this panel's database in place — emits a full config dict
+    # (a copy of self.config with database already overridden).
+    open_database_in_new_tab = Signal(dict)
 
     # ── Bridge signals used by _run_query_in_tab ──────────────────────────
     # These live on a QWidget (main thread), so QueuedConnection guarantees
@@ -556,12 +561,6 @@ class ConnectionPanel(QWidget):
     _csv_import_progress    = Signal(int)        # rows completed so far
     _csv_import_write_done  = Signal(int, int)   # (inserted, errors)
     _csv_import_write_error = Signal(str)
-    # Bridge signal for _switch_database()'s non-MySQL (real reconnect)
-    # path (issue #237) — same self._connecting guard as
-    # _connect_in_background(), since this touches self.db_service itself
-    # rather than a dedicated connection (switching *is* changing what
-    # self.db_service points to).
-    _db_switch_done = Signal(str, str, float)   # (new_db, error, switch_t0)
 
     def __init__(self, config: dict, db_service: DbService,
                  query_history: QueryHistory, saved_queries: SavedQueries = None,
@@ -648,7 +647,6 @@ class ConnectionPanel(QWidget):
         self._csv_import_progress.connect(self._on_csv_import_progress, Qt.QueuedConnection)
         self._csv_import_write_done.connect(self._on_csv_import_write_done, Qt.QueuedConnection)
         self._csv_import_write_error.connect(self._on_csv_import_write_error, Qt.QueuedConnection)
-        self._db_switch_done.connect(self._on_db_switch_done, Qt.QueuedConnection)
         self.health_changed.connect(self._update_tab_status_bars, Qt.QueuedConnection)
         self._column_cache: dict = {}   # {table: [col, ...]} for autocomplete
         self._column_details_cache: dict = {}   # {table: [{name,type,nullable,default,key}, ...]}
@@ -686,7 +684,7 @@ class ConnectionPanel(QWidget):
 
         # Database pill button (replaces QComboBox)
         self.db_pill = QPushButton()
-        self.db_pill.setToolTip("Switch database (Cmd+K)")
+        self.db_pill.setToolTip("Open a database in a new tab (Cmd+K)")
         self.db_pill.clicked.connect(self.show_db_switcher)
         left_layout.addWidget(self.db_pill)
 
@@ -1276,7 +1274,7 @@ class ConnectionPanel(QWidget):
         cached schema, so run the real db_service.connect() off the main
         thread instead of blocking behind a modal dialog. Only this thread
         touches self.db_service until _on_background_connect_done fires —
-        _switch_database/_do_reconnect refuse to run concurrently with it
+        _do_reconnect refuses to run concurrently with it
         (self._connecting guard)."""
         conf = dict(self.config)
         sig_done = self._bg_connect_done
@@ -1574,9 +1572,10 @@ class ConnectionPanel(QWidget):
         from PySide6.QtWidgets import QApplication as _QApp
         _QApp.processEvents()
 
-        # Unlike _switch_database, this never needs a reconnect — Postgres
-        # schemas live inside one already-open database connection, so
-        # just repointing search_path is enough (see DbService.set_schema).
+        # Unlike opening a different database, this never needs a reconnect
+        # (or a new tab) — Postgres schemas live inside one already-open
+        # database connection, so just repointing search_path is enough
+        # (see DbService.set_schema).
         if self.db_service.connection:
             try:
                 self.db_service.set_schema(new_schema)
@@ -1589,7 +1588,7 @@ class ConnectionPanel(QWidget):
         self._spawn_schema_fetch(dict(self.config))
 
     def show_db_switcher(self):
-        """Open the Cmd+K database switcher dialog."""
+        """Open the Cmd+K database switcher popup."""
         if not self._available_dbs:
             return
         current_db = self.config.get("database", "")
@@ -1597,7 +1596,7 @@ class ConnectionPanel(QWidget):
         # Center below the pill button
         dialog.move(self.db_pill.mapToGlobal(
             self.db_pill.rect().bottomLeft()))
-        dialog.db_selected.connect(self._switch_database)
+        dialog.db_selected.connect(self._open_selected_database)
         # Issue #234: Qt.Popup (set in DbSwitcherDialog itself, for real
         # click-outside-to-close) is shown via .show(), not .exec() — an
         # app-modal .exec() loop blocks the very outside clicks this popup
@@ -1607,104 +1606,25 @@ class ConnectionPanel(QWidget):
         self._db_switcher_dialog = dialog
         dialog.show()
 
-    def _switch_database(self, new_db: str):
+    def _open_selected_database(self, new_db: str):
+        """Picking a database from the switcher opens it as its own
+        connection tab (issue #281) instead of switching this tab's
+        database in place. TableViewWidget hands each tab the *same*
+        self.config dict object it was constructed with — mutating
+        self.config["database"] in place used to silently repoint every
+        already-open tab (any that hadn't yet opened its own dedicated
+        connection) at the new database with no indication. Every open
+        table tab now stays unambiguously scoped to the connection+
+        database it was actually opened under; MainWindow re-focuses an
+        already-open tab for the same connection+database instead of
+        duplicating it (see MainWindow._open_database_in_new_tab)."""
         if new_db == self.config.get("database", ""):
             return
-        if self._connecting:
-            QMessageBox.information(
-                self, "Connecting…",
-                "Still connecting to the database — try switching in a moment.")
-            return
-
-        # Issue #267: same progress bar/ticker used for the initial schema
-        # load, not just a static tree row — and disable the existing
-        # tabs/results while the switch is in flight so nothing looks (or
-        # is) interactive against a connection that's mid-switch.
-        self._clear_schema_state()
-        self._start_schema_loading_indicator(label="Switching database")
-        self.tabs.setEnabled(False)
-        from PySide6.QtWidgets import QApplication as _QApp
-        _QApp.processEvents()
-
-        # MySQL can point the existing connection at the new database with a
-        # single lightweight command (COM_INIT_DB) — no new TCP handshake,
-        # auth round-trip, or (potentially tunnelled) SSH setup. Previously
-        # every switch paid the full disconnect+reconnect cost, which is
-        # where the multi-second freeze reported in issue #23 actually came
-        # from — left synchronous here by design.
-        if self.db_service.db_type == "mysql" and self.db_service.connection:
-            _switch_t0 = time.perf_counter()
-            try:
-                self.db_service.select_db(new_db)
-            except Exception as ex:
-                self.tabs.setEnabled(True)
-                self._on_schema_error(str(ex))
-                return
-            perf_metrics.record("database", "db_switch", (time.perf_counter() - _switch_t0) * 1000)
-            self._commit_database_switch(new_db)
-            return
-
-        # Postgres connections are bound to one database for their
-        # lifetime, so switching needs a real disconnect+reconnect — issue
-        # #237: that now runs on a background thread, guarded by
-        # self._connecting exactly the way _connect_in_background() is
-        # (nothing else touches self.db_service until _on_db_switch_done
-        # fires). The (potentially slower) schema listing always runs on a
-        # background thread over its OWN dedicated connection
-        # (services/schema_snapshot.py) either way.
-        self._connecting = True
-        self._update_pill_label()
-        # Schemas are per-database — a schema pinned in the old database
-        # may not exist in new_db, so don't carry it over (SET search_path
-        # to a nonexistent schema silently resolves nothing rather than
-        # erroring, which would look identical to "no tables" here).
         new_config = dict(self.config, database=new_db)
+        # Schemas are per-database — a schema pinned in the old database
+        # may not exist in new_db (same reasoning as _switch_schema).
         new_config.pop("schema", None)
-        switch_t0 = time.perf_counter()
-        sig_done = self._db_switch_done
-
-        def _worker():
-            try:
-                self.db_service.disconnect()
-                self.db_service.connect(new_config)
-            except Exception as ex:
-                sig_done.emit(new_db, str(ex), switch_t0)
-            else:
-                sig_done.emit(new_db, "", switch_t0)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_db_switch_done(self, new_db: str, error: str, switch_t0: float):
-        self._connecting = False
-        if error:
-            self.tabs.setEnabled(True)
-            self._update_pill_label()
-            self._on_schema_error(error)
-            return
-        perf_metrics.record("database", "db_switch", (time.perf_counter() - switch_t0) * 1000)
-        self.config.pop("schema", None)
-        self._commit_database_switch(new_db)
-
-    def _commit_database_switch(self, new_db: str):
-        # Only commit the switch to tracked state/the pill once the
-        # connection has actually confirmed it. Setting these eagerly
-        # meant a failed switch left the UI and self.config claiming
-        # new_db while the live connection was still silently on the old
-        # database — every query in this tab would then run against the
-        # wrong database with no indication.
-        self.config["database"] = new_db
-        # Issue #267: the connection itself has now confirmed the switch —
-        # re-enable tabs/results. The schema tree still shows the loading
-        # indicator (started in _switch_database) until the fetch below
-        # completes or a cache hit repaints it.
-        self.tabs.setEnabled(True)
-        self._update_pill_label()
-
-        # Issue #71: populate instantly from disk if this database was
-        # visited before; the background fetch below still refreshes it.
-        self._apply_cached_schema(schema_cache.load(self.config.get("id", ""), new_db))
-
-        self._spawn_schema_fetch(dict(self.config))
+        self.open_database_in_new_tab.emit(new_config)
 
     # ─── Database management (create/refresh/drop) ────────────────────────────
 
@@ -4647,12 +4567,19 @@ class ConnectionPanel(QWidget):
     @property
     def label(self) -> str:
         base = self.config.get("name", "Connection")
+        # Issue #281: a database opened via the Cmd+K switcher is its own
+        # connection tab now rather than swapping in place, so two tabs for
+        # the same server (e.g. "Local CIM LOCAL") can be open side by side
+        # differing only in database — without this they'd be identical
+        # and just as impossible to tell apart as before.
+        db = self.config.get("database", "")
+        db_suffix = f"  ·  {db}" if db else ""
         ver = getattr(self, '_server_version', '')
         env = environment.normalize(self.config.get("environment"))
         env_suffix = f"  {environment.BADGE_LABELS[env]}" if env != environment.UNCLASSIFIED else ""
         read_only_suffix = "  🔒 READ-ONLY" if self.config.get("read_only") else ""
         ver_suffix = f"  [{ver}]" if ver else ""
-        return f"{base}{env_suffix}{read_only_suffix}{ver_suffix}"
+        return f"{base}{db_suffix}{env_suffix}{read_only_suffix}{ver_suffix}"
 
     def _reload_errored_table_tabs(self):
         """Retry every open TableViewWidget currently stuck on a connection

@@ -474,6 +474,7 @@ class MainWindow(QMainWindow):
         )
         panel.reconnected.connect(self._show_reconnect_toast)
         panel.label_changed.connect(self._on_panel_label_changed)
+        panel.open_database_in_new_tab.connect(self._open_database_in_new_tab)
         # Set initial green dot immediately
         self._on_health_changed(panel, 'idle')
 
@@ -566,97 +567,123 @@ class MainWindow(QMainWindow):
             if not config:
                 continue
 
-            # A previously-visited remote/SSH connection with a warm schema
-            # cache: skip the blocking "Connecting…" modal entirely and open
-            # the panel straight away showing cached schema/autocomplete —
-            # db_service.connect() (TCP + auth + SSH tunnel, the actual
-            # source of the lag) runs on a background thread inside the
-            # panel itself instead (ConnectionPanel._connect_in_background).
-            # Local MySQL/Postgres connect fast enough that this
-            # wouldn't be felt, so they keep the simpler blocking path.
-            optimistic = (
-                _is_remote_connection(config)
-                and schema_cache.load(config.get("id", ""), config.get("database", "")) is not None
-            )
-
-            try:
-                db_service = DbService()
-
-                if optimistic:
-                    panel = ConnectionPanel(
-                        config=config,
-                        db_service=db_service,
-                        query_history=self.query_history,
-                        saved_queries=self.saved_queries,
-                        parent=self,
-                        already_connected=False,
-                    )
-                else:
-                    from PySide6.QtCore import QCoreApplication
-                    progress = QProgressDialog("Connecting…", None, 0, 0, self)
-                    progress.setWindowTitle("Connecting")
-                    progress.setWindowModality(Qt.WindowModal)
-                    progress.setCancelButton(None)
-                    progress.setMinimumDuration(0)
-                    progress.show()
-                    QCoreApplication.processEvents()
-
-                    db_service.connect(config)
-
-                    progress.setLabelText("Loading schema…")
-                    QCoreApplication.processEvents()
-
-                    panel = ConnectionPanel(
-                        config=config,
-                        db_service=db_service,
-                        query_history=self.query_history,
-                        saved_queries=self.saved_queries,
-                        parent=self,
-                    )
-                    progress.close()
-
-                panel.update_theme(self.current_theme == "dark")
-                # Server version arrives asynchronously via the schema-load
-                # result (panel.label_changed) rather than being fetched here —
-                # fetching it on this thread would race the schema-loading
-                # background thread over the same shared connection.
-
-                # ConnectionDialog just closed via dialog.exec() — on macOS
-                # that leaves no window "active" at the OS level (verified:
-                # QApplication.focusWidget() is None afterward and stays
-                # None), so the editor.setFocus() inside ensure_at_least_
-                # one_tab()/add_new_tab() below is a no-op until something
-                # reclaims window activation explicitly.
-                self.activateWindow()
-                self.raise_()
-                # Realize this panel's first tab BEFORE _add_panel below
-                # ever makes it part of the visible window (i.e. while
-                # `panel` is still just an unshown QWidget parented to
-                # `self`, not yet a page of `self.stack`). Opening a new
-                # connection can happen at any point in the app's life,
-                # including while the main window is already in native
-                # full screen — unlike every other panel's first tab,
-                # which is always realized at startup/session-restore,
-                # before full screen is reachable at all (see
-                # ConnectionPanel.ensure_at_least_one_tab). Populating the
-                # tab while off-screen means _add_panel reveals an
-                # already-fully-populated panel in one shot, instead of
-                # showing an empty panel and then adding brand-new native
-                # tab content to it live — the latter is what slides an
-                # already-full-screen window out to reveal another Space
-                # (issue #25).
-                self._log_win_state("_prompt_new_connection: before ensure_at_least_one_tab")
-                panel.ensure_at_least_one_tab()
-                self._log_win_state("_prompt_new_connection: after ensure_at_least_one_tab")
-                self._add_panel(panel)
-                self._log_win_state("_prompt_new_connection: after _add_panel")
+            if self._connect_and_add_panel(config):
                 return
 
-            except Exception as ex:
-                logger.error(f"Connection failed: {ex}")
-                if 'progress' in dir():
-                    progress.close()
-                QMessageBox.critical(self, "Connection Error", str(ex))
+    def _connect_and_add_panel(self, config: dict) -> bool:
+        """Connect *config* and add it as a new top-level connection tab.
+        Shared by the "Add Connection" flow above (once a config is picked)
+        and opening a different database as its own tab (issue #281,
+        _open_database_in_new_tab below) — same optimistic-cache-vs-
+        blocking-connect behavior either way. Returns whether it succeeded;
+        _prompt_new_connection's caller loops back to re-prompt on failure,
+        _open_database_in_new_tab's just reports the error."""
+        # A previously-visited remote/SSH connection with a warm schema
+        # cache: skip the blocking "Connecting…" modal entirely and open
+        # the panel straight away showing cached schema/autocomplete —
+        # db_service.connect() (TCP + auth + SSH tunnel, the actual
+        # source of the lag) runs on a background thread inside the
+        # panel itself instead (ConnectionPanel._connect_in_background).
+        # Local MySQL/Postgres connect fast enough that this
+        # wouldn't be felt, so they keep the simpler blocking path.
+        optimistic = (
+            _is_remote_connection(config)
+            and schema_cache.load(config.get("id", ""), config.get("database", "")) is not None
+        )
+        progress = None
+        try:
+            db_service = DbService()
+
+            if optimistic:
+                panel = ConnectionPanel(
+                    config=config,
+                    db_service=db_service,
+                    query_history=self.query_history,
+                    saved_queries=self.saved_queries,
+                    parent=self,
+                    already_connected=False,
+                )
+            else:
+                from PySide6.QtCore import QCoreApplication
+                progress = QProgressDialog("Connecting…", None, 0, 0, self)
+                progress.setWindowTitle("Connecting")
+                progress.setWindowModality(Qt.WindowModal)
+                progress.setCancelButton(None)
+                progress.setMinimumDuration(0)
+                progress.show()
+                QCoreApplication.processEvents()
+
+                db_service.connect(config)
+
+                progress.setLabelText("Loading schema…")
+                QCoreApplication.processEvents()
+
+                panel = ConnectionPanel(
+                    config=config,
+                    db_service=db_service,
+                    query_history=self.query_history,
+                    saved_queries=self.saved_queries,
+                    parent=self,
+                )
+                progress.close()
+
+            panel.update_theme(self.current_theme == "dark")
+            # Server version arrives asynchronously via the schema-load
+            # result (panel.label_changed) rather than being fetched here —
+            # fetching it on this thread would race the schema-loading
+            # background thread over the same shared connection.
+
+            # A just-closed modal (ConnectionDialog, or this method's own
+            # progress dialog) leaves no window "active" at the OS level on
+            # macOS (verified: QApplication.focusWidget() is None afterward
+            # and stays None), so the editor.setFocus() inside ensure_at_least_
+            # one_tab()/add_new_tab() below is a no-op until something
+            # reclaims window activation explicitly.
+            self.activateWindow()
+            self.raise_()
+            # Realize this panel's first tab BEFORE _add_panel below
+            # ever makes it part of the visible window (i.e. while
+            # `panel` is still just an unshown QWidget parented to
+            # `self`, not yet a page of `self.stack`). Opening a new
+            # connection can happen at any point in the app's life,
+            # including while the main window is already in native
+            # full screen — unlike every other panel's first tab,
+            # which is always realized at startup/session-restore,
+            # before full screen is reachable at all (see
+            # ConnectionPanel.ensure_at_least_one_tab). Populating the
+            # tab while off-screen means _add_panel reveals an
+            # already-fully-populated panel in one shot, instead of
+            # showing an empty panel and then adding brand-new native
+            # tab content to it live — the latter is what slides an
+            # already-full-screen window out to reveal another Space
+            # (issue #25).
+            self._log_win_state("_connect_and_add_panel: before ensure_at_least_one_tab")
+            panel.ensure_at_least_one_tab()
+            self._log_win_state("_connect_and_add_panel: after ensure_at_least_one_tab")
+            self._add_panel(panel)
+            self._log_win_state("_connect_and_add_panel: after _add_panel")
+            return True
+
+        except Exception as ex:
+            logger.error(f"Connection failed: {ex}")
+            if progress is not None:
+                progress.close()
+            QMessageBox.critical(self, "Connection Error", str(ex))
+            return False
+
+    def _open_database_in_new_tab(self, new_config: dict):
+        """A ConnectionPanel's Cmd+K database switcher asked to open
+        *new_config*'s database as its own connection tab (issue #281)
+        rather than switching in place — refocus an already-open tab for
+        the same connection+database instead of duplicating it, matching
+        ConnectionPanel.open_table_view's identical re-focus-don't-
+        duplicate convention for table tabs."""
+        for i, panel in enumerate(self._panels):
+            if (panel.config.get("id") == new_config.get("id")
+                    and panel.config.get("database") == new_config.get("database")):
+                self.conn_tab_bar.setCurrentIndex(i)
+                return
+        self._connect_and_add_panel(new_config)
 
     # ─── Close connection tab ────────────────────────────────────────────────
 

@@ -12,6 +12,7 @@ sequence stays in place — it can't re-verify the underlying OS behavior.
 """
 import os
 import time
+import types
 
 import pytest
 
@@ -79,6 +80,11 @@ class _MainWindowStub(QWidget):
         self.activate_calls = 0
         self.raise_calls = 0
         self._dialog_wait_ms = 0.0  # normally set in MainWindow.__init__ (issue #173)
+        # issue #281: _prompt_new_connection() now delegates the actual
+        # connect+add-panel work to this real MainWindow method (shared
+        # with opening a database as a new tab), so the stub needs it too.
+        self._connect_and_add_panel = types.MethodType(
+            main_mod.MainWindow._connect_and_add_panel, self)
 
     def activateWindow(self):
         self.activate_calls += 1
