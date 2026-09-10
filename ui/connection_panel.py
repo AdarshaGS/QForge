@@ -739,11 +739,6 @@ class ConnectionPanel(QWidget):
         left_layout.addWidget(cat_container)
         self._update_category_row_styles()
 
-        self.table_search = QLineEdit()
-        self.table_search.setPlaceholderText("Search tables...")
-        self.table_search.textChanged.connect(self.filter_tables)
-        left_layout.addWidget(self.table_search)
-
         # ── Tables / Queries / History toggle ──────────────────────────
         # Order is Tables, Queries, History (issue #130) — Queries sits
         # ahead of History since it's the more actively-used workflow.
@@ -811,6 +806,11 @@ class ConnectionPanel(QWidget):
         schema_page_layout.addWidget(self._schema_loading_label)
 
         self._style_schema_progress_bar(self.current_theme == "dark")
+
+        self.table_search = QLineEdit()
+        self.table_search.setPlaceholderText("Search tables...")
+        self.table_search.textChanged.connect(self.filter_tables)
+        schema_page_layout.addWidget(self.table_search)
 
         self.schema_tree = QTreeWidget()
         self.schema_tree.setHeaderHidden(True)
@@ -2134,11 +2134,14 @@ class ConnectionPanel(QWidget):
         if not self._under_tab_limit(silent):
             return
 
+        self._log_win_state("open_table_view: before TableViewWidget()")
         tv = TableViewWidget(self.db_service, table_name, self.config)
+        self._log_win_state("open_table_view: after TableViewWidget(), before addTab")
         tv.execute_query_signal.connect(self._run_query_in_tab)
         tab_index = self.tabs.addTab(tv, table_name)
         self._attach_close_btn(tab_index)
         self.tabs.setCurrentIndex(tab_index)
+        self._log_win_state("open_table_view: after addTab")
 
         # ── FK metadata: load async-style (non-blocking) ──────────────────────
         try:
@@ -2196,16 +2199,22 @@ class ConnectionPanel(QWidget):
 
     def ensure_at_least_one_tab(self):
         """Guarantee this panel has at least one query tab. Called once
-        right after a panel becomes interactive (fresh connect or session
-        restore) so its tab bar's native view is realized immediately —
-        before the user can ever switch the main window to full screen.
-        Confirmed via live testing (real screenshots of a real full-screen
-        session, not just offscreen flag inspection): the first time Qt has
-        to realize brand-new native tab content inside an *already*
-        full-screen window, macOS briefly slides the window out to reveal
-        another Space (issue #25). Front-loading that realization while
-        still windowed avoids the trigger for the common case of a panel
-        that starts with zero tabs."""
+        right after a panel becomes interactive (fresh connect, new
+        connection opened later, or session restore) so its tab bar's
+        native view is realized immediately. Confirmed via live testing
+        (real screenshots of a real full-screen session, not just
+        offscreen flag inspection): the first time Qt has to realize
+        brand-new native tab content inside an *already* full-screen
+        window, macOS briefly slides the window out to reveal another
+        Space (issue #25). Safe to call any time the main window cannot
+        yet be full screen (startup, session restore — nothing has shown
+        the window long enough for the user to have full-screened it
+        yet). For a panel that can appear later in the app's life (e.g. a
+        new connection opened while already running), call this BEFORE
+        the panel is ever shown instead — realizing the tab while the
+        panel is still off-screen avoids the trigger regardless of
+        whether the main window happens to be full screen at that point
+        (see MainWindow._prompt_new_connection)."""
         if self.tabs.count() == 0:
             self.add_new_tab()
 
@@ -2236,6 +2245,18 @@ class ConnectionPanel(QWidget):
             return cap is None or self.tabs.count() < cap
         return require_under_limit(Limit.MAX_QUERY_TABS, self.tabs.count(), "query tabs", self)
 
+    def _log_win_state(self, tag: str):
+        """[SPACE-DEBUG] snapshot of the top-level window's state, for
+        correlating against MainWindow's [SPACE-DEBUG] transition lines
+        (changeEvent/applicationStateChanged). TEMP — remove once the
+        space-switch trigger is confirmed/fixed (issue #25 follow-up)."""
+        win = self.window()
+        logger.info(
+            f"[SPACE-DEBUG] {tag}: t={time.perf_counter():.4f} "
+            f"isFullScreen={win.isFullScreen()} isActiveWindow={win.isActiveWindow()} "
+            f"windowState={win.windowState()!r} tabCount={self.tabs.count()}"
+        )
+
     def add_new_tab(self, silent: bool = False):
         """Open a blank SQL query tab. Returns the new tab, or None if the
         tab cap (issue #154) blocked it. *silent* suppresses the upgrade
@@ -2243,7 +2264,9 @@ class ConnectionPanel(QWidget):
         a click."""
         if not self._under_tab_limit(silent):
             return None
+        self._log_win_state("add_new_tab: before SqlTab()")
         tab = SqlTab()
+        self._log_win_state("add_new_tab: after SqlTab(), before addTab")
         # Reparent into the real tab widget FIRST, before any other setup.
         # SqlTab() itself is a fairly heavy construction (dozens of child
         # widgets), and until it's added here it's a parentless — hence
@@ -2258,6 +2281,7 @@ class ConnectionPanel(QWidget):
         # closes the window for it to happen.
         count = self.tabs.count() + 1
         idx = self.tabs.addTab(tab, f"Tab {count}")
+        self._log_win_state("add_new_tab: after addTab")
         tab.run_btn.clicked.connect(lambda: self._run_query_in_tab(tab))
         tab.run_all_requested.connect(lambda: self._run_query_in_tab(tab, run_all=True))
         tab.begin_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "BEGIN"))
@@ -2276,9 +2300,11 @@ class ConnectionPanel(QWidget):
         self._attach_close_btn(idx)
         self.tabs.setCurrentWidget(tab)
         tab.update_theme(self.current_theme == "dark")
+        self._log_win_state("add_new_tab: end (before deferred setFocus)")
         # Focus the editor after the tab is fully shown
         from PySide6.QtCore import QTimer
         QTimer.singleShot(0, tab.editor.setFocus)
+        QTimer.singleShot(0, lambda: self._log_win_state("add_new_tab: deferred setFocus fired"))
         return tab
 
     def _execute_commit_sql(self, sql_list: list, tab):
@@ -3997,7 +4023,6 @@ class ConnectionPanel(QWidget):
         self._schema_btn.setChecked(index == 0)
         self._queries_btn.setChecked(index == 1)
         self._history_btn.setChecked(index == 2)
-        self.table_search.setVisible(index == 0)
         if index == 1:
             self._reload_queries_list()
         elif index == 2:
@@ -4288,23 +4313,9 @@ class ConnectionPanel(QWidget):
             if idx == len(query):              return 700
             return -1   # no match
 
-        scored = []
         for name, item in items_map.items():
             s = _score(name)
             item.setHidden(s < 0)
-            if s >= 0:
-                scored.append((s, name, item))
-
-        # ── Highlight matched characters in green ─────────────────────────────
-        # QTreeWidget doesn't support rich text, so we colour the whole item
-        # for prefix/exact matches and use normal colour for fuzzy hits.
-        for s, name, item in scored:
-            if s >= 800:
-                # Direct substring match — tint green
-                item.setForeground(0, QBrush(QColor("#89d185")))
-            elif s == 700:
-                # Fuzzy match — dim tint to distinguish from prefix matches
-                item.setForeground(0, QBrush(QColor("#6cba68")))
 
         # ── Re-sort visible items so best matches appear first ────────────────
         # QTreeWidget doesn't have a built-in sort by custom score. The tree

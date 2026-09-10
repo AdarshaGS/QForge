@@ -22,6 +22,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QWidget
 
 import main as main_mod
 from services.db_service import DbService
+from ui.connection_panel import ConnectionPanel
 from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
 
@@ -105,3 +106,38 @@ def test_prompt_new_connection_reactivates_window_after_connecting(monkeypatch):
     # think-time) must be accumulated for MainWindow.__init__ to subtract
     # back out of the startup-stage timings.
     assert win._dialog_wait_ms >= _StubDialog._DELAY_S * 1000
+
+
+def test_prompt_new_connection_realizes_first_tab_before_panel_is_shown(monkeypatch):
+    """Regression guard for issue #25's un-mitigated case: opening a new
+    connection (not just the app's very first one) must realize the
+    panel's first tab BEFORE _add_panel ever makes it a visible page of
+    the main window's stack. Unlike startup/session-restore, this can
+    happen at any point in the app's life — including while the main
+    window is already native full-screen — so it can't rely on "before
+    the window can be full screen" timing; it needs this call order
+    instead (see ConnectionPanel.ensure_at_least_one_tab)."""
+    monkeypatch.setattr(main_mod, "ConnectionDialog", _StubDialog)
+    monkeypatch.setattr(DbService, "connect", _fake_connect)
+
+    calls = []
+    real_ensure = ConnectionPanel.ensure_at_least_one_tab
+
+    def _tracked_ensure(self):
+        calls.append("ensure_at_least_one_tab")
+        return real_ensure(self)
+
+    monkeypatch.setattr(ConnectionPanel, "ensure_at_least_one_tab", _tracked_ensure)
+
+    win = _MainWindowStub()
+    real_add_panel = win._add_panel
+
+    def _tracked_add_panel(panel):
+        calls.append("_add_panel")
+        return real_add_panel(panel)
+
+    win._add_panel = _tracked_add_panel
+
+    main_mod.MainWindow._prompt_new_connection(win, allow_cancel_quit=False)
+
+    assert calls == ["ensure_at_least_one_tab", "_add_panel"]

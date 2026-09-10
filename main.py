@@ -4,7 +4,7 @@ import json
 import signal
 import time
 
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, QEvent
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabBar, QStackedWidget, QPushButton, QMessageBox, QProgressDialog,
@@ -128,6 +128,41 @@ class MainWindow(QMainWindow):
         self._start_update_check()
         self._start_entitlement_config_check()
         self._start_license_revalidation()
+
+        # TEMP DIAGNOSTIC (space-switch investigation, issue #25 follow-up):
+        # log every window-state/activation transition and every app-wide
+        # active/inactive transition, so a "+"-click that slides the
+        # fullscreen window out to another Space shows up as a
+        # [SPACE-DEBUG] line bracketing whichever log lines the click
+        # itself produced. Remove once the trigger is confirmed/fixed.
+        QApplication.instance().applicationStateChanged.connect(self._log_app_state_change)
+
+    def _log_win_state(self, tag: str):
+        """[SPACE-DEBUG] snapshot of this window's state, for correlating
+        against the [SPACE-DEBUG] transition lines logged by changeEvent()
+        and _log_app_state_change() below."""
+        logger.info(
+            f"[SPACE-DEBUG] {tag}: t={time.perf_counter():.4f} "
+            f"isFullScreen={self.isFullScreen()} isActiveWindow={self.isActiveWindow()} "
+            f"isVisible={self.isVisible()} windowState={self.windowState()!r}"
+        )
+
+    def _log_app_state_change(self, state):
+        logger.info(f"[SPACE-DEBUG] applicationStateChanged: t={time.perf_counter():.4f} state={state!r}")
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.WindowStateChange:
+            logger.info(
+                f"[SPACE-DEBUG] changeEvent(WindowStateChange): t={time.perf_counter():.4f} "
+                f"oldState={event.oldState()!r} newState={self.windowState()!r} "
+                f"isFullScreen={self.isFullScreen()}"
+            )
+        elif event.type() == QEvent.ActivationChange:
+            logger.info(
+                f"[SPACE-DEBUG] changeEvent(ActivationChange): t={time.perf_counter():.4f} "
+                f"isActiveWindow={self.isActiveWindow()} isFullScreen={self.isFullScreen()}"
+            )
+        super().changeEvent(event)
 
     # ─── License revalidation (offline grace period) ───────────────────────────
 
@@ -589,7 +624,6 @@ class MainWindow(QMainWindow):
                 # fetching it on this thread would race the schema-loading
                 # background thread over the same shared connection.
 
-                self._add_panel(panel)
                 # ConnectionDialog just closed via dialog.exec() — on macOS
                 # that leaves no window "active" at the OS level (verified:
                 # QApplication.focusWidget() is None afterward and stays
@@ -598,7 +632,27 @@ class MainWindow(QMainWindow):
                 # reclaims window activation explicitly.
                 self.activateWindow()
                 self.raise_()
+                # Realize this panel's first tab BEFORE _add_panel below
+                # ever makes it part of the visible window (i.e. while
+                # `panel` is still just an unshown QWidget parented to
+                # `self`, not yet a page of `self.stack`). Opening a new
+                # connection can happen at any point in the app's life,
+                # including while the main window is already in native
+                # full screen — unlike every other panel's first tab,
+                # which is always realized at startup/session-restore,
+                # before full screen is reachable at all (see
+                # ConnectionPanel.ensure_at_least_one_tab). Populating the
+                # tab while off-screen means _add_panel reveals an
+                # already-fully-populated panel in one shot, instead of
+                # showing an empty panel and then adding brand-new native
+                # tab content to it live — the latter is what slides an
+                # already-full-screen window out to reveal another Space
+                # (issue #25).
+                self._log_win_state("_prompt_new_connection: before ensure_at_least_one_tab")
                 panel.ensure_at_least_one_tab()
+                self._log_win_state("_prompt_new_connection: after ensure_at_least_one_tab")
+                self._add_panel(panel)
+                self._log_win_state("_prompt_new_connection: after _add_panel")
                 return
 
             except Exception as ex:

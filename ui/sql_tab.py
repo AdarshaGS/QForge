@@ -42,6 +42,9 @@ from ui.column_filter_dialog import ColumnFilterDialog
 from ui.theme_manager import ThemeManager
 from ui.snippet_manager import SnippetManager
 from utils.sql_errors import sql_error_hint as _sql_error_hint, sql_error_title as _sql_error_title
+from utils.logger import get_logger
+
+logger = get_logger()
 
 
 # ─── Error card: location lookup (title/hint now in utils/sql_errors.py,
@@ -135,6 +138,14 @@ class SqlTab(QWidget):
         # Theme will be set by update_theme() call in init_ui
 
     def init_ui(self):
+        # TEMP DIAGNOSTIC (space-switch investigation, issue #25 follow-up):
+        # fine-grained [SPACE-DEBUG] checkpoints through this ~800-line
+        # method, to narrow down which section constructs whatever is
+        # tripping the fullscreen Space-slide (the coarse before/after
+        # SqlTab() bracket in ConnectionPanel.add_new_tab already showed
+        # the ActivationChange blip happens somewhere inside this call).
+        # Remove once the exact line is confirmed/fixed.
+        logger.info(f"[SPACE-DEBUG] init_ui: start t={time.perf_counter():.4f}")
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -148,15 +159,18 @@ class SqlTab(QWidget):
         # SQL EDITOR
         # ==================================
 
+        logger.info(f"[SPACE-DEBUG] init_ui: before CodeEditor() t={time.perf_counter():.4f}")
         self.editor = CodeEditor()
+        logger.info(f"[SPACE-DEBUG] init_ui: after CodeEditor() t={time.perf_counter():.4f}")
         self.editor.setPlaceholderText("Write SQL here…")
         self.editor.setMinimumHeight(120)
 
         # Apply syntax highlighting to the document
         self.highlighter = SqlHighlighter(self.editor.document())
-        
+
         # Apply autocomplete
         self.completer = SqlCompleter(self.editor)
+        logger.info(f"[SPACE-DEBUG] init_ui: after highlighter+completer t={time.perf_counter():.4f}")
 
         # Schema validation (unknown table/column squiggly underline) —
         # debounced off the same keystrokes that drive autocomplete, and
@@ -358,6 +372,7 @@ class SqlTab(QWidget):
             QPushButton:pressed { background: #0066CC; }
         """)
         run_layout.addWidget(self.run_btn)
+        logger.info(f"[SPACE-DEBUG] init_ui: after buttons toolbar t={time.perf_counter():.4f}")
 
         # ── Find / Replace bar (Cmd+F = find, Cmd+H = find+replace) ─────────
         self._find_bar = QWidget()
@@ -589,6 +604,7 @@ class SqlTab(QWidget):
         
         # Add initial filter row
         self.add_filter_row()
+        logger.info(f"[SPACE-DEBUG] init_ui: after find/replace+filter bar t={time.perf_counter():.4f}")
 
         # ==================================
         # STATUS (Hidden by default)
@@ -779,12 +795,15 @@ class SqlTab(QWidget):
         self._error_card_scroll.setFrameShape(QScrollArea.NoFrame)
         self._error_card_scroll.setWidget(self._error_card)
         self._error_card_scroll.hide()
+        logger.info(f"[SPACE-DEBUG] init_ui: after status+error card t={time.perf_counter():.4f}")
 
         # ==================================
         # RESULT GRID
         # ==================================
 
+        logger.info(f"[SPACE-DEBUG] init_ui: before EditableTableWidget() t={time.perf_counter():.4f}")
         self.result_table = EditableTableWidget()
+        logger.info(f"[SPACE-DEBUG] init_ui: after EditableTableWidget() t={time.perf_counter():.4f}")
 
         # remove serial number column
         self.result_table.verticalHeader().setVisible(False)
@@ -880,9 +899,12 @@ class SqlTab(QWidget):
         self.splitter.setSizes([300, 500])  # Initial sizes
         
         layout.addWidget(self.splitter)
+        logger.info(f"[SPACE-DEBUG] init_ui: after splitter.addWidget x2 + layout.addWidget(splitter) t={time.perf_counter():.4f}")
         layout.addWidget(self._build_tab_status_bar())
+        logger.info(f"[SPACE-DEBUG] init_ui: after _build_tab_status_bar() t={time.perf_counter():.4f}")
 
         self.setLayout(layout)
+        logger.info(f"[SPACE-DEBUG] init_ui: after setLayout t={time.perf_counter():.4f}")
 
         # ==================================
         # KEYBOARD SHORTCUTS
@@ -940,10 +962,11 @@ class SqlTab(QWidget):
         self.commit_btn.hide()
         self.revert_btn = QPushButton()
         self.revert_btn.hide()
-        
+        logger.info(f"[SPACE-DEBUG] init_ui: end t={time.perf_counter():.4f}")
+
         # Apply theme after all widgets are created
         # Note: Will be updated when theme changes via apply_theme in main window
-    
+
     def get_main_window(self):
         """Get the main window by traversing up the parent hierarchy"""
         widget = self
