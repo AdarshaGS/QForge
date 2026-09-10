@@ -212,6 +212,10 @@ def test_ancestor_with_existing_rows_defaults_to_reuse_not_generate():
 def test_large_row_count_generates_on_background_thread():
     dlg = _make_dialog(columns=[_col("id", "int(11)", nullable="NO"), _col("name", "varchar(50)")],
                         primary_keys=["id"])
+    # QWidget.isVisible() reflects actual on-screen visibility, which
+    # requires the top-level dialog itself to be shown — real callers get
+    # this for free via .exec(), which this test can't use since it blocks.
+    dlg.show()
     requested = _BACKGROUND_ROW_THRESHOLD + 50
     dlg._row_count_spin.setValue(requested)
     dlg._regenerate()

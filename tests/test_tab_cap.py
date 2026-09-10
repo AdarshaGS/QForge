@@ -28,6 +28,12 @@ def _make_panel(monkeypatch):
     # Force Free edition regardless of any real license on the machine
     # running these tests (test_entitlements.py's own pattern).
     monkeypatch.setattr(entitlements_module.license_manager, "current_edition", lambda: "free")
+    # ALL_FEATURES_FREE (the Pro-for-everyone kill switch, v1.5.0) is on by
+    # default and would otherwise make every limit unlimited regardless of
+    # edition — this suite exercises the underlying Free/Pro cap logic
+    # itself, so it needs gating back on (test_entitlements.py's own
+    # _with_gating_enabled pattern).
+    monkeypatch.setattr(entitlements_module.config, "ALL_FEATURES_FREE", False)
     # UpgradeDialog.exec() is a real blocking modal — nothing can click it
     # offscreen, so stub it out rather than the require_under_limit() logic
     # itself, which is exactly what's under test.
@@ -128,8 +134,10 @@ def test_restore_pinned_tabs_stops_silently_at_cap(monkeypatch):
         panel.add_new_tab()
 
     from utils import pinned_tabs as _pt
-    monkeypatch.setattr(_pt, "load", lambda: {"t": [{"name": "p1", "query": "SELECT 1"},
-                                                     {"name": "p2", "query": "SELECT 2"}]})
+    # Keyed by panel.label, not the bare config name — issue #281 folded the
+    # database name into the label so same-server tabs stay distinguishable.
+    monkeypatch.setattr(_pt, "load", lambda: {panel.label: [{"name": "p1", "query": "SELECT 1"},
+                                                             {"name": "p2", "query": "SELECT 2"}]})
 
     panel.restore_pinned_tabs()
 

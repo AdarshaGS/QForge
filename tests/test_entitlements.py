@@ -55,6 +55,7 @@ def test_pro_bundled_defaults(tmp_path, monkeypatch):
 
 def test_apply_remote_config_overrides_only_provided_keys(tmp_path, monkeypatch):
     _as_free(monkeypatch)
+    _with_gating_enabled(monkeypatch)
     ent = _fresh(tmp_path, monkeypatch)
 
     ent.apply_remote_config({"free_limits": {"max_connections": 2}, "price_label": "$99/year"})
@@ -68,6 +69,7 @@ def test_apply_remote_config_overrides_only_provided_keys(tmp_path, monkeypatch)
 
 def test_apply_remote_config_persists_across_a_fresh_instance(tmp_path, monkeypatch):
     _as_free(monkeypatch)
+    _with_gating_enabled(monkeypatch)
     ent = _fresh(tmp_path, monkeypatch)
     ent.apply_remote_config({"free_limits": {"max_connections": 2}})
 

@@ -55,6 +55,13 @@ def test_load_structure_tab_runs_in_background_and_populates_tables():
 
     w._load_structure_tab()
     _pump_until(lambda: db.columns_calls)
+    # db.columns_calls flips inside the background thread the instant
+    # get_columns() returns, but _apply_structure_result() (which fills
+    # col_tbl/idx_tbl/fk_tbl) only runs once the main thread's event loop
+    # delivers the cross-thread _structure_load_done signal — a separate,
+    # later tick — so wait for that too rather than assuming it's already
+    # landed.
+    _pump_until(lambda: w.col_tbl.rowCount() > 0)
 
     assert w.col_tbl.rowCount() == 1
     assert w.idx_tbl.rowCount() == 1
