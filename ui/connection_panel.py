@@ -2814,7 +2814,9 @@ class ConnectionPanel(QWidget):
         the Estimate Cost / Run Profile buttons still work as normal for a
         live re-check against the database now. *history_entry_id*, when
         given, makes a live Estimate/Profile run from inside the dialog
-        stick back onto that history entry — see _CostProfileTab.
+        stick back onto that history entry; otherwise (the Database menu/
+        status-badge entry point) the first successful run instead
+        creates a new history entry (issue #339) — see _CostProfileTab.
         Free tier — no require_pro() gate, unlike Schema/Data Compare;
         this is a safety/education aid, not a power-user workflow."""
         if not self.db_service or not self.db_service.connection:
@@ -2828,7 +2830,8 @@ class ConnectionPanel(QWidget):
                                    initial_cost_detail=cost_detail,
                                    initial_profile_detail=profile_detail,
                                    query_history=self.query_history,
-                                   history_entry_id=history_entry_id, parent=self)
+                                   history_entry_id=history_entry_id,
+                                   connection_name=self.config.get("name", ""), parent=self)
         if focus_cost_tab:
             dlg.show_cost_tab()
         dlg.show()

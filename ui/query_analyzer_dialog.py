@@ -705,7 +705,7 @@ class _CostProfileTab(QWidget):
 
     def __init__(self, db_service, initial_query: str = "", initial_cost_detail: dict = None,
                  initial_profile_detail: dict = None, query_history=None,
-                 history_entry_id: str = None, parent=None):
+                 history_entry_id: str = None, connection_name: str = "", parent=None):
         super().__init__(parent)
         self._db = db_service
         self._dialect = getattr(db_service, "db_type", "") or ""
@@ -713,13 +713,17 @@ class _CostProfileTab(QWidget):
         self._cost_worker = None
         self._profile_thread = None
         self._profile_worker = None
-        # When both are set, a live Estimate/Profile run here is persisted
-        # back onto that history entry (query_history.update_entry) — see
-        # _on_estimate_done/_on_profile_done. None for the "current tab's
-        # query" entry point (Database menu / status badge), which has no
-        # single history entry to write back to.
+        # When history_entry_id is given (the dialog was opened from an
+        # existing history row — e.g. the History panel's "View Cost &
+        # Profile" action), a live Estimate/Profile run here is persisted
+        # back onto that entry. Otherwise (the "current tab's query" entry
+        # point — Database menu / status badge — which has no existing
+        # entry to write back to) the first successful run instead creates
+        # a new one (issue #339), and every later run in this dialog
+        # session updates that same entry — see _persist_to_history.
         self._query_history = query_history
         self._history_entry_id = history_entry_id
+        self._connection_name = connection_name
         self._build_ui(initial_query, initial_cost_detail, initial_profile_detail)
 
     def _build_ui(self, initial_query: str, initial_cost_detail: dict = None,
@@ -908,11 +912,21 @@ class _CostProfileTab(QWidget):
 
     def _persist_to_history(self, **fields):
         """Write *fields* onto the history entry this dialog was opened
-        for, if any — see _CostProfileTab.__init__. A no-op for the
-        "current tab's query" entry point, which has no single history
-        entry to write back to."""
-        if self._query_history and self._history_entry_id:
+        for — see _CostProfileTab.__init__. When there isn't one yet (the
+        "current tab's query" entry point), create one instead so a
+        standalone Analyze Query run doesn't vanish once the dialog closes
+        (issue #339); the id is remembered so a later run in this same
+        dialog session (e.g. Profile after Estimate) updates that entry
+        rather than creating a second one."""
+        if not self._query_history:
+            return
+        if self._history_entry_id:
             self._query_history.update_entry(self._history_entry_id, **fields)
+        else:
+            sql = self._editor.toPlainText().strip()
+            self._history_entry_id = self._query_history.add_query(
+                sql, self._connection_name, **fields,
+            )
 
     # ─── Cost estimate (plan-only) ───────────────────────────────────────
 
@@ -1075,7 +1089,10 @@ class _CostProfileTab(QWidget):
             return
         self._status_lbl.setText("")
         self._render_profile(result)
-        self._persist_to_history(profile_detail=query_cost.profile_to_dict(result))
+        self._persist_to_history(
+            execution_time=result.total_time_ms / 1000.0,
+            profile_detail=query_cost.profile_to_dict(result),
+        )
 
     def _on_profile_error(self, message: str):
         self._set_busy(False)
@@ -2272,7 +2289,7 @@ class QueryAnalyzerDialog(QDialog):
 
     def __init__(self, db_service, initial_query: str = "", initial_cost_detail: dict = None,
                  initial_profile_detail: dict = None, query_history=None,
-                 history_entry_id: str = None, parent=None):
+                 history_entry_id: str = None, connection_name: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Analyze Query")
         self.setMinimumSize(1000, 720)
@@ -2288,7 +2305,8 @@ class QueryAnalyzerDialog(QDialog):
                                           initial_cost_detail=initial_cost_detail,
                                           initial_profile_detail=initial_profile_detail,
                                           query_history=query_history,
-                                          history_entry_id=history_entry_id)
+                                          history_entry_id=history_entry_id,
+                                          connection_name=connection_name)
         self._compare_tab = _CompareQueriesTab(db_service, initial_query=initial_query)
         self._tabs.addTab(self._cost_tab, "Cost && Profile")
         self._tabs.addTab(self._compare_tab, "Compare Queries")
