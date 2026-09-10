@@ -4574,12 +4574,41 @@ class ConnectionPanel(QWidget):
         # and just as impossible to tell apart as before.
         db = self.config.get("database", "")
         db_suffix = f"  ·  {db}" if db else ""
-        ver = getattr(self, '_server_version', '')
         env = environment.normalize(self.config.get("environment"))
         env_suffix = f"  {environment.BADGE_LABELS[env]}" if env != environment.UNCLASSIFIED else ""
         read_only_suffix = "  🔒 READ-ONLY" if self.config.get("read_only") else ""
-        ver_suffix = f"  [{ver}]" if ver else ""
-        return f"{base}{db_suffix}{env_suffix}{read_only_suffix}{ver_suffix}"
+        # Server version used to be appended here too (issue #336 follow-up)
+        # but it crowded out the tab bar — it's in connection_details_text()
+        # (the hover tooltip) instead now.
+        return f"{base}{db_suffix}{env_suffix}{read_only_suffix}"
+
+    def connection_details_text(self) -> str:
+        """Full connection details for the tab's hover tooltip / the
+        'Copy Connection Details' context-menu action — everything the
+        tab label itself no longer has room to show."""
+        lines = [self.config.get("name", "Connection")]
+        db_type = self.config.get("type", "")
+        if db_type:
+            lines.append(f"Type: {db_type.upper()}")
+        host = self.config.get("host", "")
+        if host:
+            port = self.config.get("port", "")
+            lines.append(f"Host: {host}{':' + str(port) if port else ''}")
+        user = self.config.get("user", "")
+        if user:
+            lines.append(f"User: {user}")
+        db = self.config.get("database", "")
+        if db:
+            lines.append(f"Database: {db}")
+        ver = getattr(self, '_server_version', '')
+        if ver:
+            lines.append(f"Version: {ver}")
+        env = environment.normalize(self.config.get("environment"))
+        if env != environment.UNCLASSIFIED:
+            lines.append(f"Environment: {environment.BADGE_LABELS[env].strip()}")
+        if self.config.get("read_only"):
+            lines.append("Read-only")
+        return "\n".join(lines)
 
     def _reload_errored_table_tabs(self):
         """Retry every open TableViewWidget currently stuck on a connection

@@ -137,16 +137,6 @@ class MainWindow(QMainWindow):
         # itself produced. Remove once the trigger is confirmed/fixed.
         QApplication.instance().applicationStateChanged.connect(self._log_app_state_change)
 
-    def _log_win_state(self, tag: str):
-        """[SPACE-DEBUG] snapshot of this window's state, for correlating
-        against the [SPACE-DEBUG] transition lines logged by changeEvent()
-        and _log_app_state_change() below."""
-        logger.info(
-            f"[SPACE-DEBUG] {tag}: t={time.perf_counter():.4f} "
-            f"isFullScreen={self.isFullScreen()} isActiveWindow={self.isActiveWindow()} "
-            f"isVisible={self.isVisible()} windowState={self.windowState()!r}"
-        )
-
     def _log_app_state_change(self, state):
         logger.info(f"[SPACE-DEBUG] applicationStateChanged: t={time.perf_counter():.4f} state={state!r}")
 
@@ -465,6 +455,7 @@ class MainWindow(QMainWindow):
         self._panels.append(panel)
         self.stack.addWidget(panel)
         tab_idx = self.conn_tab_bar.addTab(panel.label)
+        self.conn_tab_bar.setTabToolTip(tab_idx, panel.connection_details_text())
         self.conn_tab_bar.setCurrentIndex(tab_idx)
         self.stack.setCurrentWidget(panel)
         self._update_window_title()
@@ -483,6 +474,7 @@ class MainWindow(QMainWindow):
             return
         idx = self._panels.index(panel)
         self.conn_tab_bar.setTabText(idx, new_label)
+        self.conn_tab_bar.setTabToolTip(idx, panel.connection_details_text())
         if self._current_panel() is panel:
             self._update_window_title()
 
@@ -657,11 +649,8 @@ class MainWindow(QMainWindow):
             # tab content to it live — the latter is what slides an
             # already-full-screen window out to reveal another Space
             # (issue #25).
-            self._log_win_state("_connect_and_add_panel: before ensure_at_least_one_tab")
             panel.ensure_at_least_one_tab()
-            self._log_win_state("_connect_and_add_panel: after ensure_at_least_one_tab")
             self._add_panel(panel)
-            self._log_win_state("_connect_and_add_panel: after _add_panel")
             return True
 
         except Exception as ex:
@@ -753,6 +742,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         refresh_schema_act  = menu.addAction("↺  Refresh Schema")
         reconnect_act       = menu.addAction("⟳  Reconnect")
+        copy_details_act    = menu.addAction("⧉  Copy Connection Details")
         menu.addSeparator()
         close_act           = menu.addAction("Close Connection")
         close_others_act    = menu.addAction("Close Other Connections")
@@ -764,6 +754,9 @@ class MainWindow(QMainWindow):
         elif action == reconnect_act:
             if 0 <= idx < len(self._panels):
                 self._panels[idx]._do_reconnect()
+        elif action == copy_details_act:
+            if 0 <= idx < len(self._panels):
+                QApplication.clipboard().setText(self._panels[idx].connection_details_text())
         elif action == close_act:
             self._close_connection_tab(idx)
         elif action == close_others_act:

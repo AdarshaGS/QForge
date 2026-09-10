@@ -1211,7 +1211,10 @@ class EditableTableWidget(QTableWidget):
             # astype(str) casts via numpy's string dtype, which tries to
             # UTF-8-decode bytes and crashes the entire page load on the
             # first non-UTF-8 byte. Python's own str() just reprs it.
-            sample = dataframe.iloc[:50, col_idx].fillna('').map(str)
+            # NULLs are blanked out via the map itself, not .fillna('') —
+            # a nullable Int64/etc column (issue #279) rejects '' as a fill
+            # value since it isn't an int, raising TypeError.
+            sample = dataframe.iloc[:50, col_idx].map(lambda v: '' if pd.isna(v) else str(v))
             content_w = sample.map(lambda s: fm.horizontalAdvance(str(s))).max() if not sample.empty else 0
             content_w += 20  # cell padding
             best = max(header_w, content_w, self._COL_WIDTH_DEF)

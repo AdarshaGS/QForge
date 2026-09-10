@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QCompleter,
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QFont, QColor, QIcon
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QEvent
 
 
 class ConnectionDialog(QDialog):
@@ -102,6 +102,7 @@ class ConnectionDialog(QDialog):
         self.connection_search.setPlaceholderText("Type to filter connections...")
         self.connection_search.setStyleSheet("font-size: 12px; padding: 8px;")
         self.connection_search.textChanged.connect(self.filter_connections)
+        self.connection_search.installEventFilter(self)
 
         left_layout.addWidget(search_label)
         left_layout.addWidget(self.connection_search)
@@ -1357,6 +1358,53 @@ class ConnectionDialog(QDialog):
                 if visible:
                     group_has_visible = True
             group_item.setHidden(bool(search_text) and not group_has_visible)
+            if group_has_visible:
+                group_item.setExpanded(True)
+
+        if search_text:
+            visible_items = self._visible_connection_items()
+            if visible_items and self._get_selected_conn_item() not in visible_items:
+                self.connection_tree.setCurrentItem(visible_items[0])
+                self.load_selected_connection()
+
+    def _visible_connection_items(self):
+        """Return connection leaf items that are currently shown, in display order."""
+        items = []
+        for gi in range(self.connection_tree.topLevelItemCount()):
+            group_item = self.connection_tree.topLevelItem(gi)
+            if group_item.isHidden():
+                continue
+            for ci in range(group_item.childCount()):
+                child = group_item.child(ci)
+                if not child.isHidden():
+                    items.append(child)
+        return items
+
+    def _move_connection_selection(self, delta):
+        """Move the current connection selection up/down among visible items."""
+        visible_items = self._visible_connection_items()
+        if not visible_items:
+            return
+        current = self._get_selected_conn_item()
+        if current in visible_items:
+            new_index = (visible_items.index(current) + delta) % len(visible_items)
+        else:
+            new_index = 0
+        self.connection_tree.setCurrentItem(visible_items[new_index])
+        self.load_selected_connection()
+
+    def eventFilter(self, obj, event):
+        if obj is self.connection_search and event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Down, Qt.Key_Up):
+                self._move_connection_selection(1 if key == Qt.Key_Down else -1)
+                return True
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                item = self._get_selected_conn_item()
+                if item is not None:
+                    self.load_selected_connection()
+                return True
+        return super().eventFilter(obj, event)
 
     # ── Last connection persistence ──────────────────────────────
 
