@@ -133,3 +133,22 @@ def test_primary_key_columns_reads_key_field_from_column_details():
 def test_primary_key_columns_empty_for_unknown_table():
     completer, _ = _make_completer("SELECT * FROM users")
     assert completer.primary_key_columns("no_such_table") == []
+
+
+def test_aliased_table_column_suggestion_is_alias_qualified():
+    query = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE i"
+    completer, _ = _make_completer(query)
+    items = completer._build_suggestions("i", "AFTER_WHERE", query, len(query))
+    # Both tables have an "id" column — with aliases in play each should
+    # surface distinctly qualified rather than collapsing to one ambiguous
+    # bare "id".
+    assert _find(items, "u.id") is not None
+    assert _find(items, "o.id") is not None
+    assert _find(items, "id") is None
+
+
+def test_unaliased_table_column_suggestion_stays_bare():
+    completer, _ = _make_completer("SELECT em FROM users")
+    items = completer._build_suggestions("em", "AFTER_SELECT", "SELECT em FROM users", 8)
+    assert _find(items, "email") is not None
+    assert _find(items, "users.email") is None

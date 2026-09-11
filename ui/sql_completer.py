@@ -306,6 +306,34 @@ class SuggestionDelegate(QStyledItemDelegate):
             painter.setPen(QColor("#aaaaaa"))
             rest_area = text_area.adjusted(matched_px, 0, 0, 0)
             painter.drawText(rest_area, Qt.AlignVCenter | Qt.AlignLeft, rest)
+        elif (prefix and '.' not in prefix and '.' in text
+              and text_lower.rsplit('.', 1)[1].startswith(prefix)):
+            # Alias-qualified column suggestion (e.g. "u.name") matched by
+            # typing just the column part ("na") with no dot — highlight
+            # only the matched slice of the column, keep "alias." dim.
+            qualifier, col_part = text.rsplit('.', 1)
+            lead = qualifier + '.'
+            matched = col_part[:len(prefix)]
+            rest = col_part[len(prefix):]
+
+            painter.setFont(base_font)
+            painter.setPen(QColor("#777777"))
+            painter.drawText(text_area, Qt.AlignVCenter | Qt.AlignLeft, lead)
+            lead_px = QFontMetrics(base_font).horizontalAdvance(lead)
+
+            bold_font = QFont(base_font)
+            bold_font.setBold(True)
+            painter.setFont(bold_font)
+            bfm2 = QFontMetrics(bold_font)
+            painter.setPen(QColor("#ffffff"))
+            matched_area = text_area.adjusted(lead_px, 0, 0, 0)
+            painter.drawText(matched_area, Qt.AlignVCenter | Qt.AlignLeft, matched)
+            matched_px = bfm2.horizontalAdvance(matched)
+
+            painter.setFont(base_font)
+            painter.setPen(QColor("#aaaaaa"))
+            rest_area = text_area.adjusted(lead_px + matched_px, 0, 0, 0)
+            painter.drawText(rest_area, Qt.AlignVCenter | Qt.AlignLeft, rest)
         else:
             painter.setFont(base_font)
             painter.setPen(QColor("#cccccc"))
@@ -934,16 +962,34 @@ class SqlCompleter:
             extra["key"] = "FK"
         return extra
 
+    def _display_alias(self, table: str) -> Optional[str]:
+        """The alias `table` is actually referenced by in the current query,
+        if any — distinct from the table's own name. Shared by
+        _score_columns (to qualify column suggestions) and
+        _fk_join_on_suggestion (to build a readable ON clause)."""
+        for alias, tbl in self._aliases.items():
+            if tbl == table and alias != table.lower():
+                return alias
+        return None
+
     def _score_columns(self, prefix: str, tables: list[str], base: int) -> list[SuggestionItem]:
         """Like _score() but for real table columns — attaches the type/PK/FK
-        badge info _score() has no per-item source for."""
+        badge info _score() has no per-item source for.
+
+        A table referenced under an alias in the query (e.g. `FROM users
+        u`) gets its columns suggested as `u.col` rather than a bare `col`
+        — otherwise two joined tables sharing a column name (e.g. both
+        having an `id`) would dedupe to a single ambiguous suggestion with
+        no way to tell which table it came from."""
         pl = prefix.lower()
         seen: set[str] = set()
         out: list[SuggestionItem] = []
         for tbl in tables:
+            alias = self._display_alias(tbl)
             for col in self._columns_for(tbl):
                 cl = col.lower()
-                if cl in seen:
+                dedup_key = f"{alias}.{cl}" if alias else cl
+                if dedup_key in seen:
                     continue
                 if not pl:
                     s = base
@@ -955,8 +1001,9 @@ class SqlCompleter:
                     s = base - 300
                 else:
                     continue
-                seen.add(cl)
-                out.append(SuggestionItem(col, SuggestionItem.COLUMN, s,
+                seen.add(dedup_key)
+                text = f"{alias}.{col}" if alias else col
+                out.append(SuggestionItem(text, SuggestionItem.COLUMN, s,
                                           extra=self._column_badge_extra(tbl, cl)))
         return out
 
@@ -1209,13 +1256,8 @@ class SqlCompleter:
                 return []
             left_col, right_col = fk["column"], fk["ref_column"]
 
-        def display_name(table: str) -> str:
-            for alias, tbl in self._aliases.items():
-                if tbl == table and alias != table.lower():
-                    return alias
-            return table
-
-        left, right = display_name(prev), display_name(joined)
+        left = self._display_alias(prev) or prev
+        right = self._display_alias(joined) or joined
         clause = f"ON {left}.{left_col} = {right}.{right_col}"
         return [SuggestionItem("ON", SuggestionItem.KEYWORD, 1300,
                                extra={"body": clause})]
