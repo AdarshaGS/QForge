@@ -1009,8 +1009,8 @@ class MainWindow(QMainWindow):
             lambda: self._current_panel() and self._current_panel().open_erd_view()
         )
 
-        act = db_menu.addAction("Visual Query Builder…")
-        act.triggered.connect(
+        self.query_builder_action = db_menu.addAction("Visual Query Builder…")
+        self.query_builder_action.triggered.connect(
             lambda: self._current_panel() and self._current_panel().open_query_builder()
         )
 
@@ -1120,6 +1120,10 @@ class MainWindow(QMainWindow):
         schema_compare_gated = not entitlements.is_enabled(Feature.SCHEMA_COMPARE)
         self.schema_compare_action.setText(
             "Compare Schemas… (Pro)" if schema_compare_gated else "Compare Schemas…"
+        )
+        query_builder_gated = not entitlements.is_enabled(Feature.VISUAL_QUERY_BUILDER)
+        self.query_builder_action.setText(
+            "Visual Query Builder… (Pro)" if query_builder_gated else "Visual Query Builder…"
         )
         self.license_action.setText(
             "Upgrade to Pro…" if entitlements.edition() is Edition.FREE else "License…"

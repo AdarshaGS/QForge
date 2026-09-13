@@ -1,9 +1,6 @@
-"""Visual Query Builder — table canvas & join graph (VQB.2, issue #192).
-
-Column/aggregate picking, filters, GROUP BY/ORDER BY/LIMIT, and SQL sync
-land in later sub-issues (#193-#196, tracked under #190); this dialog owns
-only the canvas: add/remove tables, draw joins between columns (or accept
-an auto-suggested FK join), and pick each join's type.
+"""Visual Query Builder — table canvas, join graph, SELECT/filter/
+GROUP BY/ORDER BY/LIMIT panels, live SQL sync, and persistence
+(VQB.2-VQB.6, issues #192-#196).
 
 Reuses ui/erd_dialog.py's canvas mechanics via ui/graph_canvas.py (pan/zoom
 view, minimap, card drawing, curve routing) rather than rebuilding them.
@@ -16,25 +13,41 @@ Loads schema metadata (all tables + FK relationships, for the "Add table"
 list and FK auto-suggestion) via services/erd_model.py's ErdGraph — the
 same model ErdDialog renders — through its own dedicated connection,
 never the caller's live one.
+
+SQL sync (VQB.5) is one-way, builder-state -> SQL string, per
+ai/vqb-design-spike.md: every mutation recomputes services.
+query_builder_model.build_sql() into a read-only preview strip. "Run"
+emits run_requested so the caller (ConnectionPanel.open_query_builder)
+hands the generated SQL to a normal query tab and the existing execution
+pipeline — this dialog never executes a query itself. Persistence (VQB.6)
+saves the full builder state (not just the SQL) via
+services/saved_visual_queries.py so a saved visual query reopens into the
+canvas, not just re-runs text.
 """
 import threading
 
 from PySide6.QtCore import Qt, QPointF, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainterPath, QPainterPathStroker, QPen
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QGraphicsItem, QGraphicsPathItem, QGraphicsRectItem,
-    QGraphicsScene, QGraphicsSimpleTextItem, QHBoxLayout, QLabel, QMenu,
-    QPushButton, QSplitter, QVBoxLayout,
+    QApplication, QComboBox, QDialog, QGraphicsItem, QGraphicsPathItem,
+    QGraphicsRectItem, QGraphicsScene, QGraphicsSimpleTextItem, QHBoxLayout,
+    QInputDialog, QLabel, QMenu, QMessageBox, QPushButton, QScrollArea,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 from services.erd_model import build_erd_graph, build_erd_graph_from_snapshot
-from services.query_builder_model import JOIN_TYPES, Join, QueryBuilderState
+from services.query_builder_model import (
+    JOIN_TYPES, Join, QueryBuilderState, build_sql,
+)
+from services.saved_visual_queries import saved_visual_queries
+from ui.code_editor import CodeEditor
 from ui.graph_canvas import (
     CanvasView, CollapseToggle, HEADER_H, HeaderItem, MinimapView, NODE_W,
     PAD, ROW_GAP_X, ROW_GAP_Y, ROW_H, build_curved_path, header_color,
     paint_card,
 )
-from ui.query_builder_panels import SelectPanel
+from ui.query_builder_panels import FilterPanel, GroupOrderLimitPanel, SelectPanel
+from ui.sql_highlighter import SqlHighlighter
 from utils import schema_cache
 
 
@@ -197,13 +210,15 @@ class _QbJoinEdgeItem(QGraphicsPathItem):
     FK-inferred join not yet touched by the user) renders dashed; picking
     a type or redrawing it confirms it and switches to solid."""
 
-    def __init__(self, join: Join, source_node, target_node, is_dark: bool, nodes_ref: dict, on_remove):
+    def __init__(self, join: Join, source_node, target_node, is_dark: bool, nodes_ref: dict,
+                 on_remove, on_change=None):
         super().__init__()
         self.join = join
         self.source_node = source_node
         self.target_node = target_node
         self._nodes = nodes_ref
         self._on_remove = on_remove
+        self._on_change = on_change
 
         color = QColor("#7a7a7f") if is_dark else QColor("#9a9a9f")
         self._solid_pen = QPen(color, 1.6)
@@ -268,6 +283,8 @@ class _QbJoinEdgeItem(QGraphicsPathItem):
             self.join.join_type = type_actions[action]
             self.join.suggested = False
             self.update_geometry()
+            if self._on_change:
+                self._on_change()
         elif action == remove_action:
             self._on_remove(self)
 
@@ -280,6 +297,7 @@ class QueryBuilderDialog(QDialog):
 
     _graph_loaded = Signal(object)
     _graph_load_error = Signal(str)
+    run_requested = Signal(str)
 
     def __init__(self, config: dict, is_dark: bool = True, parent=None):
         super().__init__(parent)
@@ -287,10 +305,12 @@ class QueryBuilderDialog(QDialog):
         self._is_dark = is_dark
         label = config.get("database") or config.get("name") or ""
         self.setWindowTitle(f"Visual Query Builder — {label}" if label else "Visual Query Builder")
-        self.resize(1000, 700)
+        self.resize(1150, 760)
 
         self.state = QueryBuilderState()
         self._graph = None  # full-schema ErdGraph (all tables/FKs), loaded once
+        self._loaded_query_id = None  # id of the saved visual query last opened/saved this session
+        self._last_sql = ""
 
         layout = QVBoxLayout(self)
 
@@ -308,21 +328,62 @@ class QueryBuilderDialog(QDialog):
         self.status_label = QLabel("")
         toolbar.addWidget(self.status_label)
         toolbar.addStretch()
+
+        self.saved_btn = QPushButton("Saved ▾")
+        self._saved_menu = QMenu(self.saved_btn)
+        self.saved_btn.setMenu(self._saved_menu)
+        self._saved_menu.aboutToShow.connect(self._populate_saved_menu)
+        toolbar.addWidget(self.saved_btn)
+
+        save_btn = QPushButton("Save…")
+        save_btn.clicked.connect(self._save_query)
+        toolbar.addWidget(save_btn)
+
+        copy_btn = QPushButton("Copy SQL")
+        copy_btn.clicked.connect(self._copy_sql)
+        toolbar.addWidget(copy_btn)
+
+        run_btn = QPushButton("Run")
+        run_btn.clicked.connect(self._on_run_clicked)
+        toolbar.addWidget(run_btn)
+
         layout.addLayout(toolbar)
 
         self.scene = QGraphicsScene(self)
         self.view = CanvasView(self.scene, self)
 
         self.select_panel = SelectPanel(self.state, on_change=self._on_select_state_changed)
-        self.select_panel.setMinimumWidth(260)
-        self.select_panel.setMaximumWidth(360)
+        self.where_panel = FilterPanel("WHERE", self.state.where_root, on_change=self._on_filters_changed)
+        self.having_panel = FilterPanel("HAVING", self.state.having_root, on_change=self._on_filters_changed)
+        self.group_order_limit_panel = GroupOrderLimitPanel(
+            self.state, on_change=self._on_group_order_limit_changed)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        for panel in (self.select_panel, self.where_panel, self.having_panel,
+                      self.group_order_limit_panel):
+            right_layout.addWidget(panel)
+
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setWidget(right_panel)
+        right_scroll.setMinimumWidth(280)
+        right_scroll.setMaximumWidth(380)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.view)
-        splitter.addWidget(self.select_panel)
+        splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
         layout.addWidget(splitter, 1)
+
+        layout.addWidget(QLabel("SQL Preview"))
+        self.sql_preview = CodeEditor()
+        self.sql_preview.setReadOnly(True)
+        self.sql_preview.setMaximumHeight(160)
+        self._sql_highlighter = SqlHighlighter(self.sql_preview.document())
+        layout.addWidget(self.sql_preview)
 
         bg = "#1c1c1e" if is_dark else "#ffffff"
         self.scene.setBackgroundBrush(QBrush(QColor(bg)))
@@ -374,6 +435,8 @@ class QueryBuilderDialog(QDialog):
         self._graph = graph
         self._refresh_add_table_combo()
         self.select_panel.refresh(self._graph, list(self._nodes))
+        self._refresh_filter_and_group_columns()
+        self._refresh_sql_preview()
         self.status_label.setText(f"{len(self._nodes)} table(s) on canvas · {len(graph.tables)} available")
 
     # ── "Add table" combo ────────────────────────────────────────────────
@@ -429,6 +492,8 @@ class QueryBuilderDialog(QDialog):
         self._refresh_add_table_combo()
         self._suggest_fk_joins(table_name)
         self.select_panel.refresh(self._graph, list(self._nodes))
+        self._refresh_filter_and_group_columns()
+        self._refresh_sql_preview()
         self.minimap.refresh_fit()
         self._update_minimap_tracking()
         self.status_label.setText(f"{len(self._nodes)} table(s) on canvas")
@@ -445,6 +510,8 @@ class QueryBuilderDialog(QDialog):
         self.state.remove_table(table_name)
         self._refresh_add_table_combo()
         self.select_panel.refresh(self._graph, list(self._nodes))
+        self._refresh_filter_and_group_columns()
+        self._refresh_sql_preview()
         self.status_label.setText(f"{len(self._nodes)} table(s) on canvas")
 
     # ── FK auto-suggestion ───────────────────────────────────────────────
@@ -456,7 +523,7 @@ class QueryBuilderDialog(QDialog):
         user can remove or retype any of these the same way as a manually
         drawn join; nothing about them is special once added besides the
         dashed pen until touched."""
-        if self._graph is None:
+        if self._graph is None or getattr(self, "_suppress_fk_suggestions", False):
             return
         for rel in self._graph.relationships:
             connects_to_canvas = (
@@ -528,13 +595,15 @@ class QueryBuilderDialog(QDialog):
         if src is None or tgt is None:
             return
         self.state.add_join(join)
-        edge = _QbJoinEdgeItem(join, src, tgt, self._is_dark, self._nodes, on_remove=self._remove_join_edge)
+        edge = _QbJoinEdgeItem(join, src, tgt, self._is_dark, self._nodes,
+                                on_remove=self._remove_join_edge, on_change=self._refresh_sql_preview)
         self.scene.addItem(edge)
         self.scene.addItem(edge.label_bg)
         self.scene.addItem(edge.label)
         src.edges.append(edge)
         tgt.edges.append(edge)
         self._edges.append(edge)
+        self._refresh_sql_preview()
 
     def _remove_join_edge(self, edge: "_QbJoinEdgeItem"):
         if edge not in self._edges:
@@ -548,15 +617,171 @@ class QueryBuilderDialog(QDialog):
         self.scene.removeItem(edge.label_bg)
         self.scene.removeItem(edge.label)
         self.scene.removeItem(edge)
+        self._refresh_sql_preview()
 
     # ── SELECT panel ─────────────────────────────────────────────────────
 
     def _on_select_state_changed(self):
-        # No SQL preview yet (VQB.5) — just reflect the count so checking a
-        # box has visible feedback.
         n = len(self.state.select_items)
         if n:
             self.status_label.setText(f"{len(self._nodes)} table(s) on canvas · {n} column(s) selected")
+        self._refresh_filter_and_group_columns()
+        self._refresh_sql_preview()
+
+    # ── WHERE/HAVING/GROUP BY/ORDER BY/LIMIT panels (VQB.4, VQB.5) ──────
+
+    def _refresh_filter_and_group_columns(self):
+        """Column choices for the filter/group/order panels — plain
+        table.column pairs for every table on the canvas, sourced from the
+        same ErdGraph SelectPanel uses. HAVING additionally offers each
+        aggregate/expression SELECT item as a synthetic entry (table=""),
+        since HAVING conditions typically target an aggregate result
+        rather than a raw column."""
+        columns = []
+        for table_name in self._nodes:
+            table = self._graph.tables.get(table_name) if self._graph else None
+            if table is None:
+                continue
+            for col in table.columns:
+                columns.append((f"{table_name}.{col.name}", table_name, col.name))
+
+        self.where_panel.set_columns(columns)
+        self.group_order_limit_panel.set_columns(columns)
+
+        having_columns = list(columns)
+        for item in self.state.select_items:
+            if item.kind == "column" and item.aggregate:
+                expr = f"{item.aggregate}({item.table}.{item.column})"
+                having_columns.append((expr, "", expr))
+            elif item.kind == "expression" and item.expression:
+                having_columns.append((item.expression, "", item.expression))
+        self.having_panel.set_columns(having_columns)
+
+    def _on_filters_changed(self):
+        self._refresh_sql_preview()
+
+    def _on_group_order_limit_changed(self):
+        self._refresh_sql_preview()
+
+    # ── SQL sync (VQB.5) ─────────────────────────────────────────────────
+
+    def _refresh_sql_preview(self):
+        self._last_sql = build_sql(self.state)
+        self.sql_preview.setPlainText(self._last_sql)
+
+    def _copy_sql(self):
+        if not self._last_sql:
+            return
+        QApplication.clipboard().setText(self._last_sql)
+        self.status_label.setText("SQL copied to clipboard.")
+
+    def _on_run_clicked(self):
+        if not self._last_sql:
+            QMessageBox.information(self, "Run", "Add at least one table first.")
+            return
+        self.run_requested.emit(self._last_sql)
+
+    # ── Persistence (VQB.6) ──────────────────────────────────────────────
+
+    def _positions_snapshot(self) -> dict:
+        return {name: [node.pos().x(), node.pos().y()] for name, node in self._nodes.items()}
+
+    def _save_query(self):
+        default_name = ""
+        if self._loaded_query_id:
+            existing = saved_visual_queries.get(self._loaded_query_id)
+            default_name = existing.get("name", "") if existing else ""
+        name, ok = QInputDialog.getText(self, "Save Visual Query", "Name:", text=default_name)
+        if not ok or not name.strip():
+            return
+        builder_state = self.state.to_dict()
+        positions = self._positions_snapshot()
+        if self._loaded_query_id and saved_visual_queries.get(self._loaded_query_id):
+            saved_visual_queries.update(
+                self._loaded_query_id, name=name.strip(), builder_state=builder_state,
+                positions=positions, sql=self._last_sql)
+        else:
+            entry = saved_visual_queries.add(
+                name.strip(), self._config.get("id", ""), self._config.get("database", ""),
+                builder_state, positions, self._last_sql)
+            self._loaded_query_id = entry["id"]
+        self.status_label.setText(f"Saved “{name.strip()}”.")
+
+    def _populate_saved_menu(self):
+        self._saved_menu.clear()
+        entries = saved_visual_queries.for_connection(self._config.get("id", ""))
+        if not entries:
+            empty = self._saved_menu.addAction("(no saved visual queries)")
+            empty.setEnabled(False)
+            return
+        for entry in entries:
+            row = QMenu(entry.get("name", "Untitled"), self._saved_menu)
+            open_action = row.addAction("Open")
+            open_action.triggered.connect(lambda _checked=False, e=entry: self._load_saved_query(e))
+            delete_action = row.addAction("Delete")
+            delete_action.triggered.connect(lambda _checked=False, e=entry: self._delete_saved_query(e))
+            self._saved_menu.addMenu(row)
+
+    def _load_saved_query(self, entry: dict):
+        for name in list(self._nodes):
+            self.remove_table(name)
+
+        # Parse the saved state, then replay it onto a fresh, empty canvas
+        # rather than mutating self.state in place: add_table()/
+        # _add_join_edge() are what actually build the QGraphicsScene
+        # nodes/edges, and they read from self.state as they go — so
+        # self.state starts empty again here, and tables/joins are
+        # (re)added via the normal add-table path, positioned from the
+        # saved snapshot afterward.
+        loaded_state = QueryBuilderState.from_dict(entry.get("builder_state"))
+        positions = entry.get("positions") or {}
+
+        self.state = QueryBuilderState()
+        self.select_panel.set_state(self.state)
+        self.where_panel.set_root(loaded_state.where_root)
+        self.having_panel.set_root(loaded_state.having_root)
+        self.group_order_limit_panel.set_state(self.state)
+
+        self._suppress_fk_suggestions = True
+        try:
+            for table_name in loaded_state.table_names:
+                self.add_table(table_name)
+                node = self._nodes.get(table_name)
+                pos = positions.get(table_name)
+                if node is not None and pos:
+                    node.setPos(pos[0], pos[1])
+            for join in loaded_state.joins:
+                self._add_join_edge(join)
+        finally:
+            self._suppress_fk_suggestions = False
+
+        self.state.select_items = loaded_state.select_items
+        self.state.where_root = loaded_state.where_root
+        self.state.having_root = loaded_state.having_root
+        self.state.group_by = loaded_state.group_by
+        self.state.order_by = loaded_state.order_by
+        self.state.limit = loaded_state.limit
+
+        self.select_panel.refresh(self._graph, list(self._nodes))
+        self._refresh_filter_and_group_columns()
+        self.where_panel.refresh()
+        self.having_panel.refresh()
+        self.group_order_limit_panel.refresh()
+        self._refresh_sql_preview()
+        self.minimap.refresh_fit()
+        self._update_minimap_tracking()
+
+        self._loaded_query_id = entry.get("id")
+        self.status_label.setText(f"Opened “{entry.get('name', 'Untitled')}”.")
+
+    def _delete_saved_query(self, entry: dict):
+        confirm = QMessageBox.question(
+            self, "Delete Saved Query", f"Delete “{entry.get('name', 'Untitled')}”?")
+        if confirm != QMessageBox.Yes:
+            return
+        saved_visual_queries.delete(entry["id"])
+        if self._loaded_query_id == entry.get("id"):
+            self._loaded_query_id = None
 
     # ── selection / view controls (shared logic, see ErdDialog) ─────────
 

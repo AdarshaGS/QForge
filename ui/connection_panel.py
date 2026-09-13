@@ -2023,18 +2023,34 @@ class ConnectionPanel(QWidget):
         dlg.activateWindow()
 
     def open_query_builder(self):
-        """Open the Visual Query Builder canvas (VQB.2, issue #192). Builds
-        its own dedicated connection (services/erd_model.py), same as
-        open_erd_view — never touches self.db_service. Entitlements gating
-        lands in VQB.6 (issue #196); unrestricted for now."""
+        """Open the Visual Query Builder canvas (VQB.2-VQB.6, issues
+        #192-#196). Builds its own dedicated connection
+        (services/erd_model.py), same as open_erd_view — never touches
+        self.db_service. Pro-gated as a whole feature (VQB.6, issue #196),
+        same pattern as Schema/Data Compare."""
         if not self.db_service or not self.db_service.connection:
             QMessageBox.information(self, "Visual Query Builder", "Connect to a database first.")
             return
+        if not require_pro(Feature.VISUAL_QUERY_BUILDER, "Visual Query Builder", self):
+            return
         dlg = QueryBuilderDialog(dict(self.config), is_dark=(self.current_theme == "dark"), parent=self)
+        dlg.run_requested.connect(lambda sql: self._run_visual_query(sql))
         dlg.setAttribute(Qt.WA_DeleteOnClose)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+
+    def _run_visual_query(self, sql: str):
+        """QueryBuilderDialog's "Run" button (VQB.5, issue #195) — hands the
+        generated SQL to a normal query tab and runs it through the same
+        execution pipeline as hand-written SQL (_run_query_in_tab), rather
+        than a parallel execution path. Mirrors _open_ai_nl_to_sql's
+        insertPlainText wiring, plus actually running it."""
+        tab = self.add_new_tab()
+        if tab is None:
+            return
+        tab.editor.setPlainText(sql)
+        self._run_query_in_tab(tab)
 
     def _find_table_usages(self, table_name: str):
         """Issue #236 — lists foreign keys referencing *table_name* plus

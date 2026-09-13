@@ -35,6 +35,7 @@ def test_free_bundled_defaults(tmp_path, monkeypatch):
     assert ent.is_enabled(Feature.SCHEMA_COMPARE) is False
     assert ent.is_enabled(Feature.ADVANCED_ERD) is False
     assert ent.is_enabled(Feature.DATA_COMPARE) is False
+    assert ent.is_enabled(Feature.VISUAL_QUERY_BUILDER) is False
 
 
 def test_pro_bundled_defaults(tmp_path, monkeypatch):
@@ -51,6 +52,7 @@ def test_pro_bundled_defaults(tmp_path, monkeypatch):
     assert ent.is_enabled(Feature.SCHEMA_COMPARE) is True
     assert ent.is_enabled(Feature.ADVANCED_ERD) is True
     assert ent.is_enabled(Feature.DATA_COMPARE) is True
+    assert ent.is_enabled(Feature.VISUAL_QUERY_BUILDER) is True
 
 
 def test_apply_remote_config_overrides_only_provided_keys(tmp_path, monkeypatch):
@@ -97,6 +99,7 @@ def test_apply_remote_config_can_explicitly_free_a_pro_only_feature(tmp_path, mo
 
     assert ent.is_enabled(Feature.SCHEMA_COMPARE) is True
     assert ent.is_enabled(Feature.ADVANCED_ERD) is True
+    assert ent.is_enabled(Feature.VISUAL_QUERY_BUILDER) is True
 
 
 def test_all_features_free_toggle_grants_pro_to_free_edition(tmp_path, monkeypatch):
@@ -114,3 +117,4 @@ def test_all_features_free_toggle_grants_pro_to_free_edition(tmp_path, monkeypat
     assert ent.is_enabled(Feature.ADVANCED_ERD) is True
     assert ent.is_enabled(Feature.DATA_COMPARE) is True
     assert ent.is_enabled(Feature.IMPACT_ANALYSIS) is True
+    assert ent.is_enabled(Feature.VISUAL_QUERY_BUILDER) is True

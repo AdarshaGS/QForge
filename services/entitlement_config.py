@@ -53,7 +53,10 @@ PRO_LIMITS = {
     "query_history": None,
 }
 
-PRO_ONLY_FEATURES = {"schema_compare", "advanced_erd", "data_compare", "impact_analysis"}
+PRO_ONLY_FEATURES = {
+    "schema_compare", "advanced_erd", "data_compare", "impact_analysis",
+    "visual_query_builder",
+}
 
 PRICING_URL = "https://qforge-licensing-production.up.railway.app/#pricing"
 PRICE_LABEL = "$49/lifetime"
@@ -65,6 +68,7 @@ PRO_BENEFITS = [
     "Schema Compare",
     "Data Compare",
     "Impact Analysis (find usages / dependents)",
+    "Visual Query Builder",
     "Priority support",
 ]
 

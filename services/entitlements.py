@@ -44,6 +44,7 @@ class Feature(Enum):
     ADVANCED_ERD = "advanced_erd"
     DATA_COMPARE = "data_compare"
     IMPACT_ANALYSIS = "impact_analysis"
+    VISUAL_QUERY_BUILDER = "visual_query_builder"
 
 
 class Entitlements:
