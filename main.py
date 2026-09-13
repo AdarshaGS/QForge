@@ -949,9 +949,35 @@ class MainWindow(QMainWindow):
             )
 
     def closeEvent(self, event):
+        if not self._confirm_quit_with_pending_work():
+            event.ignore()
+            return
         self._save_window_geometry()
         self.save_session()
         event.accept()
+
+    def _confirm_quit_with_pending_work(self) -> bool:
+        """Warn before quitting if any connection has an open manual
+        transaction (silently rolled back on quit, same as _close_tab's
+        existing per-tab warning) or a query still running in the
+        background (issue #281) — closeEvent previously accepted
+        unconditionally. Returns True if it's safe to proceed."""
+        has_tx = any(p.has_open_transactions() for p in self._panels)
+        has_running = any(p.has_running_query() for p in self._panels)
+        if not has_tx and not has_running:
+            return True
+
+        lines = []
+        if has_tx:
+            lines.append("• An open transaction will be rolled back.")
+        if has_running:
+            lines.append("• A query is still running.")
+        reply = QMessageBox.question(
+            self, "Quit QForge?",
+            "Quitting now:\n" + "\n".join(lines) + "\n\nQuit anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
 
     # ─── Menu bar ────────────────────────────────────────────────────────────
 

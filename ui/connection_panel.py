@@ -2862,6 +2862,16 @@ class ConnectionPanel(QWidget):
                 return True
         return False
 
+    def has_running_query(self) -> bool:
+        """True if any tab in this connection has a query currently
+        executing on a background thread — used alongside
+        has_open_transactions() to warn before quitting the app while
+        work is still in flight (issue #281)."""
+        for i in range(self.tabs.count()):
+            if getattr(self.tabs.widget(i), '_query_running', False):
+                return True
+        return False
+
     def open_query_analyzer(self, focus_cost_tab: bool = False, focus_ai_tab: bool = False,
                              query: str = None, cost_detail: dict = None,
                              profile_detail: dict = None, history_entry_id: str = None):
