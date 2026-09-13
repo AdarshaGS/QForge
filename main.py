@@ -4,7 +4,7 @@ import json
 import signal
 import time
 
-from PySide6.QtCore import Qt, QSize, QEvent
+from PySide6.QtCore import Qt, QSize, QEvent, QByteArray
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabBar, QStackedWidget, QPushButton, QMessageBox, QProgressDialog,
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QColor, QIcon, QAction
 
+from services import preferences
 from services.db_service import DbService
 from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
@@ -351,8 +352,9 @@ class MainWindow(QMainWindow):
 
     def _init_ui(self):
         self.setWindowTitle("QForge")
-        self.resize(1600, 900)
         self.setMinimumSize(1200, 700)
+        if not self._restore_window_geometry():
+            self.resize(1600, 900)
 
         self._create_menu_bar()
 
@@ -762,6 +764,48 @@ class MainWindow(QMainWindow):
         elif action == close_others_act:
             self._close_other_connections(keep_index=idx)
 
+    # ─── Window geometry ─────────────────────────────────────────────────────
+
+    _GEOMETRY_PREF_KEY = "window.geometry"
+
+    def _save_window_geometry(self):
+        """Persist size/position/maximized/fullscreen state (issue #282) —
+        QMainWindow.saveGeometry() encodes all of that in one QByteArray.
+        Stored via services.preferences (the existing flat-JSON-under-
+        app_data_dir() store), hex-encoded since JSON can't hold raw
+        bytes."""
+        try:
+            preferences.set(self._GEOMETRY_PREF_KEY, bytes(self.saveGeometry()).hex())
+        except Exception as ex:
+            logger.warning(f"Failed to save window geometry: {ex}")
+
+    def _restore_window_geometry(self) -> bool:
+        """Restore geometry saved by _save_window_geometry(), if any and if
+        still usable. Returns False (caller falls back to the default
+        1600x900) when there's nothing saved, the saved bytes don't parse,
+        or — the off-screen sanity check — the restored frame no longer
+        overlaps any currently connected screen (e.g. it was saved while on
+        an external monitor that's now disconnected), which would
+        otherwise leave the window unreachable."""
+        raw = preferences.get(self._GEOMETRY_PREF_KEY)
+        if not raw:
+            return False
+        try:
+            geometry = QByteArray(bytes.fromhex(raw))
+        except (ValueError, TypeError):
+            return False
+        if not self.restoreGeometry(geometry):
+            return False
+        screens = QApplication.instance().screens()
+        if screens and not any(s.geometry().intersects(self.frameGeometry()) for s in screens):
+            # Off-screen (e.g. saved while on a now-disconnected external
+            # monitor) — restoreGeometry() already moved the window there,
+            # so explicitly pull it back onto the primary screen rather
+            # than leaving it wherever that placed it.
+            self.move(100, 100)
+            return False
+        return True
+
     # ─── Session ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -905,6 +949,7 @@ class MainWindow(QMainWindow):
             )
 
     def closeEvent(self, event):
+        self._save_window_geometry()
         self.save_session()
         event.accept()
 
