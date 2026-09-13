@@ -201,6 +201,18 @@ def test_replace_and_load_data_are_classified_as_writes():
     assert c.is_write is True
 
 
+def test_merge_is_classified_as_a_write():
+    # issue #287: sqlparse's get_type() reports "MERGE" directly (not
+    # UNKNOWN), but it was missing from WRITE_KINDS entirely — a Postgres
+    # MERGE silently bypassed the read-only guard.
+    sql = ("MERGE INTO users USING new_users ON users.id = new_users.id "
+           "WHEN MATCHED THEN UPDATE SET x = 1")
+    c = classify(sql)
+    assert c.kind == "MERGE"
+    assert c.is_write is True
+    assert c.kind in READ_ONLY_BLOCKED_KINDS
+
+
 def test_procedure_calls_are_not_writes_but_are_read_only_blocked():
     # Not folded into WRITE_KINDS: execute_multi_query() dispatches writes
     # through execute_update(), which would silently drop a result set a
@@ -218,6 +230,8 @@ def test_read_only_blocked_kinds_covers_every_write_kind():
         "UPDATE users SET x=1 WHERE id=1",
         "DELETE FROM users WHERE id=1",
         "REPLACE INTO users (id) VALUES (1)",
+        "MERGE INTO users USING new_users ON users.id = new_users.id "
+        "WHEN MATCHED THEN UPDATE SET x = 1",
         "CREATE TABLE x (id INT)",
         "DROP TABLE users",
         "ALTER TABLE x ADD COLUMN y INT",
@@ -228,6 +242,32 @@ def test_read_only_blocked_kinds_covers_every_write_kind():
         "LOAD DATA INFILE 'x.csv' INTO TABLE users",
     ):
         assert classify(sql).kind in READ_ONLY_BLOCKED_KINDS, sql
+
+
+def test_read_only_guard_blocks_obfuscated_and_vendor_specific_writes():
+    """issue #287's exact audit list: a write hidden behind a leading
+    comment, wrapped in a CTE, vendor-specific syntax (MySQL REPLACE INTO,
+    Postgres MERGE, INSERT ... ON CONFLICT), mixed-case/unusual whitespace
+    keywords, and a write that isn't the first statement in a script — all
+    must classify as read-only-blocked."""
+    cases = [
+        "-- setup\nDELETE FROM users WHERE id = 1",
+        "/* block comment */ DELETE FROM users WHERE id = 1",
+        "WITH x AS (SELECT 1) DELETE FROM users WHERE id IN (SELECT * FROM x)",
+        "WITH x AS (SELECT 1) UPDATE users SET x = 1",
+        "REPLACE INTO users (id, name) VALUES (1, 'a')",
+        "MERGE INTO users USING new_users ON users.id = new_users.id "
+        "WHEN MATCHED THEN UPDATE SET x = 1",
+        "INSERT INTO users (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET x = 1",
+        "INSERT INTO users (id) VALUES (1) ON DUPLICATE KEY UPDATE x = 1",
+        "  UpDaTe\tusers set x=1",
+    ]
+    for sql in cases:
+        assert classify(sql).kind in READ_ONLY_BLOCKED_KINDS, sql
+
+    # A write that isn't the first statement in a multi-statement script.
+    stmts = split_statements("SELECT 1; DELETE FROM users WHERE id = 1;")
+    assert [classify(s).kind in READ_ONLY_BLOCKED_KINDS for s in stmts] == [False, True]
 
 
 def test_read_only_blocked_kinds_excludes_reads_and_transaction_control():

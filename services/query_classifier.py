@@ -26,7 +26,7 @@ from sqlparse.tokens import Keyword, DML
 grouping.MAX_GROUPING_TOKENS = 100_000
 
 WRITE_KINDS = {
-    "INSERT", "UPDATE", "DELETE", "REPLACE",
+    "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE",
     "CREATE", "DROP", "ALTER", "TRUNCATE", "RENAME", "GRANT", "REVOKE",
     "LOAD",
 }
