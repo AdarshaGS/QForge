@@ -764,12 +764,25 @@ class MainWindow(QMainWindow):
 
     # ─── Session ─────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _sanitized_session_config(config: dict) -> dict:
+        """Strip resolved plaintext DB/SSH passwords before persisting to
+        session.json — unlike connections.json, this file has no keychain
+        protection, and every quit/close would otherwise write live
+        credentials to disk in the clear (issue #280)."""
+        sanitized = dict(config)
+        sanitized.pop("password", None)
+        ssh = sanitized.get("ssh_tunnel")
+        if isinstance(ssh, dict) and "password" in ssh:
+            sanitized["ssh_tunnel"] = {**ssh, "password": None}
+        return sanitized
+
     def save_session(self):
         data = []
         for panel in self._panels:
             data.append({
                 "connection_name": panel.label,
-                "config": panel.config,
+                "config": self._sanitized_session_config(panel.config),
                 "tabs": panel.get_session_tabs()
             })
         try:
