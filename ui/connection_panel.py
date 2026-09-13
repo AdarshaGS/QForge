@@ -2405,8 +2405,9 @@ class ConnectionPanel(QWidget):
         # Load FK map so right-click "Go to …" works in the result grid
         self._wire_result_fk(tab, table_name)
         cost = getattr(tab, '_last_cost_estimate', None)
+        history_query = getattr(tab, '_last_query_template', query)
         tab._last_history_entry_id = self.query_history.add_query(
-            query, self.config["name"], len(df), elapsed,
+            history_query, self.config["name"], len(df), elapsed,
             cost_score=cost.score if cost and not cost.error else None,
             cost_label=cost.label if cost and not cost.error else None,
             cost_detail=query_cost.estimate_to_dict(cost),
@@ -2444,8 +2445,9 @@ class ConnectionPanel(QWidget):
         # within a single estimate's own issue list.
         costs = [cost for _, _, cost in results if cost is not None]
         worst_cost = max(costs, key=lambda c: c.score) if costs else None
+        history_query = getattr(tab, '_last_query_template', query)
         self.query_history.add_query(
-            query, self.config["name"], total_rows, elapsed,
+            history_query, self.config["name"], total_rows, elapsed,
             cost_score=worst_cost.score if worst_cost else None,
             cost_label=worst_cost.label if worst_cost else None,
             cost_detail=query_cost.estimate_to_dict(worst_cost),
@@ -2682,6 +2684,12 @@ class ConnectionPanel(QWidget):
                 "Still connecting to the database — try again in a moment.")
             return
 
+        # The as-typed query (with {{param}} placeholders still in place, if
+        # any) — kept separate from the resolved query used for execution so
+        # a secret-shaped param value never gets written to query history
+        # (issue #289); a re-opened history entry re-prompts for it instead.
+        template_query = query
+
         if override_query is None:
             # ── Parameterised queries: prompt for {{var}} values ───────────────
             resolved = self._prompt_params(query)
@@ -2698,6 +2706,7 @@ class ConnectionPanel(QWidget):
 
         tab._query_running = True
         tab._last_query    = query
+        tab._last_query_template = template_query
         tab._last_cost_estimate = None
         tab._last_history_entry_id = None
         if hasattr(tab, 'clear_cost_estimate'):
