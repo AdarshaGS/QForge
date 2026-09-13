@@ -29,7 +29,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QShortcut, QKeySequence, QCursor, QFont
 
 from services.db_service import DbService
-from services import query_cost
+from services import ai_client, ai_prompts, preferences, query_cost
+from ui.ai_async import AiCallManager
 from services import mock_data_generator as mock_gen
 from services.query_history import QueryHistory
 from services.saved_queries import SavedQueries
@@ -588,6 +589,10 @@ class ConnectionPanel(QWidget):
         self.current_theme = "dark"
         self._available_dbs: list[str] = []
         self._available_schemas: list[str] = []
+        # Cached-and-reopened (not recreated) Schema Q&A chat dialog (issue
+        # #345) — deliberate exception to the open_erd_view/open_query_builder
+        # recreate-per-open pattern, so scrollback survives close+reopen.
+        self._ai_chat_dialog = None
 
         # Quick Search recency signal (issue #242): monotonic counter per
         # table/view name, bumped on every open_table_view() call. In-memory
@@ -2274,6 +2279,10 @@ class ConnectionPanel(QWidget):
         # Wire inline-edit commit: execute SQL with our db_service
         tab.commit_sql.connect(lambda sqls, t=tab: self._execute_commit_sql(sqls, t))
         tab.open_analyzer.connect(lambda: self.open_query_analyzer(focus_cost_tab=True))
+        tab._ai_call_mgr = AiCallManager(tab)
+        tab.ai_fix_requested.connect(lambda t=tab: self._on_ai_fix_requested(t))
+        tab.ask_ai_requested.connect(lambda t=tab: self._open_ai_nl_to_sql(t))
+        tab.open_ai_suggestions.connect(lambda t=tab: self._open_ai_suggestions_for_tab(t))
         # Push current schema so autocomplete works immediately
         tab.set_schema(self.all_tables, self._column_cache,
                         column_details=self._column_details_cache,
@@ -2502,6 +2511,42 @@ class ConnectionPanel(QWidget):
         tab._last_cost_estimate = estimate
         if hasattr(tab, 'set_cost_estimate'):
             tab.set_cost_estimate(estimate)
+        self._maybe_start_proactive_ai_optimize(tab, estimate)
+
+    def _maybe_start_proactive_ai_optimize(self, tab, estimate):
+        """Opt-in (Preferences → AI Assistance → "Automatically suggest
+        optimizations after running a query") — reuses the CostEstimate
+        _on_query_cost_ready already has (same rule-based Issue list the
+        AI Suggestions tab's manual "Suggest Optimizations" sends) instead
+        of a second EXPLAIN round-trip. Silent on failure/no-suggestions —
+        this is a background nudge, not a user-initiated action, so
+        there's nothing to report back for those cases."""
+        if not ai_client.is_enabled() or not preferences.get("ai.proactive_optimize", False):
+            return
+        if not estimate or getattr(estimate, "error", ""):
+            return
+        if not hasattr(tab, "_ai_call_mgr") or tab._ai_call_mgr.busy:
+            return
+        sql = tab.get_query().strip() if hasattr(tab, "get_query") else ""
+        if not sql or getattr(tab, "_last_ai_optimize_query", None) == sql:
+            return  # unchanged since the last auto-check — don't re-spend a call
+        tab._last_ai_optimize_query = sql
+
+        dialect = estimate.dialect or getattr(self.db_service, "db_type", "") or ""
+        tables = list(set(query_cost._parse_table_aliases(sql).values()))
+        schema_ctx = query_cost.fetch_schema_context(self.db_service, tables)
+        prompt, schema = ai_prompts.build_optimize_prompt(
+            sql, dialect, schema_ctx, list(estimate.issues))
+        tab._ai_call_mgr.start(
+            prompt, on_done=lambda result, t=tab: self._on_proactive_optimize_done(t, result),
+            json_schema=schema, timeout=45.0,
+        )
+
+    def _on_proactive_optimize_done(self, tab, result):
+        if not result.ok or not result.data:
+            return
+        if hasattr(tab, "set_ai_suggestions"):
+            tab.set_ai_suggestions(result.data.get("suggestions") or [])
 
     def _on_query_profile_ready(self, tab, profile):
         """Receives worker `profile_ready` signal via bridge — only fires
@@ -2622,15 +2667,6 @@ class ConnectionPanel(QWidget):
             return
 
         if override_query is None:
-            # Format on run if user has the toggle active
-            if getattr(tab, '_format_on_run', False):
-                import sqlparse
-                try:
-                    query = sqlparse.format(query, reindent=True, keyword_case="upper")
-                    tab.editor.setPlainText(query)
-                except Exception:
-                    pass  # query too large for sqlparse — run as-is
-
             # ── Parameterised queries: prompt for {{var}} values ───────────────
             resolved = self._prompt_params(query)
             if resolved is None:
@@ -2650,6 +2686,8 @@ class ConnectionPanel(QWidget):
         tab._last_history_entry_id = None
         if hasattr(tab, 'clear_cost_estimate'):
             tab.clear_cost_estimate()
+        if hasattr(tab, 'clear_ai_suggestions'):
+            tab.clear_ai_suggestions()
         if hasattr(tab, 'clear_for_run'):
             tab.clear_for_run()
         tab._cancel_flag   = threading.Event()
@@ -2799,9 +2837,9 @@ class ConnectionPanel(QWidget):
                 return True
         return False
 
-    def open_query_analyzer(self, focus_cost_tab: bool = False, query: str = None,
-                             cost_detail: dict = None, profile_detail: dict = None,
-                             history_entry_id: str = None):
+    def open_query_analyzer(self, focus_cost_tab: bool = False, focus_ai_tab: bool = False,
+                             query: str = None, cost_detail: dict = None,
+                             profile_detail: dict = None, history_entry_id: str = None):
         """Open the consolidated Analyze Query dialog (Cost & Profile +
         Compare Queries), pre-populated with *query* — or, when omitted,
         the current tab's query (the original behavior, used by the
@@ -2834,7 +2872,81 @@ class ConnectionPanel(QWidget):
                                    connection_name=self.config.get("name", ""), parent=self)
         if focus_cost_tab:
             dlg.show_cost_tab()
+        if focus_ai_tab:
+            dlg.show_ai_tab()
         dlg.show()
+        return dlg
+
+    def _open_ai_suggestions_for_tab(self, tab):
+        """Status-bar "✨ N AI suggestions" badge click — reopens the
+        Analyze Query dialog on the AI Suggestions tab for this tab's
+        query, and re-populates it with the suggestions already computed
+        by the proactive background check rather than making the user
+        click "Suggest Optimizations" again for something already known."""
+        query = tab.get_query().strip() if hasattr(tab, 'get_query') else ""
+        dlg = self.open_query_analyzer(focus_ai_tab=True, query=query)
+        suggestions = getattr(tab, '_last_ai_suggestions', None)
+        if dlg is not None and suggestions and hasattr(dlg, '_ai_tab'):
+            dlg._ai_tab.show_suggestions(suggestions)
+
+    def _on_ai_fix_requested(self, tab):
+        """Issue #342 — SqlTab's error-card "Ask AI to Fix This" button.
+        Builds the fix prompt here (not in SqlTab) since only ConnectionPanel
+        has db_service for schema context; the actual call and rendering
+        happen back on `tab` via show_ai_fix_loading()/show_ai_fix_result()."""
+        if not self.db_service or not self.db_service.connection:
+            return
+        if not ai_client.is_enabled():
+            return
+        if tab._ai_call_mgr.busy:
+            return
+        sql = tab._last_error_query
+        error_message = tab._last_error_message
+        if not sql or not error_message:
+            return
+
+        tab.show_ai_fix_loading()
+        dialect = getattr(self.db_service, "db_type", "") or ""
+        tables = list(set(query_cost._parse_table_aliases(sql).values()))
+        schema_ctx = query_cost.fetch_schema_context(self.db_service, tables)
+        prompt, schema = ai_prompts.build_fix_error_prompt(sql, error_message, dialect, schema_ctx)
+        tab._ai_call_mgr.start(
+            prompt, on_done=lambda result, t=tab: t.show_ai_fix_result(result),
+            json_schema=schema, timeout=45.0,
+        )
+
+    def open_schema_chat(self):
+        """Issue #345 — Database menu's "Ask About Schema…". Cached and
+        reopened, not recreated, so the conversation survives closing and
+        reopening the dialog within this connection session — see the
+        _ai_chat_dialog docstring at __init__."""
+        if not self.db_service or not self.db_service.connection:
+            QMessageBox.information(self, "Ask About Schema", "Connect to a database first.")
+            return
+        if self._ai_chat_dialog is None:
+            from ui.ai_schema_chat_dialog import AiSchemaChatDialog
+            self._ai_chat_dialog = AiSchemaChatDialog(
+                self.db_service, column_details=self._column_details_cache,
+                foreign_keys=self._foreign_keys_cache, parent=self)
+        self._ai_chat_dialog.show()
+        self._ai_chat_dialog.raise_()
+        self._ai_chat_dialog.activateWindow()
+
+    def _open_ai_nl_to_sql(self, tab):
+        """Issue #344 — SqlTab toolbar's "✨ Ask AI" button."""
+        if not self.db_service or not self.db_service.connection:
+            QMessageBox.information(self, "Ask AI", "Connect to a database first.")
+            return
+        from ui.ai_nl_to_sql_dialog import AiNlToSqlDialog
+        known_tables = list(self.all_tables or []) + list(getattr(self, "all_views", None) or [])
+        dlg = AiNlToSqlDialog(self.db_service, self._dialect_display_name(), known_tables,
+                               column_details=self._column_details_cache,
+                               foreign_keys=self._foreign_keys_cache, parent=self)
+        dlg.sql_accepted.connect(lambda sql, t=tab: t.editor.insertPlainText(sql))
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def run_all_statements(self):
         """Database menu / Ctrl+Shift+Return: run every statement in the
@@ -4424,7 +4536,6 @@ class ConnectionPanel(QWidget):
                     "type": "query",
                     "name": self.tabs.tabText(i),
                     "query": query,
-                    "pinned": getattr(w, 'pinned', False),
                 })
         return result
 
@@ -4451,12 +4562,6 @@ class ConnectionPanel(QWidget):
                     self.tabs.setTabText(idx, label)
                     if tab.get("query"):
                         w.set_query(tab["query"])
-                    if tab.get("pinned") and hasattr(w, 'pin_btn'):
-                        w.pin_btn.setChecked(True)
-                        w.pinned = True
-                        # Add ★ prefix to tab label if not already
-                        if not label.startswith("★ "):
-                            self.tabs.setTabText(idx, f"★ {label}")
             except Exception as ex:
                 logger.error(f"Failed to restore tab {tab}: {ex}")
 
@@ -4526,44 +4631,6 @@ class ConnectionPanel(QWidget):
 
         t = threading.Thread(target=_ping, daemon=True)
         t.start()
-
-    # ─── Pinned tab persistence ───────────────────────────────────────────────────
-
-    def _save_pinned_tabs(self):
-        """Persist all pinned SQL tabs to pinned_tabs.json."""
-        from utils import pinned_tabs as _pt
-        conn_name = self.label
-        all_pinned = _pt.load()
-        pinned_list = []
-        for i in range(self.tabs.count()):
-            w = self.tabs.widget(i)
-            if isinstance(w, SqlTab) and getattr(w, 'pinned', False):
-                pinned_list.append({
-                    "name": self.tabs.tabText(i).lstrip("★ "),
-                    "query": w.get_query() if hasattr(w, 'get_query') else "",
-                })
-        all_pinned[conn_name] = pinned_list
-        _pt.save(all_pinned)
-
-    def restore_pinned_tabs(self):
-        """Reopen pinned tabs from pinned_tabs.json (called on startup).
-        Stops once the Free-tier tab cap (issue #154) is hit — same
-        silent-restore treatment as restore_session_tabs."""
-        from utils import pinned_tabs as _pt
-        conn_name = self.label
-        pinned_list = _pt.load().get(conn_name, [])
-        for entry in pinned_list:
-            w = self.add_new_tab(silent=True)
-            if w is None:
-                break
-            idx = self.tabs.indexOf(w)
-            name = entry.get("name", f"Tab {idx + 1}")
-            self.tabs.setTabText(idx, f"★ {name}")
-            if entry.get('query'):
-                w.set_query(entry['query'])
-            if hasattr(w, 'pin_btn'):
-                w.pin_btn.setChecked(True)
-                w.pinned = True
 
     # ─── Public helpers ───────────────────────────────────────────────────────
 

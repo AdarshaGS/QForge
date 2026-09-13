@@ -106,6 +106,19 @@ class SqlTab(QWidget):
     # Emitted when the status-bar cost badge is clicked — parent opens the
     # Analyze Query dialog's Cost & Profile tab for this tab's query
     open_analyzer = Signal()
+    # Emitted when the error card's "Ask AI to Fix This" button is clicked —
+    # parent (ConnectionPanel, which owns db_service) builds the fix prompt
+    # and calls back into show_ai_fix_loading()/show_ai_fix_result() below
+    # (issue #342). Free for everyone; gated by whether the local Claude
+    # CLI is enabled+available, never services/entitlements.py.
+    ai_fix_requested = Signal()
+    # Emitted when the toolbar's "✨ Ask AI" button is clicked — parent
+    # (ConnectionPanel) opens AiNlToSqlDialog, since only it has db_service
+    # and the connection's known table/view names (issue #344).
+    ask_ai_requested = Signal()
+    # Emitted when the proactive-AI-suggestions status-bar badge is
+    # clicked — parent opens the Analyze Query dialog's AI Suggestions tab.
+    open_ai_suggestions = Signal()
     # Emitted by Ctrl+Shift+Return — parent runs every statement in the
     # editor regardless of selection/cursor position, distinct from plain
     # Run (Ctrl+Return / the Run button), which scopes to the selection or
@@ -128,11 +141,11 @@ class SqlTab(QWidget):
         self._result_sort_col  = -1
         self._result_sort_asc  = True
 
-        # Extra features
-        self._format_on_run = False   # auto-beautify SQL before executing
-        self._prev_df       = None    # previous result set for diff
-        self._diff_active   = False   # diff mode toggle
-        self.pinned         = False   # favourite / pinned tab
+        self._last_error_message = ""   # for "Ask AI to Fix This" (issue #342)
+        self._last_error_query   = ""
+        self._pending_ai_fix_sql = None
+        self._last_ai_suggestions = None   # for the proactive-suggestions badge
+        self._last_ai_optimize_query = None  # avoids re-triggering on an unchanged re-run
 
         self.init_ui()
         
@@ -182,14 +195,24 @@ class SqlTab(QWidget):
         self._validation_selections: list = []
         self._validation_issues: list = []
         self._find_selections: list = []
+        # Cmd+D multi-select: [start, end] offset pairs, one per active
+        # occurrence — see _select_next_occurrence / _apply_multi_region_edit.
+        self._multi_regions: list = []
+        self._multi_occurrence_selections: list = []
         self.editor.cursorPositionChanged.connect(self._apply_extra_selections)
 
         # Snippets
         self.snippet_manager = SnippetManager()
         self.completer.set_snippets(self.snippet_manager.get_all())
 
-        # Install event filter for better control
+        # Install event filter for better control. QPlainTextEdit is a
+        # QAbstractScrollArea: keyboard/focus events go to self.editor
+        # itself, but mouse events (clicks) are delivered to its viewport
+        # widget instead — installing only on self.editor meant a real
+        # mouse click never reached the Cmd+D multi-select "click ends
+        # it" check below (self.editor.viewport() is a different QObject).
         self.editor.installEventFilter(self)
+        self.editor.viewport().installEventFilter(self)
 
         # Ctrl/Cmd-click go-to-definition (issue #206)
         self.editor.identifier_clicked.connect(self._go_to_definition)
@@ -203,10 +226,13 @@ class SqlTab(QWidget):
         run_layout.setContentsMargins(6, 4, 6, 4)
         run_layout.setSpacing(6)
 
-        snip_btn = QPushButton("{ } Snippets")
-        snip_btn.setFixedHeight(28)
-        snip_btn.setToolTip("Manage SQL snippets")
-        snip_btn.setStyleSheet("""
+        # ── Ask AI (issue #344, natural-language-to-SQL) ──
+        ask_ai_btn = QPushButton("✨ Ask AI")
+        ask_ai_btn.setFixedHeight(28)
+        ask_ai_btn.setToolTip(
+            "Describe what you want in plain English — Claude drafts the SQL.\n"
+            "Uses your own Claude account/usage.")
+        ask_ai_btn.setStyleSheet("""
             QPushButton {
                 background: transparent;
                 color: #8e8e93;
@@ -215,72 +241,10 @@ class SqlTab(QWidget):
                 padding: 0 12px;
                 font-size: 12px;
             }
-            QPushButton:hover { color: #89d185; border-color: #89d185; }
+            QPushButton:hover { color: #0A84FF; border-color: #0A84FF; }
         """)
-        snip_btn.clicked.connect(self._open_snippet_editor)
-        run_layout.addWidget(snip_btn)
-
-        # ── Format on Run toggle ──
-        self.fmt_run_btn = QPushButton("⌨ Auto-Format")
-        self.fmt_run_btn.setFixedHeight(28)
-        self.fmt_run_btn.setCheckable(True)
-        self.fmt_run_btn.setToolTip("Auto-beautify SQL before every run (Ctrl+Shift+F)")
-        self.fmt_run_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                color: #8e8e93;
-                border: 1px solid #3a3a3c;
-                border-radius: 5px;
-                padding: 0 10px;
-                font-size: 12px;
-            }
-            QPushButton:checked { color: #30d158; border-color: #30d158; }
-            QPushButton:hover   { color: #e5e5ea; border-color: #636366; }
-        """)
-        self.fmt_run_btn.toggled.connect(lambda v: setattr(self, '_format_on_run', v))
-        run_layout.addWidget(self.fmt_run_btn)
-
-        # ── Diff toggle ──
-        self.diff_btn = QPushButton("≠ Diff")
-        self.diff_btn.setFixedHeight(28)
-        self.diff_btn.setCheckable(True)
-        self.diff_btn.setToolTip("Highlight changes between last two query results")
-        self.diff_btn.setEnabled(False)
-        self.diff_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                color: #8e8e93;
-                border: 1px solid #3a3a3c;
-                border-radius: 5px;
-                padding: 0 10px;
-                font-size: 12px;
-            }
-            QPushButton:checked { color: #ff9f0a; border-color: #ff9f0a; }
-            QPushButton:hover   { color: #e5e5ea; border-color: #636366; }
-            QPushButton:disabled { color: #48484a; border-color: #2c2c2e; }
-        """)
-        self.diff_btn.toggled.connect(self._on_diff_toggled)
-        run_layout.addWidget(self.diff_btn)
-
-        # ── Pin / favourite toggle ──
-        self.pin_btn = QPushButton("★")
-        self.pin_btn.setFixedSize(28, 28)
-        self.pin_btn.setCheckable(True)
-        self.pin_btn.setToolTip("Pin this tab — it will reopen on next launch")
-        self.pin_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                color: #636366;
-                border: 1px solid #3a3a3c;
-                border-radius: 5px;
-                padding: 0;
-                font-size: 14px;
-            }
-            QPushButton:checked { color: #ffd60a; border-color: #ffd60a; }
-            QPushButton:hover   { color: #e5e5ea; border-color: #636366; }
-        """)
-        self.pin_btn.toggled.connect(self._on_pin_toggled)
-        run_layout.addWidget(self.pin_btn)
+        ask_ai_btn.clicked.connect(self.ask_ai_requested.emit)
+        run_layout.addWidget(ask_ai_btn)
 
         # ── Transaction controls (Slice 4, ai/load-context.md) ──────────────
         # Tab-scoped: this tab gets its own persistent connection once a
@@ -787,6 +751,85 @@ class SqlTab(QWidget):
         _err_layout.addWidget(self._error_details_section)
         self._error_details_section.hide()   # only shown when a hint matched
 
+        # ── AI fix affordance (issue #342) — visible only when AI features
+        # are enabled (services.ai_client.is_enabled()); actual
+        # install/auth availability is checked by the parent when the
+        # request is handled, not here, to avoid every error card spawning
+        # its own availability-check subprocess.
+        self._ai_fix_btn = QPushButton("✨  Ask AI to Fix This")
+        self._ai_fix_btn.setFixedHeight(28)
+        self._ai_fix_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                color: #0A84FF;
+                border: 1px solid #0A84FF;
+                border-radius: 5px;
+                padding: 0 12px;
+                font-size: 12px;
+                margin-top: 4px;
+            }
+            QPushButton:hover { background: rgba(10, 132, 255, 0.15); }
+            QPushButton:disabled { color: #6e6e73; border-color: #48484a; }
+        """)
+        self._ai_fix_btn.setToolTip(
+            "Ask Claude to diagnose and suggest a fix for this error.\n"
+            "Uses your own Claude account/usage.")
+        self._ai_fix_btn.clicked.connect(self._on_ai_fix_btn_clicked)
+        self._ai_fix_btn.hide()
+        _err_layout.addWidget(self._ai_fix_btn, alignment=Qt.AlignLeft)
+
+        self._ai_fix_section = QWidget()
+        _fix_layout = QVBoxLayout(self._ai_fix_section)
+        _fix_layout.setContentsMargins(0, 6, 0, 0)
+        _fix_layout.setSpacing(4)
+
+        self._ai_fix_status_lbl = QLabel("")
+        self._ai_fix_status_lbl.setWordWrap(True)
+        self._ai_fix_status_lbl.setStyleSheet("color: #8e8e93; font-size: 11px; background: transparent;")
+        _fix_layout.addWidget(self._ai_fix_status_lbl)
+
+        self._ai_fix_snippet = QPlainTextEdit()
+        self._ai_fix_snippet.setReadOnly(True)
+        self._ai_fix_snippet.setFixedHeight(70)
+        self._ai_fix_snippet.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self._ai_fix_snippet.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #1c2b1c;
+                color: #d0d0d0;
+                font-family: Menlo, Consolas, monospace;
+                font-size: 12px;
+                border: 1px solid #2d4a2d;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+        """)
+        self._ai_fix_snippet.hide()
+        _fix_layout.addWidget(self._ai_fix_snippet)
+
+        self._ai_fix_explanation_lbl = QLabel("")
+        self._ai_fix_explanation_lbl.setWordWrap(True)
+        self._ai_fix_explanation_lbl.setStyleSheet("color: #a9b0bd; font-size: 11px; background: transparent;")
+        self._ai_fix_explanation_lbl.hide()
+        _fix_layout.addWidget(self._ai_fix_explanation_lbl)
+
+        _fix_btn_row = QHBoxLayout()
+        self._ai_fix_insert_btn = QPushButton("Insert")
+        self._ai_fix_insert_btn.setFixedHeight(26)
+        self._ai_fix_insert_btn.clicked.connect(self._insert_ai_fix)
+        self._ai_fix_discard_btn = QPushButton("Discard")
+        self._ai_fix_discard_btn.setFixedHeight(26)
+        self._ai_fix_discard_btn.clicked.connect(lambda: self._ai_fix_section.hide())
+        _fix_btn_row.addWidget(self._ai_fix_insert_btn)
+        _fix_btn_row.addWidget(self._ai_fix_discard_btn)
+        _fix_btn_row.addStretch()
+        self._ai_fix_btn_row_widget = QWidget()
+        self._ai_fix_btn_row_widget.setLayout(_fix_btn_row)
+        self._ai_fix_btn_row_widget.hide()
+        _fix_layout.addWidget(self._ai_fix_btn_row_widget)
+
+        _err_layout.addWidget(self._ai_fix_section)
+        self._ai_fix_section.hide()
+
         # Scrollable, not just fixed-size (issue #147/#178): a pathologically
         # long message + hint could otherwise still exceed the splitter's
         # bottom pane with no way to see the rest — the exact class of bug
@@ -942,10 +985,6 @@ class SqlTab(QWidget):
         self.find_only_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
         self.find_only_shortcut.activated.connect(self._toggle_find_bar)
 
-        # Ctrl+Shift+F — toggle format-on-run
-        self.fmt_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
-        self.fmt_shortcut.activated.connect(lambda: self.fmt_run_btn.toggle())
-
         # Add keyboard shortcut for save (Cmd+S)
         self.save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         self.save_shortcut.activated.connect(self.save_changes)
@@ -953,6 +992,12 @@ class SqlTab(QWidget):
         # Add Esc shortcut to hide filter
         self.esc_shortcut = QShortcut(QKeySequence("Esc"), self)
         self.esc_shortcut.activated.connect(self.hide_filter)
+        # Escape also ends Cmd+D multi-select. When the completer popup is
+        # visible, eventFilter's own Key_Escape branch handles this instead
+        # (see the ShortcutOverride comment above it) — this QShortcut path
+        # covers the far more common case where it isn't, in which case the
+        # real KeyPress never reaches eventFilter at all.
+        self.esc_shortcut.activated.connect(self._clear_multi_regions)
 
         # ==================================
         # EVENTS
@@ -1221,23 +1266,13 @@ class SqlTab(QWidget):
     def _apply_extra_selections(self):
         """Merge CodeEditor's own selections (current-line highlight +
         matching-bracket highlight, reset on every cursor move by its
-        cursorPositionChanged handler) with the find-match and
-        schema-validation layers, each tracked in its own list so neither
-        clobbers the other."""
+        cursorPositionChanged handler) with the find-match,
+        schema-validation, and Cmd+D multi-select layers, each tracked in
+        its own list so neither clobbers the other."""
         base = self.editor.own_extra_selections()
         self.editor.setExtraSelections(
-            base + self._find_selections + self._validation_selections)
-
-    def _open_snippet_editor(self):
-        """Open the snippet management dialog."""
-        from ui.snippet_editor_dialog import SnippetEditorDialog
-        dlg = SnippetEditorDialog(self.snippet_manager, parent=self.window())
-        dlg.snippets_changed.connect(self._reload_snippets)
-        dlg.exec()
-
-    def _reload_snippets(self):
-        """Called when snippets are changed in the editor dialog."""
-        self.completer.set_snippets(self.snippet_manager.get_all())
+            base + self._find_selections + self._validation_selections
+            + self._multi_occurrence_selections)
 
     def eventFilter(self, obj, event):
         """Route key events: popup navigation first, then auto-trigger."""
@@ -1279,6 +1314,18 @@ class SqlTab(QWidget):
         if obj is self.editor and event.type() == event.Type.ContextMenu:
             return self._show_editor_context_menu(event)
 
+        # A mouse click ends Cmd+D multi-select — the region offsets it
+        # tracks are only meaningful for a batch edit started and finished
+        # without the user clicking elsewhere first. The click itself
+        # arrives on the editor's viewport, not self.editor (FocusOut is
+        # deliberately not used for this: it can fire transiently — e.g.
+        # from incidental focus churn while typing quickly — and would
+        # silently drop an in-progress multi-select for no user-visible
+        # reason.)
+        if (obj in (self.editor, self.editor.viewport())
+                and event.type() == event.Type.MouseButtonPress):
+            self._clear_multi_regions()
+
         if obj != self.editor or event.type() != event.Type.KeyPress:
             return super().eventFilter(obj, event)
 
@@ -1289,12 +1336,29 @@ class SqlTab(QWidget):
         #    the QShortcut (hide_filter). Returning True stops the Esc reaching
         #    the shortcut, so only do that when the popup actually was visible.
         if key == Qt.Key_Escape:
+            self._clear_multi_regions()
             if self.completer.popup_visible:
                 self.completer.hide_popup()
                 self._completer_suppressed = True   # don't re-show on next backspace
                 return True          # consumed — don't also close the filter bar
             # popup not visible → let the existing Esc shortcut hide the filter
             return super().eventFilter(obj, event)
+
+        # Accepting an autocomplete suggestion while Cmd+D multi-select is
+        # active (2+ regions) must land at every site, not just the
+        # primary cursor — the popup's own accept path (below, via
+        # handle_key -> SqlCompleter._insert) only ever touches the single
+        # real QTextCursor, silently leaving every other region both
+        # unedited and stale. Redirect the same completion text through
+        # the multi-region batch-insert instead.
+        if (self.completer.popup_visible and len(self._multi_regions) >= 2
+                and key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab)):
+            completion = self.completer.peek_current_completion()
+            self.completer.hide_popup()
+            if completion is not None:
+                self._apply_multi_region_completion(completion.replace("{cursor}", ""))
+                self._schedule_schema_validation()
+            return True
 
         # 2. Let popup consume navigation / accept keys
         if self.completer.handle_key(event):
@@ -1316,9 +1380,26 @@ class SqlTab(QWidget):
             self._select_next_occurrence()
             return True
 
+        # Cmd+D multi-select bookkeeping: once 2+ occurrences are active,
+        # mirror the next content-changing edit (typed text / Backspace /
+        # Delete) across every one of them — see _apply_multi_region_edit.
+        # Any other key exits multi-select outright rather than risking a
+        # stale region list silently driving a later, unrelated edit at
+        # the wrong offsets. A bare modifier keypress (e.g. Control fires
+        # its own KeyPress a moment before the "D" of Ctrl+D) must not
+        # count as "other" — otherwise it clears the just-built selection
+        # before the actual shortcut combo ever arrives.
+        if self._multi_regions and key not in (
+                Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt, Qt.Key_Meta,
+                Qt.Key_CapsLock, Qt.Key_NumLock):
+            if len(self._multi_regions) >= 2 and self._try_multi_region_edit(key, mod, event):
+                self._schedule_schema_validation()
+                return True
+            self._clear_multi_regions()
+
         # 3. Cursor-movement keys: hide popup, pass to editor normally
-        if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End,
-                   Qt.Key_PageUp, Qt.Key_PageDown):
+        if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down,
+                   Qt.Key_Home, Qt.Key_End, Qt.Key_PageUp, Qt.Key_PageDown):
             self.completer.hide_popup()
             return super().eventFilter(obj, event)
 
@@ -1463,47 +1544,220 @@ class SqlTab(QWidget):
         cursor.endEditBlock()
 
     def _select_next_occurrence(self):
-        """Cmd+D: expand selection to current word, then find and select next match."""
+        """Cmd+D: expand selection to the current word, then repeated
+        presses keep adding the next matching occurrence to a multi-select
+        set — like VSCode's Cmd+D. Once 2+ occurrences are active, typing/
+        Backspace/Delete mirrors across all of them at once (see
+        eventFilter's multi-region interception and
+        _apply_multi_region_edit) so a column name repeated many times in
+        a big query can be renamed in one pass."""
         cursor = self.editor.textCursor()
         doc    = self.editor.document()
 
-        # If no selection, select the word under the cursor first
-        if not cursor.hasSelection():
-            cursor.select(QTextCursor.WordUnderCursor)
-            self.editor.setTextCursor(cursor)
+        if not self._multi_regions:
+            if not cursor.hasSelection():
+                cursor.select(QTextCursor.WordUnderCursor)
+                self.editor.setTextCursor(cursor)
+            if not cursor.selectedText():
+                return
+            self._multi_regions = [[cursor.selectionStart(), cursor.selectionEnd()]]
+            self._update_multi_region_highlights()
             return
 
-        word = cursor.selectedText()
+        first_start, first_end = self._multi_regions[0]
+        word = self.editor.toPlainText()[first_start:first_end]
         if not word:
+            self._clear_multi_regions()
             return
 
-        # Search forward from current selection end
-        search_start = cursor.selectionEnd()
         full_text = self.editor.toPlainText()
+        taken = {tuple(r) for r in self._multi_regions}
+        search_start = max(r[1] for r in self._multi_regions)
 
-        idx = full_text.find(word, search_start)
+        def _next_unclaimed(from_idx: int):
+            idx = full_text.find(word, from_idx)
+            while idx != -1 and (idx, idx + len(word)) in taken:
+                idx = full_text.find(word, idx + 1)
+            return idx
+
+        idx = _next_unclaimed(search_start)
         if idx == -1:
-            # Wrap around from the beginning
-            idx = full_text.find(word, 0)
-        if idx == -1 or idx == cursor.selectionStart():
-            return  # only one occurrence
+            idx = _next_unclaimed(0)
+        if idx == -1:
+            return  # every occurrence already selected
+
+        self._multi_regions.append([idx, idx + len(word)])
+        self._update_multi_region_highlights()
 
         new_cursor = QTextCursor(doc)
         new_cursor.setPosition(idx)
         new_cursor.setPosition(idx + len(word), QTextCursor.KeepAnchor)
         self.editor.setTextCursor(new_cursor)
         self.editor.ensureCursorVisible()
-    
+
+    def _update_multi_region_highlights(self):
+        """Rebuild the highlight layer for every active Cmd+D region."""
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor(90, 140, 200, 110))
+        doc = self.editor.document()
+        selections = []
+        for start, end in self._multi_regions:
+            if end <= start:
+                continue
+            c = QTextCursor(doc)
+            c.setPosition(start)
+            c.setPosition(end, QTextCursor.KeepAnchor)
+            es = QTextEdit.ExtraSelection()
+            es.cursor = c
+            es.format = fmt
+            selections.append(es)
+        self._multi_occurrence_selections = selections
+        self._apply_extra_selections()
+
+    def _clear_multi_regions(self):
+        """End Cmd+D multi-select (Escape, a click, focus loss, or any key
+        the batch-edit path below doesn't recognize)."""
+        if not self._multi_regions:
+            return
+        self._multi_regions = []
+        self._multi_occurrence_selections = []
+        self._apply_extra_selections()
+
+    def _try_multi_region_edit(self, key, mod, event) -> bool:
+        """Mirror one content-changing edit across every active Cmd+D
+        region. Returns False (and changes nothing) for any key that
+        isn't a plain insert/Backspace/Delete, so the caller falls back
+        to exiting multi-select instead of leaving stale offsets in
+        place for a later, unrelated edit."""
+        if key == Qt.Key_Backspace and mod == Qt.NoModifier:
+            self._apply_multi_region_edit("backspace")
+            return True
+        if key == Qt.Key_Delete and mod == Qt.NoModifier:
+            self._apply_multi_region_edit("delete")
+            return True
+        text = event.text()
+        if text and text.isprintable() and mod in (Qt.NoModifier, Qt.ShiftModifier):
+            self._apply_multi_region_edit("insert", text)
+            if not self._cursor_inside_string():
+                self.completer.update()
+            else:
+                self.completer.hide_popup()
+            return True
+        return False
+
+    def _apply_multi_region_edit(self, kind: str, text: str = ""):
+        """Apply one edit — insert *text*, or a Backspace/Delete — at
+        every active Cmd+D region simultaneously.
+
+        Builds a live QTextCursor per region up front and edits them in
+        any order: Qt auto-adjusts every other cursor on the same
+        QTextDocument whenever one of them edits it, so a region's cursor
+        always reflects its correct current position even after an
+        earlier (leftward) region's edit has shifted the document —
+        manually recomputing each region's offset by hand would go stale
+        the moment more than one region's edit changes the text length."""
+        doc = self.editor.document()
+        outer = self.editor.textCursor()
+        outer.beginEditBlock()
+
+        cursors = []
+        for start, end in self._multi_regions:
+            c = QTextCursor(doc)
+            c.setPosition(start)
+            c.setPosition(end, QTextCursor.KeepAnchor)
+            cursors.append(c)
+
+        for c in cursors:
+            if kind == "insert":
+                c.insertText(text)
+            elif kind == "backspace":
+                if c.hasSelection():
+                    c.removeSelectedText()
+                else:
+                    c.deletePreviousChar()
+            else:  # "delete"
+                if c.hasSelection():
+                    c.removeSelectedText()
+                else:
+                    c.deleteChar()
+
+        outer.endEditBlock()
+
+        self._multi_regions = sorted(
+            ([c.selectionStart(), c.selectionEnd()] if c.hasSelection()
+             else [c.position(), c.position()])
+            for c in cursors)
+        self._update_multi_region_highlights()
+
+        # Keep the real, blinking caret at the last (rightmost) site.
+        last_start, last_end = self._multi_regions[-1]
+        new_cursor = QTextCursor(doc)
+        new_cursor.setPosition(last_end)
+        self.editor.setTextCursor(new_cursor)
+
+    def _apply_multi_region_completion(self, completion: str):
+        """Accept an autocomplete suggestion across every active Cmd+D
+        region — e.g. typing a table name at 3 selected sites, then
+        accepting a completion, should replace all 3 in full.
+
+        Unlike _apply_multi_region_edit('insert', ...), this does NOT
+        trust each region's tracked [start, end] span: a region collapses
+        to a bare caret after its very first typed character (correct
+        for that per-character path, see _apply_multi_region_edit), so
+        by accept time it only spans the last keystroke — inserting the
+        full completion there would land it right after whatever was
+        typed before, instead of replacing it (e.g. typed "floanapprefer"
+        then accepted "f_loan_application_reference" would glue them into
+        "floanapreferf_loan_application_reference"). Same fix
+        SqlCompleter._insert already applies for the single-cursor case:
+        re-scan the document backward from each region's site for the
+        word actually typed there, and replace that whole span."""
+        doc = self.editor.document()
+        outer = self.editor.textCursor()
+        outer.beginEditBlock()
+
+        text = self.editor.toPlainText()
+        cursors = []
+        for _start, end in self._multi_regions:
+            i = end
+            while i > 0 and (text[i - 1].isalnum() or text[i - 1] in ('_', '.')):
+                i -= 1
+            c = QTextCursor(doc)
+            c.setPosition(i)
+            c.setPosition(end, QTextCursor.KeepAnchor)
+            cursors.append(c)
+
+        for c in cursors:
+            c.insertText(completion)
+
+        outer.endEditBlock()
+
+        self._multi_regions = sorted([c.position(), c.position()] for c in cursors)
+        self._update_multi_region_highlights()
+
+        last_start, last_end = self._multi_regions[-1]
+        new_cursor = QTextCursor(doc)
+        new_cursor.setPosition(last_end)
+        self.editor.setTextCursor(new_cursor)
+
     def _delete_current_line(self):
-        """Delete the entire line the cursor is on (Cmd+Backspace / ⌘⌫)."""
+        """Cmd+Backspace (⌘⌫): delete from the cursor back to the start
+        of the current line — matching the native "delete to line start"
+        behaviour — instead of always wiping the whole line regardless of
+        where the cursor sits. If the cursor is already at the start of
+        the line, falls back to a normal backspace (merging with the
+        previous line), same as most editors do in that case."""
         cursor = self.editor.textCursor()
         cursor.beginEditBlock()
-        cursor.movePosition(QTextCursor.StartOfBlock)
-        cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-        cursor.removeSelectedText()
-        # Also remove the newline unless we're on the last line
-        if not cursor.atEnd():
-            cursor.deleteChar()
+        if cursor.hasSelection():
+            cursor.removeSelectedText()
+        else:
+            anchor = cursor.position()
+            cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
+            if cursor.position() == anchor:
+                cursor.deletePreviousChar()
+            else:
+                cursor.removeSelectedText()
         cursor.endEditBlock()
         self.editor.setTextCursor(cursor)
         self.completer.hide_popup()
@@ -1613,10 +1867,6 @@ class SqlTab(QWidget):
         if hasattr(self, '_multi_result_bar') and self._multi_result_bar is not None:
             self._multi_result_bar.hide()
 
-        # Keep previous result for diff before overwriting
-        if self.current_df is not None:
-            self._prev_df = self.current_df.copy()
-            self.diff_btn.setEnabled(True)
         self.current_df = dataframe
         self.original_df = dataframe.copy()  # Store original for filtering
         self.current_table_name = table_name
@@ -1928,6 +2178,23 @@ class SqlTab(QWidget):
         self._cost_badge_btn.hide()
         layout.addWidget(self._cost_badge_btn)
 
+        # Proactive AI-suggestions badge (issue: live suggestions on Run,
+        # opt-in via Preferences → AI Assistance) — hidden until a
+        # background optimize call (triggered by ConnectionPanel right
+        # after a successful read-only run) comes back with at least one
+        # suggestion. Clicking opens the AI Suggestions tab.
+        self._ai_suggest_badge_btn = QPushButton("")
+        self._ai_suggest_badge_btn.setFlat(True)
+        self._ai_suggest_badge_btn.setCursor(Qt.PointingHandCursor)
+        self._ai_suggest_badge_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none;"
+            " color: #0A84FF; font-size: 11px; padding: 0; }"
+            " QPushButton:hover { text-decoration: underline; }"
+        )
+        self._ai_suggest_badge_btn.clicked.connect(self.open_ai_suggestions.emit)
+        self._ai_suggest_badge_btn.hide()
+        layout.addWidget(self._ai_suggest_badge_btn)
+
         layout.addStretch()
         self._cursor_pos_lbl = _seg("Ln 1, Col 1")
         _seg("UTF-8")
@@ -2040,6 +2307,25 @@ class SqlTab(QWidget):
 
     def clear_cost_estimate(self):
         self._cost_badge_btn.hide()
+
+    def set_ai_suggestions(self, suggestions: list):
+        """Populate the proactive-AI-suggestions badge (issue: live
+        suggestions on Run). Silently does nothing for an empty list —
+        this is a best-effort background nudge, not a user-initiated
+        action, so there's nothing to show/report on "no suggestions"."""
+        if not suggestions:
+            return
+        self._last_ai_suggestions = suggestions
+        n = len(suggestions)
+        self._ai_suggest_badge_btn.setText(f"✨  {n} AI suggestion{'s' if n != 1 else ''}")
+        self._ai_suggest_badge_btn.setToolTip(
+            "\n".join(f"• {s.get('title', '')}" for s in suggestions[:8])
+        )
+        self._ai_suggest_badge_btn.show()
+
+    def clear_ai_suggestions(self):
+        self._last_ai_suggestions = None
+        self._ai_suggest_badge_btn.hide()
 
     def update_status(self, rows, execution_time, truncated=False):
         """Row count and query time live only in the bottom status bar —
@@ -2160,6 +2446,62 @@ class SqlTab(QWidget):
         self._expand_result_area()
         self._query_time_lbl.setText(f"Query time: {elapsed * 1000:.0f} ms" if elapsed > 0 else "Query time: —")
         self._rows_status_lbl.setText("Rows: 0")
+
+        self._last_error_message = message
+        self._last_error_query = query
+        self._pending_ai_fix_sql = None
+        self._ai_fix_section.hide()
+        from services import ai_client
+        self._ai_fix_btn.setVisible(ai_client.is_enabled())
+        self._ai_fix_btn.setEnabled(True)
+        self._ai_fix_btn.setText("✨  Ask AI to Fix This")
+
+    def _on_ai_fix_btn_clicked(self):
+        self.ai_fix_requested.emit()
+
+    def show_ai_fix_loading(self):
+        """Called by the parent (ConnectionPanel) right after ai_fix_requested
+        fires, before the background call completes."""
+        self._ai_fix_btn.setEnabled(False)
+        self._ai_fix_btn.setText("Asking Claude…")
+        self._ai_fix_snippet.hide()
+        self._ai_fix_explanation_lbl.hide()
+        self._ai_fix_btn_row_widget.hide()
+        self._ai_fix_status_lbl.setText("Asking Claude to diagnose and fix this query…")
+        self._ai_fix_status_lbl.setStyleSheet("color: #8e8e93; font-size: 11px; background: transparent;")
+        self._ai_fix_section.show()
+
+    def show_ai_fix_result(self, result) -> None:
+        """Called by the parent with the AiResult once the background call
+        completes. Never applies the fix automatically — Insert/Discard are
+        always a separate, explicit step."""
+        self._ai_fix_btn.setEnabled(True)
+        self._ai_fix_btn.setText("✨  Ask AI to Fix This")
+
+        if not result.ok or not result.data or not result.data.get("corrected_sql"):
+            self._ai_fix_status_lbl.setText(
+                f"Couldn't get a fix: {result.error or 'unknown error'}")
+            self._ai_fix_status_lbl.setStyleSheet("color: #f48771; font-size: 11px; background: transparent;")
+            self._ai_fix_snippet.hide()
+            self._ai_fix_explanation_lbl.hide()
+            self._ai_fix_btn_row_widget.hide()
+            return
+
+        self._pending_ai_fix_sql = result.data["corrected_sql"]
+        self._ai_fix_status_lbl.setText("Suggested fix — review before inserting:")
+        self._ai_fix_status_lbl.setStyleSheet("color: #8e8e93; font-size: 11px; background: transparent;")
+        self._ai_fix_snippet.setPlainText(self._pending_ai_fix_sql)
+        self._ai_fix_snippet.show()
+        explanation = result.data.get("explanation") or ""
+        self._ai_fix_explanation_lbl.setText(explanation)
+        self._ai_fix_explanation_lbl.setVisible(bool(explanation))
+        self._ai_fix_btn_row_widget.show()
+
+    def _insert_ai_fix(self):
+        if not self._pending_ai_fix_sql:
+            return
+        self.editor.setPlainText(self._pending_ai_fix_sql)
+        self._ai_fix_section.hide()
 
     def show_cancelled(self):
         """Show a neutral 'query cancelled' status."""
@@ -2785,68 +3127,6 @@ class SqlTab(QWidget):
         if new_content != self.editor.toPlainText():
             self.editor.setPlainText(new_content)
         self._find_live_update()
-
-    # ── Diff ──────────────────────────────────────────────────────────────────
-
-    def _on_diff_toggled(self, active: bool):
-        self._diff_active = active
-        if active and self._prev_df is not None:
-            self._apply_diff_highlights()
-        else:
-            self._clear_diff_highlights()
-
-    def _apply_diff_highlights(self):
-        """Highlight cells that differ between _prev_df and current_df."""
-        from PySide6.QtGui import QColor, QBrush
-        if self._prev_df is None or self.current_df is None:
-            return
-        # Compare the full dataframes (not the rendered page)
-        prev = self._prev_df.reset_index(drop=True)
-        curr = self.current_df.reset_index(drop=True)
-        added_bg   = QBrush(QColor("#1a3a1a"))   # green — new row
-        changed_bg = QBrush(QColor("#3a2800"))   # amber — changed cell
-        # Walk the visible result table rows
-        for row in range(self.result_table.rowCount()):
-            # Map visible row back to the full dataframe index
-            # (result_table shows the current page slice)
-            page_start = self._result_page * self._result_page_size
-            df_row = page_start + row
-            for col in range(self.result_table.columnCount()):
-                item = self.result_table.item(row, col)
-                if item is None:
-                    continue
-                if df_row >= len(prev):
-                    item.setBackground(added_bg)
-                else:
-                    try:
-                        prev_val = str(prev.iloc[df_row, col]) if col < prev.shape[1] else ""
-                        curr_val = str(curr.iloc[df_row, col]) if col < curr.shape[1] else ""
-                        if prev_val != curr_val:
-                            item.setBackground(changed_bg)
-                    except Exception:
-                        pass
-
-    def _clear_diff_highlights(self):
-        """Remove diff highlighting (restore normal theme colours)."""
-        from PySide6.QtGui import QBrush, QColor
-        clear = QBrush(QColor(0, 0, 0, 0))
-        for row in range(self.result_table.rowCount()):
-            for col in range(self.result_table.columnCount()):
-                item = self.result_table.item(row, col)
-                if item:
-                    item.setBackground(clear)
-
-    # ── Pin / Favourite ───────────────────────────────────────────────────────
-
-    def _on_pin_toggled(self, pinned: bool):
-        self.pinned = pinned
-        # Signal to parent to persist; connection_panel listens via tab widget
-        panel = self.parent()
-        while panel is not None:
-            if hasattr(panel, '_save_pinned_tabs'):
-                panel._save_pinned_tabs()
-                break
-            panel = panel.parent()
 
     def set_transaction_state(self, active: bool):
         """Reflect whether this tab has an open manual transaction:

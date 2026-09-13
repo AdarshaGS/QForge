@@ -57,4 +57,12 @@ Out of scope / not a QForge vulnerability by itself:
   QForge keeps the password in `connections.json` in plain text rather than
   silently losing it, and warns you when this happens.
 - QForge has no built-in telemetry or crash reporting; nothing about your
-  usage or data leaves your machine via QForge itself.
+  usage or data leaves your machine via QForge itself — **with one opt-in
+  exception**: AI Assistance features (Preferences → AI Assistance, off by
+  default) send query text and narrow schema metadata (table/column/index
+  names — never row data) to Anthropic, via your own local Claude Code
+  CLI and your own Claude account. QForge itself never stores or transmits
+  an API key — it shells out to the `claude` CLI already configured on your
+  machine and never persists the call to its own session history
+  (`--no-session-persistence`). Disable the Preferences checkbox at any
+  time to turn this off.

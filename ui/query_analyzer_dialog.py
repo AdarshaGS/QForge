@@ -49,8 +49,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from services import query_cost
+from services import ai_client, ai_prompts, query_cost
 from services.query_verifier import QueryVerifier, VerifyResult
+from ui.ai_async import AiCallManager
+from ui.ai_availability_widget import AiAvailabilityWidget
 from ui.code_editor import CodeEditor
 from ui.sql_highlighter import SqlHighlighter
 
@@ -703,6 +705,13 @@ class _CostProfileTab(QWidget):
     stale analysis results" still holds per-section: each section only
     ever shows its own latest run or historical snapshot, never a mix)."""
 
+    # Emitted by the "✨ Ask AI" button — the parent QueryAnalyzerDialog
+    # switches to the AI Suggestions tab and runs its optimize flow seeded
+    # with this tab's query and already-computed rule-based issues, so AI
+    # suggestions are reachable directly from wherever Cost & Profile
+    # results already are, not only from a separate tab.
+    request_ai_optimize = Signal()
+
     def __init__(self, db_service, initial_query: str = "", initial_cost_detail: dict = None,
                  initial_profile_detail: dict = None, query_history=None,
                  history_entry_id: str = None, connection_name: str = "", parent=None):
@@ -713,6 +722,7 @@ class _CostProfileTab(QWidget):
         self._cost_worker = None
         self._profile_thread = None
         self._profile_worker = None
+        self._last_estimate = None  # last CostEstimate, read by the AI Suggestions tab
         # When history_entry_id is given (the dialog was opened from an
         # existing history row — e.g. the History panel's "View Cost &
         # Profile" action), a live Estimate/Profile run here is persisted
@@ -787,6 +797,15 @@ class _CostProfileTab(QWidget):
                 "plan-only estimate above."
             )
         btn_row.addWidget(self._profile_btn)
+
+        self._ask_ai_btn = QPushButton("✨  Ask AI")
+        self._ask_ai_btn.setFixedHeight(32)
+        self._ask_ai_btn.setToolTip(
+            "Get AI-generated optimization suggestions for this query, "
+            "building on the issues found above.\n"
+            "Uses your own Claude account/usage.")
+        self._ask_ai_btn.clicked.connect(self.request_ai_optimize.emit)
+        btn_row.addWidget(self._ask_ai_btn)
 
         ep.addLayout(btn_row)
         splitter.addWidget(editor_pane)
@@ -930,6 +949,17 @@ class _CostProfileTab(QWidget):
 
     # ─── Cost estimate (plan-only) ───────────────────────────────────────
 
+    def last_issues(self) -> list:
+        """The rule-based Issue list from the most recent Estimate Cost run
+        in this dialog session, if any — read by the sibling AI Suggestions
+        tab so its optimization prompt builds on these findings instead of
+        re-deriving them from scratch. Empty if Estimate Cost hasn't been
+        run yet."""
+        return list(self._last_estimate.issues) if self._last_estimate else []
+
+    def current_query(self) -> str:
+        return self._editor.toPlainText().strip()
+
     def _start_estimate(self):
         sql = self._editor.toPlainText().strip()
         if not sql:
@@ -965,6 +995,7 @@ class _CostProfileTab(QWidget):
             self._render_failure("Query Analysis Failed", result.error, target="estimate")
             return
         self._status_lbl.setText("")
+        self._last_estimate = result  # read by the sibling AI Suggestions tab, see last_issues()
         self._render_estimate(result)
         self._persist_to_history(
             cost_score=result.score, cost_label=result.label,
@@ -2281,6 +2312,277 @@ class _CompareQueriesTab(QWidget):
 
 
 # ===========================================================================
+# Tab 3 — AI Suggestions (issues #341, #342, #343)
+# ===========================================================================
+
+_AI_SEVERITY_COLOR = {"info": _INFO_COLOR, "suggestion": _WARN_COLOR, "important": _FAIL_COLOR}
+
+
+class _AiSuggestionsTab(QWidget):
+    """Explain a query in plain language, or ask for generative optimization
+    suggestions, using the user's local Claude Code CLI (services/
+    ai_client.py) — a generative complement to the deterministic Cost &
+    Profile tab (services/query_cost.py), not a replacement for it.
+
+    Free for everyone — gated only by whether the CLI is installed and
+    authenticated (ui/ai_availability_widget.py), never
+    services/entitlements.py's require_pro()."""
+
+    def __init__(self, db_service, initial_query: str = "", cost_tab=None, parent=None):
+        super().__init__(parent)
+        self._db = db_service
+        self._dialect = getattr(db_service, "db_type", "") or ""
+        self._cost_tab = cost_tab  # sibling _CostProfileTab — read-only access to last_issues()
+        self._call_mgr = AiCallManager(self)
+        self._build_ui(initial_query)
+
+    def _build_ui(self, initial_query: str):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        self._availability = AiAvailabilityWidget(compact=True)
+        self._availability.availability_changed.connect(lambda _a: self._update_gate())
+        root.addWidget(self._availability)
+
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setHandleWidth(6)
+        splitter.setChildrenCollapsible(False)
+
+        editor_pane = QWidget()
+        ep = QVBoxLayout(editor_pane)
+        ep.setContentsMargins(0, 0, 0, 6)
+        ep.setSpacing(6)
+
+        self._editor = CodeEditor()
+        self._editor.setPlaceholderText("Paste or write a query to explain or optimize…")
+        self._editor.setPlainText(initial_query)
+        self._editor.setMinimumHeight(48)
+        SqlHighlighter(self._editor.document())
+        ep.addWidget(self._editor, 1)
+
+        self._status_lbl = QLabel("")
+        self._status_lbl.setWordWrap(True)
+        self._status_lbl.setStyleSheet(f"color:{_MUTED}; font-size:12px;")
+        ep.addWidget(self._status_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+
+        self._explain_btn = QPushButton("✨  Explain")
+        self._explain_btn.setFixedHeight(32)
+        self._explain_btn.setToolTip(
+            "Ask Claude to explain this query in plain language.\n"
+            "Uses your own Claude account/usage.")
+        self._explain_btn.clicked.connect(self._start_explain)
+        btn_row.addWidget(self._explain_btn)
+
+        self._optimize_btn = QPushButton("✨  Suggest Optimizations")
+        self._optimize_btn.setObjectName("primaryBtn")
+        self._optimize_btn.setFixedHeight(32)
+        self._optimize_btn.setToolTip(
+            "Ask Claude for optimization suggestions beyond the rule-based "
+            "checks above.\nUses your own Claude account/usage.")
+        self._optimize_btn.clicked.connect(self._start_optimize)
+        btn_row.addWidget(self._optimize_btn)
+        btn_row.addStretch()
+        ep.addLayout(btn_row)
+
+        splitter.addWidget(editor_pane)
+
+        results_pane = QWidget()
+        rp = QVBoxLayout(results_pane)
+        rp.setContentsMargins(0, 6, 0, 0)
+        rp.setSpacing(6)
+        rp.addWidget(_divider())
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        self._results_widget = QWidget()
+        self._results_layout = QVBoxLayout(self._results_widget)
+        self._results_layout.setContentsMargins(0, 4, 0, 4)
+        self._results_layout.setSpacing(6)
+
+        self._empty_lbl = QLabel(
+            "Ask AI to explain this query in plain language, or suggest "
+            "optimizations beyond what the Cost & Profile tab's rule-based "
+            "checks already found."
+        )
+        self._empty_lbl.setWordWrap(True)
+        self._empty_lbl.setAlignment(Qt.AlignCenter)
+        self._empty_lbl.setStyleSheet(f"color:{_MUTED}; font-size:13px; padding:24px;")
+        self._results_layout.addWidget(self._empty_lbl)
+
+        scroll.setWidget(self._results_widget)
+        rp.addWidget(scroll, 1)
+        splitter.addWidget(results_pane)
+        splitter.setSizes([160, 480])
+
+        root.addWidget(splitter, 1)
+        self._update_gate()
+
+    # ── availability/opt-in gating ──────────────────────────────────────
+
+    def _update_gate(self):
+        avail = self._availability.availability
+        enabled = ai_client.is_enabled()
+        ready = enabled and bool(avail and avail.authenticated)
+        if not self._call_mgr.busy:
+            self._explain_btn.setEnabled(ready)
+            self._optimize_btn.setEnabled(ready)
+        if not enabled:
+            self._status_lbl.setText("Enable AI features in Preferences to use this.")
+        elif avail and not avail.authenticated:
+            self._status_lbl.setText(avail.detail)
+        else:
+            self._status_lbl.setText("")
+
+    # ── explain ──────────────────────────────────────────────────────────
+
+    def _tables_in_query(self, sql: str) -> list:
+        return list(set(query_cost._parse_table_aliases(sql).values()))
+
+    def _is_ready(self) -> bool:
+        """Defense in depth: _start_explain/_start_optimize are reachable
+        programmatically (ConnectionPanel's Cost & Profile "Ask AI" button
+        triggers _start_optimize directly), not only via this tab's own
+        buttons — those buttons' disabled state alone isn't a sufficient
+        guard against a call being kicked off while AI isn't enabled or
+        the CLI isn't authenticated."""
+        avail = self._availability.availability
+        return ai_client.is_enabled() and bool(avail and avail.authenticated)
+
+    def _start_explain(self):
+        sql = self._editor.toPlainText().strip()
+        if not sql or self._call_mgr.busy or not self._is_ready():
+            return
+        self._set_busy(True, "Asking Claude to explain this query…")
+        schema_ctx = query_cost.fetch_schema_context(self._db, self._tables_in_query(sql))
+        prompt = ai_prompts.build_explain_prompt(sql, self._dialect, schema_ctx)
+        self._call_mgr.start(prompt, on_done=self._on_explain_done, timeout=45.0)
+
+    def _on_explain_done(self, result):
+        self._set_busy(False)
+        self._clear_layout(self._results_layout)
+        if not result.ok:
+            self._results_layout.addWidget(
+                _check_row("fail", "Couldn't get an explanation", result.error or ""))
+            return
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame {{ background:{_PANEL_BG}; border:1px solid {_BORDER}; border-radius:6px; }}")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(10, 8, 10, 8)
+        lbl = QLabel(result.text)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(f"color:{_TEXT}; font-size:12px; border:none;")
+        lbl.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        v.addWidget(lbl)
+        self._results_layout.addWidget(card)
+
+    # ── optimize ─────────────────────────────────────────────────────────
+
+    def _start_optimize(self):
+        sql = self._editor.toPlainText().strip()
+        if not sql or self._call_mgr.busy or not self._is_ready():
+            return
+        self._set_busy(True, "Asking Claude for optimization suggestions…")
+        schema_ctx = query_cost.fetch_schema_context(self._db, self._tables_in_query(sql))
+        existing_issues = self._cost_tab.last_issues() if self._cost_tab is not None else []
+        prompt, schema = ai_prompts.build_optimize_prompt(
+            sql, self._dialect, schema_ctx, existing_issues)
+        self._call_mgr.start(prompt, on_done=self._on_optimize_done, json_schema=schema, timeout=45.0)
+
+    def _on_optimize_done(self, result):
+        self._set_busy(False)
+        if not result.ok or result.data is None:
+            self._clear_layout(self._results_layout)
+            self._results_layout.addWidget(
+                _check_row("fail", "Couldn't get optimization suggestions", result.error or ""))
+            return
+        self.show_suggestions(result.data.get("suggestions") or [])
+
+    def show_suggestions(self, suggestions: list):
+        """Renders a suggestions list directly, without making a call —
+        used both by _on_optimize_done and by ConnectionPanel to
+        re-display suggestions a proactive background check (issue: live
+        suggestions on Run) already computed, without spending a second
+        AI call on something already known."""
+        self._clear_layout(self._results_layout)
+        if not suggestions:
+            self._results_layout.addWidget(_check_row("pass", "No additional suggestions."))
+            return
+        for s in suggestions:
+            self._results_layout.addWidget(self._suggestion_card(s))
+
+    def _suggestion_card(self, s: dict) -> QWidget:
+        color = _AI_SEVERITY_COLOR.get(s.get("severity"), _MUTED)
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame {{ background:{_PANEL_BG}; border:1px solid {_BORDER};"
+            f" border-left:3px solid {color}; border-radius:6px; }}"
+        )
+        v = QVBoxLayout(card)
+        v.setContentsMargins(10, 8, 10, 8)
+        v.setSpacing(4)
+
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        head.addWidget(_text_chip((s.get("severity") or "info").upper(), color, width=90))
+        title_lbl = QLabel(s.get("title", ""))
+        title_lbl.setStyleSheet(f"color:{_TEXT}; font-size:12px; font-weight:700; border:none;")
+        head.addWidget(title_lbl, 1)
+        v.addLayout(head)
+
+        detail_lbl = QLabel(s.get("detail", ""))
+        detail_lbl.setWordWrap(True)
+        detail_lbl.setStyleSheet(f"color:{_TEXT}; font-size:12px; border:none;")
+        detail_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        v.addWidget(detail_lbl)
+
+        suggested_sql = s.get("suggested_sql")
+        if suggested_sql:
+            snippet = QPlainTextEdit()
+            snippet.setReadOnly(True)
+            snippet.setPlainText(suggested_sql)
+            snippet.setFixedHeight(60)
+            snippet.setLineWrapMode(QPlainTextEdit.NoWrap)
+            snippet.setStyleSheet(
+                f"background:{_BG}; color:{_TEXT}; border:1px solid {_BORDER};"
+                f" border-radius:4px; font-family: Menlo, Consolas, monospace; font-size:11px;"
+            )
+            v.addWidget(snippet)
+            copy_btn = QPushButton("Copy SQL")
+            copy_btn.setFixedHeight(24)
+            copy_btn.clicked.connect(
+                lambda *, b=copy_btn, txt=suggested_sql: _copy_with_feedback(b, txt, "Copy SQL"))
+            v.addWidget(copy_btn, alignment=Qt.AlignLeft)
+
+        return card
+
+    # ── shared ───────────────────────────────────────────────────────────
+
+    def _set_busy(self, busy: bool, status: str = ""):
+        self._explain_btn.setEnabled(not busy)
+        self._optimize_btn.setEnabled(not busy)
+        if busy:
+            self._status_lbl.setText(status)
+            self._status_lbl.setStyleSheet(f"color:{_MUTED}; font-size:12px;")
+        else:
+            self._update_gate()
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.hide()
+                w.deleteLater()
+
+
+# ===========================================================================
 # Top-level dialog
 # ===========================================================================
 
@@ -2308,9 +2610,28 @@ class QueryAnalyzerDialog(QDialog):
                                           history_entry_id=history_entry_id,
                                           connection_name=connection_name)
         self._compare_tab = _CompareQueriesTab(db_service, initial_query=initial_query)
+        self._ai_tab = _AiSuggestionsTab(db_service, initial_query=initial_query,
+                                          cost_tab=self._cost_tab)
         self._tabs.addTab(self._cost_tab, "Cost && Profile")
         self._tabs.addTab(self._compare_tab, "Compare Queries")
+        self._tabs.addTab(self._ai_tab, "AI Suggestions")
         layout.addWidget(self._tabs)
+
+        self._cost_tab.request_ai_optimize.connect(self._on_request_ai_optimize)
+
+    def _on_request_ai_optimize(self):
+        """The Cost & Profile tab's "✨ Ask AI" button — switches to the AI
+        Suggestions tab, seeds it with this tab's current query, and runs
+        the same optimize flow its own button would (reusing the rule-based
+        issues already computed here, via _AiSuggestionsTab._cost_tab)."""
+        self._ai_tab._editor.setPlainText(self._cost_tab.current_query())
+        self.show_ai_tab()
+        self._ai_tab._start_optimize()
+
+    def show_ai_tab(self):
+        """Focus the AI Suggestions tab — used by SqlTab's "Ask AI to fix
+        this" error-card button and the "Explain" entry point."""
+        self._tabs.setCurrentWidget(self._ai_tab)
 
     def show_cost_tab(self):
         """Focus the Cost & Profile tab — used when opened from the

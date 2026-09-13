@@ -796,9 +796,7 @@ class MainWindow(QMainWindow):
             if panel:
                 panel.restore_session_tabs(entry.get("tabs", []))
 
-        # Restore pinned tabs for all panels (persists across sessions)
         for panel in self._panels:
-            panel.restore_pinned_tabs()
             panel.ensure_at_least_one_tab()
             # Restoring N tabs in a loop leaves the last-restored one
             # active/focused (issue #149) — reset to tab 1 once restoration
@@ -1029,6 +1027,11 @@ class MainWindow(QMainWindow):
         act = db_menu.addAction("Analyze Query…")
         act.triggered.connect(
             lambda: self._current_panel() and self._current_panel().open_query_analyzer()
+        )
+
+        act = db_menu.addAction("Ask About Schema…")
+        act.triggered.connect(
+            lambda: self._current_panel() and self._current_panel().open_schema_chat()
         )
 
         act = db_menu.addAction("Run All Statements")

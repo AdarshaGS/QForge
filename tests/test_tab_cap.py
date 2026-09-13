@@ -128,22 +128,6 @@ def test_restore_session_tabs_stops_silently_at_cap(monkeypatch):
     assert panel.tabs.widget(0).get_query() == "SELECT 0"
 
 
-def test_restore_pinned_tabs_stops_silently_at_cap(monkeypatch):
-    panel = _make_panel(monkeypatch)
-    for _ in range(_cap() - 1):
-        panel.add_new_tab()
-
-    from utils import pinned_tabs as _pt
-    # Keyed by panel.label, not the bare config name — issue #281 folded the
-    # database name into the label so same-server tabs stay distinguishable.
-    monkeypatch.setattr(_pt, "load", lambda: {panel.label: [{"name": "p1", "query": "SELECT 1"},
-                                                             {"name": "p2", "query": "SELECT 2"}]})
-
-    panel.restore_pinned_tabs()
-
-    assert panel.tabs.count() == _cap()
-
-
 def test_active_sql_tab_falls_back_to_existing_sql_tab_when_capped(monkeypatch):
     panel = _make_panel(monkeypatch)
     panel.add_new_tab()
