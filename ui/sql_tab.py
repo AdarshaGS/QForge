@@ -2925,12 +2925,26 @@ class SqlTab(QWidget):
             return None
 
         offset = 0
+        last_nonempty = None
         for stmt in statements:
             text = str(stmt)
             start, end = offset, offset + len(text)
             if start <= cursor_pos <= end and text.strip():
                 return text.strip()
+            if text.strip():
+                last_nonempty = text.strip()
             offset = end
+
+        # sqlparse.parse() doesn't attribute trailing whitespace after the
+        # final statement to any statement's span — unlike leading
+        # whitespace/comments, which attach to the statement that follows
+        # them. A cursor sitting in that trailing whitespace (a trailing
+        # blank line, or Ctrl+End) would otherwise fall through every
+        # statement's range and make plain Run silently run the WHOLE
+        # script instead of the last statement the cursor is actually
+        # nearest to (issue #285).
+        if cursor_pos >= offset and last_nonempty is not None:
+            return last_nonempty
 
         return None
 
