@@ -981,8 +981,15 @@ class SqlTab(QWidget):
         self.find_shortcut = QShortcut(QKeySequence("Ctrl+Alt+F"), self)
         self.find_shortcut.activated.connect(self._toggle_find_replace)
 
-        # Ctrl+F — find only (hides replace row)
+        # Ctrl+F — find only (hides replace row). Scoped to this widget
+        # (rather than the default window-wide context) so it doesn't
+        # collide with TableViewWidget's own Ctrl+F filter shortcut when a
+        # SQL tab and a table view result are visible in the same
+        # top-level window (issue #300) — with two window-wide shortcuts
+        # on the same key, Qt fires neither and warns about an ambiguous
+        # shortcut overload.
         self.find_only_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        self.find_only_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.find_only_shortcut.activated.connect(self._toggle_find_bar)
 
         # Add keyboard shortcut for save (Cmd+S)

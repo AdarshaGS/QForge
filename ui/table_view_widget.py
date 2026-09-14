@@ -170,8 +170,14 @@ class TableViewWidget(QWidget):
 
         self.init_ui()
 
-        # Add Cmd+F shortcut for filter
+        # Add Cmd+F shortcut for filter. Scoped to this widget (rather than
+        # the default window-wide context) so it doesn't collide with
+        # SqlTab's own Ctrl+F when both a SQL tab and a table view result
+        # are visible in the same top-level window (issue #300) — with two
+        # window-wide shortcuts on the same key, Qt fires neither and warns
+        # about an ambiguous shortcut overload.
         self.filter_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        self.filter_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.filter_shortcut.activated.connect(self.toggle_filter)
 
         # Add Esc shortcut to close filter
