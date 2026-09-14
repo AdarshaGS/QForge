@@ -958,7 +958,7 @@ class DbService:
             pass
         return []
 
-    def bump_sequence_for_column(self, table_name: str, column: str) -> None:
+    def bump_sequence_for_column(self, table_name: str, column: str) -> bool:
         """After inserting rows with an explicit value for an
         identity/serial column (issue #215's dependency-ordered mock data
         generation gives a parent table's PK explicit values so children
@@ -970,11 +970,16 @@ class DbService:
         into a serial/identity column does *not* advance its backing
         sequence, so a later auto-assigned insert could collide with a
         value we just wrote. MySQL self-adjusts its AUTO_INCREMENT
-        counter up on an explicit higher value, so nothing to do there.
-        Never raises — this is a best-effort correctness nicety, not
-        something that should block the generation flow it runs after."""
+        counter up on an explicit higher value, so nothing to do there
+        (returns True immediately).
+
+        Never raises — this is best-effort and must not block the
+        generation flow it runs after. Returns False on failure (issue
+        #293) so the caller can surface it instead of the collision risk
+        failing completely silently; a caller that doesn't care can
+        still ignore the return value."""
         if self.db_type != "postgresql":
-            return
+            return True
         try:
             cursor = self.connection.cursor()
             cursor.execute(
@@ -983,8 +988,10 @@ class DbService:
                 (table_name, column),
             )
             cursor.close()
-        except Exception:
-            pass
+            return True
+        except Exception as ex:
+            logger.debug(f"bump_sequence_for_column failed for {table_name}.{column}: {ex}")
+            return False
 
     def content_select_list(self, table_name: str) -> str:
         """Column list for a content-export `SELECT`, with generated

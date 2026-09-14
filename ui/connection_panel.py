@@ -3340,6 +3340,25 @@ class ConnectionPanel(QWidget):
         except Exception:
             return 1
 
+    @staticmethod
+    def _mock_data_insert_message(table_name: str, failed_bumps: list) -> str:
+        """Success message for the mock-data-insert result dialog —
+        appends a visible warning when bump_sequence_for_column() failed
+        for one or more generated PK columns (issue #293), instead of
+        that best-effort failure passing completely silently and risking
+        a later auto-assigned insert colliding with the explicit PK value
+        just written."""
+        message = f"Mock data inserted into {table_name}."
+        if failed_bumps:
+            targets = ", ".join(f"{t}.{c}" for t, c in failed_bumps)
+            message += (
+                f"\n\nWarning: couldn't update the auto-increment sequence for "
+                f"{targets} — a future auto-assigned insert into "
+                f"{'that table' if len(failed_bumps) == 1 else 'those tables'} "
+                f"may collide with a value just inserted."
+            )
+        return message
+
     def show_mock_data_generator(self, table_name: str):
         """Opens the Mock Data Generator (issue #77). Environment/read-only
         safety gating happens up front, before the dialog even opens —
@@ -3406,11 +3425,15 @@ class ConnectionPanel(QWidget):
         def _run(db):
             for stmt in query_classifier.split_statements(sql):
                 db.execute_update(stmt)
-            for gen_table, pk_column in generated_pk_columns:
-                db.bump_sequence_for_column(gen_table, pk_column)
+            failed_bumps = [
+                (gen_table, pk_column) for gen_table, pk_column in generated_pk_columns
+                if not db.bump_sequence_for_column(gen_table, pk_column)
+            ]
+            return failed_bumps
 
-        def _done(_):
-            QMessageBox.information(self, "Success", f"Mock data inserted into {table_name}.")
+        def _done(failed_bumps):
+            message = self._mock_data_insert_message(table_name, failed_bumps)
+            QMessageBox.information(self, "Success", message)
             for i in range(self.tabs.count()):
                 w = self.tabs.widget(i)
                 if isinstance(w, TableViewWidget) and w.table_name == table_name:
