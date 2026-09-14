@@ -1569,6 +1569,21 @@ class ConnectionPanel(QWidget):
                 self, "Connecting…",
                 "Still connecting to the database — try switching in a moment.")
             return
+        if self.has_open_transactions():
+            # A tab with an open transaction keeps running on its own
+            # dedicated DbService (_run_query_in_tab reuses it across runs
+            # while _tx_db_service is set) — that connection's search_path
+            # was set when the transaction began and self.config["schema"]
+            # mutating below wouldn't touch it. Without this guard the
+            # schema pill/UI would show the new schema while that tab's
+            # in-flight transaction silently kept running against the old
+            # one (issue #284).
+            QMessageBox.warning(
+                self, "Open Transaction",
+                "A tab on this connection has an open transaction, which "
+                "stays bound to the schema it started in. Commit or roll "
+                "it back before switching schemas.")
+            return
 
         # Issue #267: same progress bar/ticker as the initial schema load,
         # instead of a static tree row.
