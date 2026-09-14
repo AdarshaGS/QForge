@@ -2303,7 +2303,6 @@ class ConnectionPanel(QWidget):
         idx = self.tabs.addTab(tab, f"Tab {count}")
         self._log_win_state("add_new_tab: after addTab")
         tab.run_btn.clicked.connect(lambda: self._run_query_in_tab(tab))
-        tab.run_all_requested.connect(lambda: self._run_query_in_tab(tab, run_all=True))
         tab.begin_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "BEGIN"))
         tab.commit_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "COMMIT"))
         tab.rollback_tx_btn.clicked.connect(lambda: self._run_transaction_control(tab, "ROLLBACK"))
@@ -2699,7 +2698,7 @@ class ConnectionPanel(QWidget):
         convention, and what a script with the cursor on one particular
         statement should do.
 
-        *run_all=True* (Ctrl+Shift+Return / `SqlTab.run_all_requested`) is
+        *run_all=True* (Ctrl+Shift+Return / `run_all_statements()`) is
         the deliberate, explicit way to run every statement in the editor
         regardless of selection or cursor — for an intentional multi-
         statement script, not as Run's silent default (a user previously

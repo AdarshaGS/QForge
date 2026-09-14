@@ -119,12 +119,6 @@ class SqlTab(QWidget):
     # Emitted when the proactive-AI-suggestions status-bar badge is
     # clicked — parent opens the Analyze Query dialog's AI Suggestions tab.
     open_ai_suggestions = Signal()
-    # Emitted by Ctrl+Shift+Return — parent runs every statement in the
-    # editor regardless of selection/cursor position, distinct from plain
-    # Run (Ctrl+Return / the Run button), which scopes to the selection or
-    # the statement at the cursor (see ConnectionPanel._run_query_in_tab).
-    run_all_requested = Signal()
-
     def __init__(self):
         super().__init__()
 
@@ -961,8 +955,11 @@ class SqlTab(QWidget):
 
         # Run every statement in the editor, regardless of selection/cursor
         # — the explicit counterpart to plain Run's cursor/selection scoping.
-        self.run_all_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Return"), self)
-        self.run_all_shortcut.activated.connect(self.run_all_requested.emit)
+        # NOT bound here as a bare QShortcut: the Database menu's "Run All"
+        # QAction (main.py) already owns Ctrl+Shift+Return, and a QShortcut
+        # plus a QAction sharing one key sequence makes Qt treat it as
+        # ambiguous — the same duplicate-binding bug documented for Ctrl+T
+        # (issue #25/#40) and now Ctrl+Shift+Return (issue #305).
 
         # Add keyboard shortcuts for SQL formatting
         self.beautify_shortcut = QShortcut(QKeySequence("Ctrl+I"), self)
