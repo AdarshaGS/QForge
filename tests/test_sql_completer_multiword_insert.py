@@ -71,3 +71,36 @@ def test_multiword_snippet_body_is_unaffected_by_unrelated_trigger_text():
     # actual case-insensitive word match.
     assert _insert("SELECT id FROM t WHERE ssel", "SELECT * FROM table_name") == \
         "SELECT id FROM t WHERE SELECT * FROM table_name"
+
+
+def _insert_before_trailing_text(prefix: str, completion: str, trailing: str) -> str:
+    """Like _insert(), but the cursor sits between *prefix* (being typed)
+    and *trailing* text that already exists in the editor — e.g. typing
+    "explain" at the very start of an existing "select * from customers"."""
+    editor = QPlainTextEdit()
+    editor.setPlainText(prefix + trailing)
+    cursor = editor.textCursor()
+    cursor.setPosition(len(prefix))
+    editor.setTextCursor(cursor)
+
+    stub = SimpleNamespace(_editor=editor, _popup=SimpleNamespace(hide=lambda: None))
+    SqlCompleter._insert(stub, completion)
+    return editor.toPlainText()
+
+
+def test_completion_inserts_separating_space_before_glued_trailing_word():
+    # Accepting "EXPLAIN" while the cursor sits right before an
+    # already-typed "select" (no space typed in between) must not glue
+    # them into "EXPLAINselect".
+    assert _insert_before_trailing_text("explain", "EXPLAIN", "select * from customers") == \
+        "EXPLAIN select * from customers"
+
+
+def test_completion_does_not_double_space_before_existing_whitespace():
+    assert _insert_before_trailing_text("explain", "EXPLAIN", " select * from customers") == \
+        "EXPLAIN select * from customers"
+
+
+def test_completion_before_punctuation_gets_no_extra_space():
+    assert _insert_before_trailing_text("na", "name", ", total FROM orders") == \
+        "name, total FROM orders"

@@ -52,13 +52,13 @@ def test_check_availability_not_installed():
 
 
 def test_check_availability_logged_in():
-    envelope = json.dumps({"loggedIn": True, "email": "adarsh@m2pfintech.com"})
+    envelope = json.dumps({"loggedIn": True, "email": "test@example.com"})
     with patch("services.ai_client.shutil.which", return_value="/usr/bin/claude"), \
          patch("services.ai_client.subprocess.run", return_value=_fake_completed(envelope)):
         result = ai_client.check_availability()
     assert result.installed is True
     assert result.authenticated is True
-    assert result.auth_email == "adarsh@m2pfintech.com"
+    assert result.auth_email == "test@example.com"
 
 
 def test_check_availability_not_logged_in():

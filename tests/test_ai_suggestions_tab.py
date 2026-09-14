@@ -39,7 +39,7 @@ def _set_state(tab, monkeypatch, tmp_path, *, enabled=True, authenticated=True):
     preferences.set("ai.enabled", enabled)
     tab._availability._last = ai_client.AiAvailability(
         installed=True, authenticated=authenticated,
-        auth_email="adarsh@m2pfintech.com" if authenticated else None,
+        auth_email="test@example.com" if authenticated else None,
         detail="" if authenticated else "Claude Code is installed but not logged in.",
     )
     tab._update_gate()

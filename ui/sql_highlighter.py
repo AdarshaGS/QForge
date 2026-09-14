@@ -23,7 +23,8 @@ class SqlHighlighter(QSyntaxHighlighter):
             "DISTINCT", "COUNT", "SUM", "AVG", "MAX", "MIN",
             "SET", "VALUES", "INTO", "TRUNCATE", "PRIMARY", "KEY",
             "FOREIGN", "REFERENCES", "UNIQUE", "DEFAULT", "CHECK",
-            "CONSTRAINT", "AUTO_INCREMENT", "CASCADE", "GRANT", "REVOKE"
+            "CONSTRAINT", "AUTO_INCREMENT", "CASCADE", "GRANT", "REVOKE",
+            "EXPLAIN"
         ]
 
         for word in keywords:

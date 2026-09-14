@@ -142,6 +142,23 @@ _WITH_RE = re.compile(r"\bWITH\b(?:\s+RECURSIVE\b)?", re.IGNORECASE)
 _CTE_IDENT_RE = re.compile(r"\s*[`\"]?(\w+)[`\"]?")
 _FROM_JOIN_PAREN_RE = re.compile(r"\b(?:FROM|JOIN)\s*\(", re.IGNORECASE)
 
+# WHERE/HAVING predicate awareness (_where_operator_suggestions /
+# _where_value_suggestions / _columns_already_predicated) — a completed
+# column reference with nothing after it yet ("col", "t.col"), one with a
+# completed operator right after it ("col =", "t.col IN"), and one already
+# fully formed into "col <op>" anywhere earlier in the current clause.
+_COLUMN_REF_TAIL_RE = re.compile(r'(?:([A-Za-z_]\w*)\.)?([A-Za-z_]\w*)\s*$')
+_COLUMN_THEN_OP_TAIL_RE = re.compile(
+    r'(?:([A-Za-z_]\w*)\.)?([A-Za-z_]\w*)\s+'
+    r'(NOT\s+LIKE|NOT\s+ILIKE|NOT\s+IN|LIKE|ILIKE|IN|IS\s+NOT|IS|!=|<>|<=|>=|=|<|>)\s*$',
+    re.IGNORECASE)
+_PREDICATE_COLREF_RE = re.compile(
+    r'(?:([A-Za-z_]\w*)\.)?([A-Za-z_]\w*)\s*'
+    r'(?:=|!=|<>|<=|>=|<|>|\bLIKE\b|\bILIKE\b|\bIN\b|\bIS\b)',
+    re.IGNORECASE)
+_ENUM_SET_TYPE_RE = re.compile(r"^(enum|set)\((.*)\)$", re.IGNORECASE)
+_QUOTED_LITERAL_RE = re.compile(r"'((?:[^'\\]|\\.)*)'")
+
 
 # (keyword, context_name) — checked from most-specific to least
 _CONTEXT_MARKERS = [
@@ -183,6 +200,7 @@ class SuggestionItem:
     KEYWORD = "KEYWORD"
     FUNC    = "FUNC"
     SNIPPET = "SNIPPET"   # expandable snippet
+    VALUE   = "VALUE"     # a literal (enum member, boolean) suggested for a WHERE predicate
 
     def __init__(self, text: str, kind: str, score: int = 0,
                  extra: dict | None = None):
@@ -210,6 +228,7 @@ class SuggestionDelegate(QStyledItemDelegate):
         SuggestionItem.KEYWORD: (QColor("#3a1e4a"), QColor("#c586c0")),
         SuggestionItem.FUNC:    (QColor("#4a3a1e"), QColor("#dcdcaa")),
         SuggestionItem.SNIPPET: (QColor("#1a3a1a"), QColor("#89d185")),
+        SuggestionItem.VALUE:   (QColor("#3a2f1e"), QColor("#e5c07b")),
     }
 
     # PK/FK key-glyph colours, drawn immediately left of the badge.
@@ -663,6 +682,21 @@ class SqlCompleter:
         if self._popup:
             self._popup.hide()
 
+    def peek_current_completion(self) -> Optional[str]:
+        """The text (or snippet body) that Return/Tab would insert right
+        now, without accepting or hiding the popup — lets a caller (e.g.
+        SqlTab's Cmd+D multi-select) redirect an accepted suggestion into
+        its own batch-insert instead of this class's normal single-cursor
+        _insert()."""
+        if not self._popup or not self._popup.visible:
+            return None
+        item = self._popup.list_widget.currentItem()
+        if not item:
+            return None
+        body = item.data(Qt.UserRole + 3)
+        text = item.data(Qt.UserRole + 1)
+        return body if body else text
+
     def handle_key(self, event) -> bool:
         """
         Route a key event to the popup.
@@ -972,7 +1006,8 @@ class SqlCompleter:
                 return alias
         return None
 
-    def _score_columns(self, prefix: str, tables: list[str], base: int) -> list[SuggestionItem]:
+    def _score_columns(self, prefix: str, tables: list[str], base: int,
+                       exclude: set[tuple[str, str]] | None = None) -> list[SuggestionItem]:
         """Like _score() but for real table columns — attaches the type/PK/FK
         badge info _score() has no per-item source for.
 
@@ -980,13 +1015,20 @@ class SqlCompleter:
         u`) gets its columns suggested as `u.col` rather than a bare `col`
         — otherwise two joined tables sharing a column name (e.g. both
         having an `id`) would dedupe to a single ambiguous suggestion with
-        no way to tell which table it came from."""
+        no way to tell which table it came from.
+
+        `exclude` — (table, column) pairs to leave out entirely — is used
+        by the WHERE/HAVING branch to stop re-suggesting a column already
+        used in an earlier predicate in the same clause (see
+        _columns_already_predicated)."""
         pl = prefix.lower()
         seen: set[str] = set()
         out: list[SuggestionItem] = []
         for tbl in tables:
             alias = self._display_alias(tbl)
             for col in self._columns_for(tbl):
+                if exclude and (tbl, col) in exclude:
+                    continue
                 cl = col.lower()
                 dedup_key = f"{alias}.{cl}" if alias else cl
                 if dedup_key in seen:
@@ -1006,6 +1048,147 @@ class SqlCompleter:
                 out.append(SuggestionItem(text, SuggestionItem.COLUMN, s,
                                           extra=self._column_badge_extra(tbl, cl)))
         return out
+
+    # ── WHERE/HAVING predicate awareness ──────────────────────────────────────
+
+    _NUMERIC_TYPES = {"int", "integer", "bigint", "smallint", "mediumint",
+                       "tinyint", "decimal", "numeric", "float", "double", "real", "money"}
+    _DATE_TYPES = {"date", "datetime", "timestamp", "time", "year"}
+    _STRING_TYPES = {"varchar", "char", "text", "tinytext", "mediumtext",
+                      "longtext", "json", "uuid", "enum", "set", "nchar", "nvarchar"}
+    _BOOL_TYPES = {"boolean", "bool"}
+
+    @staticmethod
+    def _base_type(type_str: str) -> str:
+        """'decimal(10,2)' -> 'decimal', 'varchar(255)' -> 'varchar'."""
+        return re.split(r'[\s(]', type_str.strip(), maxsplit=1)[0].lower()
+
+    def _resolve_column_ref(self, qualifier: Optional[str], column: str,
+                            query_tables: list[str]) -> Optional[tuple[str, str]]:
+        """A parsed `qualifier.column` (or bare `column`) reference to
+        (table, canonical_column_name) — the same canonical spelling
+        _columns_for() returns, so callers can match it against
+        _score_columns()'s own (table, col) pairs directly. None if it
+        doesn't resolve against the current schema/alias state."""
+        if qualifier:
+            table = self._aliases.get(qualifier.lower())
+            if not table:
+                return None
+            for c in self._columns_for(table):
+                if c.lower() == column.lower():
+                    return (table, c)
+            return None
+        for t in query_tables:
+            for c in self._columns_for(t):
+                if c.lower() == column.lower():
+                    return (t, c)
+        return None
+
+    def _operators_for_column(self, table: str, column: str) -> list[str]:
+        """Operators that make sense for `column`'s type — e.g. only
+        BETWEEN/</> for numeric/date columns, LIKE/ILIKE for strings, IS
+        NULL/IS NOT NULL added only when the column is nullable. Empty
+        when the type isn't known (no column_details for this table)."""
+        meta = self._column_meta.get(table, {}).get(column.lower())
+        if not meta or not meta.get("type"):
+            return []
+        base = self._base_type(str(meta["type"]))
+        if base in self._BOOL_TYPES or (base == "tinyint" and "(1)" in str(meta["type"])):
+            ops = ["=", "!=", "IS", "IS NOT"]
+        elif base in self._NUMERIC_TYPES:
+            ops = ["=", "!=", "<", "<=", ">", ">=", "BETWEEN", "IN", "NOT IN"]
+        elif base in self._DATE_TYPES:
+            ops = ["=", "!=", "<", "<=", ">", ">=", "BETWEEN"]
+        elif base in self._STRING_TYPES:
+            ops = ["=", "!=", "LIKE", "NOT LIKE", "ILIKE", "IN", "NOT IN"]
+        else:
+            return []
+        if meta.get("nullable"):
+            ops = ops + ["IS NULL", "IS NOT NULL"]
+        return ops
+
+    def _where_operator_suggestions(self, prefix: str, query: str, pos: int) -> list[SuggestionItem]:
+        """Type-aware operator suggestions right after a fully-typed column
+        reference with nothing after it yet (e.g. `WHERE status `) — see
+        _operators_for_column. Adds nothing when the column's type isn't
+        known; the caller's existing generic operator/keyword list still
+        covers that case."""
+        before = query[:pos - len(prefix)]
+        m = _COLUMN_REF_TAIL_RE.search(before)
+        if not m:
+            return []
+        qualifier, column = m.group(1), m.group(2)
+        if not column or column.upper() in SQL_KEYWORDS:
+            return []
+        resolved = self._resolve_column_ref(qualifier, column, self._tables_in_query(query))
+        if not resolved:
+            return []
+        ops = self._operators_for_column(*resolved)
+        if not ops:
+            return []
+        return self._score(prefix, ops, SuggestionItem.KEYWORD, 1200)
+
+    def _where_value_suggestions(self, prefix: str, query: str, pos: int) -> list[SuggestionItem]:
+        """Static, no-query-round-trip value suggestions right after a
+        fully-typed operator (e.g. `WHERE status = `): enum/set literals
+        parsed straight from the column's own type string, or TRUE/FALSE
+        for boolean-ish columns / 0/1 for a MySQL tinyint(1) flag.
+
+        Deliberately does NOT suggest real distinct values pulled live
+        from the table — that would need a DISTINCT query against
+        whatever the user is connected to, which may be production; see
+        ai/load-context.md's read-only/production-safety scope. This
+        stays limited to what's already known from schema metadata."""
+        before = query[:pos - len(prefix)]
+        m = _COLUMN_THEN_OP_TAIL_RE.search(before)
+        if not m:
+            return []
+        qualifier, column = m.group(1), m.group(2)
+        if not column or column.upper() in SQL_KEYWORDS:
+            return []
+        resolved = self._resolve_column_ref(qualifier, column, self._tables_in_query(query))
+        if not resolved:
+            return []
+        table, col = resolved
+        meta = self._column_meta.get(table, {}).get(col.lower())
+        if not meta or not meta.get("type"):
+            return []
+        type_str = str(meta["type"]).strip()
+        base = self._base_type(type_str)
+
+        values: list[str] = []
+        enum_m = _ENUM_SET_TYPE_RE.match(type_str)
+        if enum_m:
+            values = [f"'{v}'" for v in _QUOTED_LITERAL_RE.findall(enum_m.group(2))]
+        elif base in self._BOOL_TYPES:
+            values = ["TRUE", "FALSE"]
+        elif base == "tinyint" and "(1)" in type_str:
+            values = ["0", "1"]
+
+        if not values:
+            return []
+        return self._score(prefix, values, SuggestionItem.VALUE, 1200)
+
+    def _columns_already_predicated(self, query: str, pos: int) -> set[tuple[str, str]]:
+        """(table, column) pairs already used in a completed predicate
+        earlier in the CURRENT WHERE/HAVING clause, so a repeated AND
+        doesn't keep re-suggesting a column already filtered on. Scoped
+        to the clause starting at the nearest preceding WHERE/HAVING
+        keyword, not the whole query."""
+        clause_start = 0
+        for m in re.finditer(r'\b(WHERE|HAVING)\b', query[:pos], re.IGNORECASE):
+            clause_start = m.end()
+        segment = query[clause_start:pos]
+        query_tables = self._tables_in_query(query)
+        used: set[tuple[str, str]] = set()
+        for m in _PREDICATE_COLREF_RE.finditer(segment):
+            qualifier, column = m.group(1), m.group(2)
+            if not column or column.upper() in SQL_KEYWORDS:
+                continue
+            resolved = self._resolve_column_ref(qualifier, column, query_tables)
+            if resolved:
+                used.add(resolved)
+        return used
 
     # ── Suggestion building ───────────────────────────────────────────────────
 
@@ -1044,8 +1227,12 @@ class SqlCompleter:
             results += self._score(pl, SQL_KEYWORDS,   SuggestionItem.KEYWORD,  700)
 
         elif context in ("AFTER_WHERE", "AFTER_ON", "AFTER_HAVING"):
-            results += self._score_columns(pl, query_tables, 1000)
+            exclude = (self._columns_already_predicated(query, pos)
+                       if context in ("AFTER_WHERE", "AFTER_HAVING") else None)
+            results += self._score_columns(pl, query_tables, 1000, exclude=exclude)
             results += self._alias_col_items(pl)
+            results += self._where_operator_suggestions(pl, query, pos)
+            results += self._where_value_suggestions(pl, query, pos)
             results += self._score(pl, SQL_FUNCTIONS, SuggestionItem.FUNC,     900)
             results += self._score(pl, self._user_functions, SuggestionItem.FUNC, 905)
             results += self._score(pl,
@@ -1326,14 +1513,26 @@ class SqlCompleter:
         cursor.setPosition(pos, QTextCursor.KeepAnchor)
 
         _MARKER = "{cursor}"
-        if _MARKER in completion:
+        has_marker = _MARKER in completion
+        if has_marker:
             marker_offset = completion.index(_MARKER)
             body = completion.replace(_MARKER, "")
-            cursor.insertText(body)
+        else:
+            body = completion
+        cursor.insertText(body)
+
+        # Whatever already followed the replaced word (untouched by the
+        # selection above, still starting at `pos`) may run straight into
+        # the inserted text with no separator — e.g. accepting "EXPLAIN"
+        # while the cursor sits right before an already-typed "select"
+        # (no space in between) must not glue them into "EXPLAINselect".
+        next_char = query[pos:pos + 1]
+        if next_char and (next_char.isalnum() or next_char in ('_', '`', '"')):
+            cursor.insertText(' ')
+
+        if has_marker:
             # Move cursor to where {cursor} placeholder was
             cursor.setPosition(i + marker_offset)
-        else:
-            cursor.insertText(completion)
 
         editor.setTextCursor(cursor)
         self._popup.hide()
