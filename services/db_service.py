@@ -525,29 +525,49 @@ class DbService:
     def kill_current_query(self):
         """Best-effort: kill the running query on the server side.
 
-        MySQL  — opens a second connection and sends KILL QUERY <thread_id>.
-        Others — no-op (the cancel flag in the worker thread is sufficient).
+        MySQL — opens a second connection and sends KILL QUERY <thread_id>
+        (MySQL connections have no in-band cancel mechanism, so this needs
+        a separate connection to issue it from).
+
+        PostgreSQL — psycopg2's Connection.cancel() sends a real cancel
+        request (libpq PQcancel, using the connection's own cancellation
+        key) over its own short-lived socket. It's specifically designed
+        to be called from another thread while the connection is blocked
+        inside a query — e.g. genuinely stuck waiting on a row/table lock
+        held by another session — so this actually interrupts the server
+        side (issue #295) instead of only the worker thread giving up on
+        waiting for a response that was never coming.
+
+        Others — no-op (the cancel flag in the worker thread still stops
+        the UI from waiting, but doesn't interrupt the server side).
         """
-        if self.db_type != "mysql" or not self.connection:
+        if not self.connection:
             return
-        try:
-            import pymysql
-            thread_id = self.connection.thread_id()
-            # Open a short-lived kill connection using the same config
-            kc = pymysql.connect(
-                host=self._config.get("host", "127.0.0.1"),
-                port=int(self._config.get("port", 3306)),
-                user=self._config.get("user", ""),
-                password=self._config.get("password", ""),
-                database=self._config.get("database", ""),
-                connect_timeout=3,
-            )
-            with kc.cursor() as cur:
-                cur.execute(f"KILL QUERY {thread_id}")
-            kc.close()
-            logger.info(f"Sent KILL QUERY {thread_id}")
-        except Exception as ex:
-            logger.warning(f"kill_current_query failed (non-fatal): {ex}")
+        if self.db_type == "mysql":
+            try:
+                import pymysql
+                thread_id = self.connection.thread_id()
+                # Open a short-lived kill connection using the same config
+                kc = pymysql.connect(
+                    host=self._config.get("host", "127.0.0.1"),
+                    port=int(self._config.get("port", 3306)),
+                    user=self._config.get("user", ""),
+                    password=self._config.get("password", ""),
+                    database=self._config.get("database", ""),
+                    connect_timeout=3,
+                )
+                with kc.cursor() as cur:
+                    cur.execute(f"KILL QUERY {thread_id}")
+                kc.close()
+                logger.info(f"Sent KILL QUERY {thread_id}")
+            except Exception as ex:
+                logger.warning(f"kill_current_query failed (non-fatal): {ex}")
+        elif self.db_type == "postgresql":
+            try:
+                self.connection.cancel()
+                logger.info("Sent Postgres query cancel request")
+            except Exception as ex:
+                logger.warning(f"kill_current_query (postgres) failed (non-fatal): {ex}")
 
     def _reconnect(self, config=None):
         """Re-establish the connection using *config*, or the previously
