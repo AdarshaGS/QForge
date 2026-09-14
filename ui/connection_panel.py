@@ -3341,6 +3341,35 @@ class ConnectionPanel(QWidget):
             return 1
 
     @staticmethod
+    def _insert_mock_data_atomically(db, sql: str, generated_pk_columns: list) -> list:
+        """Run every statement in *sql* (parent-table rows, then any
+        dependent children — build_dependency_chain) and the resulting
+        sequence bumps as one transaction. Without this, each statement
+        auto-commits as it runs, and a failure partway through the
+        children (an FK/constraint violation, a cancelled connection,
+        ...) would leave the parent rows permanently committed with only
+        some of their children present, or child rows FK-referencing
+        parent PKs that never made it in (issue #292). Wrapping the whole
+        insert in one transaction makes it atomic: either every statement
+        (and the sequence bump) lands together, or none of it does — on
+        any failure the caller sees the original exception with nothing
+        committed. Returns the list of (table, column) sequence bumps
+        that failed (bump_sequence_for_column() itself never raises)."""
+        db.begin_transaction()
+        try:
+            for stmt in query_classifier.split_statements(sql):
+                db.execute_update(stmt)
+            failed_bumps = [
+                (gen_table, pk_column) for gen_table, pk_column in generated_pk_columns
+                if not db.bump_sequence_for_column(gen_table, pk_column)
+            ]
+            db.commit_transaction()
+            return failed_bumps
+        except Exception:
+            db.rollback_transaction()
+            raise
+
+    @staticmethod
     def _mock_data_insert_message(table_name: str, failed_bumps: list) -> str:
         """Success message for the mock-data-insert result dialog —
         appends a visible warning when bump_sequence_for_column() failed
@@ -3423,13 +3452,7 @@ class ConnectionPanel(QWidget):
         generated_pk_columns = dialog.generated_pk_columns()
 
         def _run(db):
-            for stmt in query_classifier.split_statements(sql):
-                db.execute_update(stmt)
-            failed_bumps = [
-                (gen_table, pk_column) for gen_table, pk_column in generated_pk_columns
-                if not db.bump_sequence_for_column(gen_table, pk_column)
-            ]
-            return failed_bumps
+            return self._insert_mock_data_atomically(db, sql, generated_pk_columns)
 
         def _done(failed_bumps):
             message = self._mock_data_insert_message(table_name, failed_bumps)
@@ -3443,7 +3466,13 @@ class ConnectionPanel(QWidget):
                     break
 
         def _error(msg):
-            QMessageBox.critical(self, "Error", msg)
+            # _run() rolls back its whole transaction on any failure
+            # (issue #292), so nothing from this generation was committed —
+            # worth saying explicitly rather than leaving it ambiguous
+            # whether some rows made it in before the error.
+            QMessageBox.critical(
+                self, "Error",
+                f"{msg}\n\nNothing was inserted — the whole batch was rolled back.")
 
         # Issue #237: write cost scales with the requested row count, so
         # this runs on a dedicated background connection.

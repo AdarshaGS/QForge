@@ -26,6 +26,20 @@ import os
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 
+def _enclosing_function_name(tree, target):
+    """Innermost def whose body contains *target*, by walking every
+    FunctionDef and checking node ranges — more stable across unrelated
+    edits elsewhere in the file than asserting an exact line number."""
+    best = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.lineno <= target.lineno <= (
+            node.end_lineno or node.lineno
+        ):
+            if best is None or node.lineno > best.lineno:
+                best = node
+    return best.name if best else None
+
+
 def _production_call_sites():
     sites = []
     for pattern in ("*.py", "ui/*.py", "services/*.py"):
@@ -40,13 +54,16 @@ def _production_call_sites():
                     # Exclude the method's own definition file except for
                     # any (non-existent today) internal self-call.
                 ):
-                    sites.append((os.path.relpath(path, _ROOT), node.lineno))
+                    sites.append((
+                        os.path.relpath(path, _ROOT),
+                        _enclosing_function_name(tree, node),
+                    ))
     return sites
 
 
 def test_is_connected_has_exactly_one_known_production_caller():
     sites = _production_call_sites()
-    assert sites == [("ui/connection_panel.py", 4720)], (
+    assert sites == [("ui/connection_panel.py", "_ping")], (  # nested inside _check_health
         f"is_connected() call sites changed: {sites}. If this is a new "
         f"caller, confirm it's using is_connected() only as a "
         f"reachability ping (e.g. a health-check/status indicator), never "
