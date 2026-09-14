@@ -2405,6 +2405,30 @@ class ConnectionPanel(QWidget):
 
         tab.result_table.navigate_fk.connect(_on_result_fk_nav)
 
+    def _invalidate_shared_metadata_cache_if_ddl(self, query: str):
+        """A tab's own dedicated DbService already invalidates its own
+        in-memory metadata cache and the on-disk schema cache when it
+        successfully runs a schema-changing statement (DbService.
+        _invalidate_schema_cache_if_ddl, called from execute_query()/
+        execute_update()) — but self.db_service, the panel's separate
+        shared instance behind the schema browser/structure editor/FK-
+        aware features, is a different Python object and never finds out
+        (issue #291). Clear its cache too so the next read goes back to
+        the database instead of serving columns/FKs from before the DDL.
+        Deliberately not gated on whether the statement actually
+        succeeded — clearing an already-fresh cache is harmless, and
+        cheaper than re-deriving per-statement success for a Run All
+        script from its truncated per-tab labels."""
+        if not self.db_service:
+            return
+        try:
+            stmts = query_classifier.split_statements(query)
+            if any(query_classifier.classify(s).kind in query_classifier.SCHEMA_CHANGING_KINDS
+                   for s in stmts):
+                self.db_service.clear_metadata_cache()
+        except Exception:
+            pass
+
     def _on_query_done(self, tab, df, elapsed):
         """Receives worker `done` signal via bridge — guaranteed main thread."""
         perf_metrics.record("sql_editor", "query_execute", elapsed * 1000)
@@ -2414,6 +2438,7 @@ class ConnectionPanel(QWidget):
         if hasattr(tab, '_query_thread'):
             tab._query_thread.quit()
         query = getattr(tab, '_last_query', '')
+        self._invalidate_shared_metadata_cache_if_ddl(query)
         table_name = self._extract_table_name(query)
         tab.load_dataframe(df, table_name)
         tab.update_status(len(df), elapsed, truncated=df.attrs.get("truncated", False))
@@ -2451,6 +2476,7 @@ class ConnectionPanel(QWidget):
         if hasattr(tab, '_query_thread'):
             tab._query_thread.quit()
         query = getattr(tab, '_last_query', '')
+        self._invalidate_shared_metadata_cache_if_ddl(query)
         select_results = [(lbl, obj) for lbl, obj, _ in results if isinstance(obj, pd.DataFrame)]
 
         total_rows = sum(len(df) for _, df in select_results)

@@ -673,7 +673,7 @@ class DbService:
             return self._run_transaction_kind(tx_kind)
 
         try:
-            return self._execute_query_raw(query, max_rows)
+            result = self._execute_query_raw(query, max_rows)
         except Exception as ex:
             if self._is_connection_error(ex):
                 if self.in_transaction:
@@ -685,8 +685,19 @@ class DbService:
                     ) from ex
                 logger.warning(f"Connection lost during query, reconnecting... ({ex})")
                 self._reconnect()
-                return self._execute_query_raw(query, max_rows)
-            raise
+                result = self._execute_query_raw(query, max_rows)
+            else:
+                raise
+
+        # A single-statement Run (the common case for ad-hoc DDL — Run All
+        # is the only path that routes a detected write through
+        # execute_update(), which already did this) went entirely through
+        # this read path with no schema-cache invalidation at all (issue
+        # #290/#291): typing one ALTER TABLE and hitting plain Run left
+        # both the on-disk schema cache and every connection's in-memory
+        # metadata cache silently stale until an explicit Refresh Schema.
+        self._invalidate_schema_cache_if_ddl(query)
+        return result
 
     def execute_multi_query(self, script: str, max_rows=None) -> list[tuple[str, object, object]]:
         """Split *script* into statements, execute each. Returns list of

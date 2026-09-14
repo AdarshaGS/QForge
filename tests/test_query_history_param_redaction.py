@@ -106,6 +106,9 @@ class _QueryDonePanelStub:
     def _finalize_query_connection(self, tab):
         pass
 
+    def _invalidate_shared_metadata_cache_if_ddl(self, query):
+        pass
+
 
 def test_on_query_done_writes_template_not_resolved_secret_to_history():
     tab = SqlTab()
@@ -133,6 +136,9 @@ class _MultiDonePanelStub:
         pass
 
     def _finalize_query_connection(self, tab):
+        pass
+
+    def _invalidate_shared_metadata_cache_if_ddl(self, query):
         pass
 
 

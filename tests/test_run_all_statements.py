@@ -167,6 +167,9 @@ class _MultiDonePanelStub:
     def _finalize_query_connection(self, tab):
         pass
 
+    def _invalidate_shared_metadata_cache_if_ddl(self, query):
+        pass
+
 
 def test_multi_done_shows_a_tab_per_write_statement_not_just_selects():
     tab = SqlTab()
