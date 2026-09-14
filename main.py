@@ -113,6 +113,23 @@ class MainWindow(QMainWindow):
             lambda: self._current_panel() and self._current_panel().refresh_current_view()
         )
 
+        # Cycle SQL sub-tabs within the active connection panel (issue #299)
+        # — no menu counterpart, so bare QShortcuts like F5 above.
+        QShortcut(QKeySequence("Ctrl+Tab"), self).activated.connect(
+            lambda: self._current_panel() and self._current_panel().next_tab()
+        )
+        QShortcut(QKeySequence("Ctrl+Shift+Tab"), self).activated.connect(
+            lambda: self._current_panel() and self._current_panel().previous_tab()
+        )
+        # Cycle connection tabs (the outer tab bar) — Ctrl+PageDown/PageUp,
+        # the conventional modifier variant for the "outer" tab level.
+        QShortcut(QKeySequence("Ctrl+PageDown"), self).activated.connect(
+            lambda: self._cycle_connection_tab(1)
+        )
+        QShortcut(QKeySequence("Ctrl+PageUp"), self).activated.connect(
+            lambda: self._cycle_connection_tab(-1)
+        )
+
         # Developer performance overlay (issue #43) — hidden from normal
         # users on purpose: no menu item, not in the shortcuts-help dialog.
         # Ctrl+Shift+Alt+P toggles it; QFORGE_DEV_OVERLAY=1 auto-shows it.
@@ -452,6 +469,15 @@ class MainWindow(QMainWindow):
         if 0 <= idx < len(self._panels):
             return self._panels[idx]
         return None
+
+    def _cycle_connection_tab(self, delta: int):
+        """Cycle to the next/previous connection tab, wrapping around
+        (issue #299)."""
+        count = self.conn_tab_bar.count()
+        if count > 1:
+            self.conn_tab_bar.setCurrentIndex(
+                (self.conn_tab_bar.currentIndex() + delta) % count
+            )
 
     def _add_panel(self, panel: ConnectionPanel):
         self._panels.append(panel)

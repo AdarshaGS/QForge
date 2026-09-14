@@ -2277,6 +2277,18 @@ class ConnectionPanel(QWidget):
             f"windowState={win.windowState()!r} tabCount={self.tabs.count()}"
         )
 
+    def next_tab(self):
+        """Cycle to the next SQL sub-tab, wrapping around (issue #299)."""
+        count = self.tabs.count()
+        if count > 1:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() + 1) % count)
+
+    def previous_tab(self):
+        """Cycle to the previous SQL sub-tab, wrapping around (issue #299)."""
+        count = self.tabs.count()
+        if count > 1:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() - 1) % count)
+
     def add_new_tab(self, silent: bool = False):
         """Open a blank SQL query tab. Returns the new tab, or None if the
         tab cap (issue #154) blocked it. *silent* suppresses the upgrade
