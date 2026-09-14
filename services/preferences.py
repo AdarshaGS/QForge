@@ -41,3 +41,30 @@ def set(key: str, value):
             json.dump(data, f, indent=2)
     except Exception as ex:
         logger.warning(f"Failed to save preferences to {_FILE}: {ex}")
+
+
+def save_splitter_state(splitter, key: str):
+    """Persist a QSplitter's divider position(s) (issue #301). Same hex-
+    encoded-QByteArray approach as main.py's window-geometry persistence
+    (JSON can't hold raw bytes)."""
+    try:
+        set(key, bytes(splitter.saveState()).hex())
+    except Exception as ex:
+        logger.warning(f"Failed to save splitter state for {key}: {ex}")
+
+
+def restore_splitter_state(splitter, key: str) -> bool:
+    """Restore a QSplitter's divider position(s) saved by
+    save_splitter_state(), if any. Returns False (caller keeps the
+    splitter's default/designed sizes) when there's nothing saved or the
+    saved bytes don't parse."""
+    from PySide6.QtCore import QByteArray
+
+    raw = get(key)
+    if not raw:
+        return False
+    try:
+        state = QByteArray(bytes.fromhex(raw))
+    except (ValueError, TypeError):
+        return False
+    return bool(splitter.restoreState(state))

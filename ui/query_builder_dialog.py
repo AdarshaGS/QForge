@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QSplitter, QVBoxLayout, QWidget,
 )
 
+from services import preferences
 from services.erd_model import build_erd_graph, build_erd_graph_from_snapshot
 from services.query_builder_model import (
     JOIN_TYPES, Join, QueryBuilderState, build_sql,
@@ -376,6 +377,13 @@ class QueryBuilderDialog(QDialog):
         splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
+
+        # Restore a previously-saved divider position, if any (issue #301).
+        preferences.restore_splitter_state(splitter, "splitter.query_builder_dialog")
+        splitter.splitterMoved.connect(
+            lambda *_: preferences.save_splitter_state(splitter, "splitter.query_builder_dialog")
+        )
+
         layout.addWidget(splitter, 1)
 
         layout.addWidget(QLabel("SQL Preview"))

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from services import mock_data_generator as gen
 from services.mock_data_generator import DependencyChain, TablePlan
+from services import preferences
 
 _PREVIEW_STYLE = (
     "font-family: monospace; font-size: 12px; "
@@ -369,6 +370,13 @@ class MockDataDialog(QDialog):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 3)
+
+        # Restore a previously-saved divider position, if any (issue #301).
+        preferences.restore_splitter_state(splitter, "splitter.mock_data_dialog")
+        splitter.splitterMoved.connect(
+            lambda *_: preferences.save_splitter_state(splitter, "splitter.mock_data_dialog")
+        )
+
         layout.addWidget(splitter, stretch=1)
 
         self._warning_label = QLabel("")

@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from services.db_service import DbService
+from services import preferences
 from services.schema_diff import build_schema_diff
 from services.schema_migration import generate_migration_sql
 from ui.connection_dialog import ConnectionDialog
@@ -431,6 +432,15 @@ class SchemaCompareDialog(QDialog):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([680, 460])
+
+        # Restore a previously-saved divider position, if any (issue #301)
+        # — after the default setSizes() above, so a saved state (when
+        # present) wins over the built-in default.
+        preferences.restore_splitter_state(splitter, "splitter.schema_compare_dialog")
+        splitter.splitterMoved.connect(
+            lambda *_: preferences.save_splitter_state(splitter, "splitter.schema_compare_dialog")
+        )
+
         layout.addWidget(splitter, 1)
 
         self._diff_loaded.connect(self._on_diff_loaded)

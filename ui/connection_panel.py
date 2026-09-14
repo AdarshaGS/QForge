@@ -926,6 +926,14 @@ class ConnectionPanel(QWidget):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
+        # Restore a previously-saved divider position, if any (issue #301)
+        # — after the default setSizes() above, so a saved state (when
+        # present) wins over the built-in default.
+        preferences.restore_splitter_state(splitter, "splitter.connection_panel")
+        splitter.splitterMoved.connect(
+            lambda *_: preferences.save_splitter_state(splitter, "splitter.connection_panel")
+        )
+
         root.addWidget(splitter)
 
     # ─── Schema sidebar category filter ────────────────────────────────────────

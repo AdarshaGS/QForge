@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from services.data_diff import build_data_diff, table_select_sql
 from services.db_service import DbService
+from services import preferences
 from ui.connection_dialog import ConnectionDialog
 from ui.schema_compare_dialog import (
     _CHANGE_COLORS, _CHANGE_META, _PAGE_SIZE, _Placeholder, _SummaryCard,
@@ -258,6 +259,15 @@ class DataCompareDialog(QDialog):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([680, 460])
+
+        # Restore a previously-saved divider position, if any (issue #301)
+        # — after the default setSizes() above, so a saved state (when
+        # present) wins over the built-in default.
+        preferences.restore_splitter_state(splitter, "splitter.data_compare_dialog")
+        splitter.splitterMoved.connect(
+            lambda *_: preferences.save_splitter_state(splitter, "splitter.data_compare_dialog")
+        )
+
         layout.addWidget(splitter, 1)
 
         self.source_combo.currentIndexChanged.connect(

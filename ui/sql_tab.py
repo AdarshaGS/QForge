@@ -935,7 +935,19 @@ class SqlTab(QWidget):
         self.splitter.addWidget(top_widget)
         self.splitter.addWidget(bottom_widget)
         self.splitter.setSizes([300, 500])  # Initial sizes
-        
+
+        # Restore a previously-saved divider position, if any (issue #301)
+        # — after the default setSizes() above, so a saved state (when
+        # present) wins over the built-in default. splitterMoved only
+        # fires on an actual user drag, not _collapse_result_area()'s/
+        # _expand_result_area()'s programmatic setSizes() calls, so those
+        # don't clobber the saved preference with a transient collapsed
+        # size.
+        preferences.restore_splitter_state(self.splitter, "splitter.sql_tab")
+        self.splitter.splitterMoved.connect(
+            lambda *_: preferences.save_splitter_state(self.splitter, "splitter.sql_tab")
+        )
+
         layout.addWidget(self.splitter)
         logger.info(f"[SPACE-DEBUG] init_ui: after splitter.addWidget x2 + layout.addWidget(splitter) t={time.perf_counter():.4f}")
         layout.addWidget(self._build_tab_status_bar())
