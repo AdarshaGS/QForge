@@ -133,31 +133,6 @@ class ThemeManager:
             pixmap.save(path, "PNG")
         return path.replace(os.sep, "/")
 
-    @staticmethod
-    def env_dot_icon_path(color_hex: str) -> str:
-        """Render a small filled-circle indicator in *color_hex*, cached by
-        color like `_close_icon_path`. Used in place of tinting a whole row's
-        text/background for environment coloring (issue #56 — colored
-        backgrounds read as visual noise in a long connection list)."""
-        import os
-        import tempfile
-        from PySide6.QtCore import Qt as _Qt
-        from PySide6.QtGui import QColor, QPainter, QBrush, QPixmap
-
-        key = color_hex.lstrip("#").upper()
-        path = os.path.join(tempfile.gettempdir(), f"qforge_env_dot_{key}.png")
-        if not os.path.exists(path):
-            pixmap = QPixmap(12, 12)
-            pixmap.fill(_Qt.transparent)
-            painter = QPainter(pixmap)
-            painter.setRenderHint(QPainter.Antialiasing)
-            painter.setPen(_Qt.NoPen)
-            painter.setBrush(QBrush(QColor(color_hex)))
-            painter.drawEllipse(2, 2, 8, 8)
-            painter.end()
-            pixmap.save(path, "PNG")
-        return path.replace(os.sep, "/")
-
     # ── Dark palette ──────────────────────────────────────────────────────────
     @staticmethod
     def get_dark_theme() -> str:

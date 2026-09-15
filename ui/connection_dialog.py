@@ -9,6 +9,7 @@ from utils.logger import get_logger
 from utils.paths import app_data_dir
 from ui.theme_manager import ThemeManager
 from ui.upgrade_dialog import require_under_limit
+from services import preferences
 from services.entitlements import Limit
 
 logger = get_logger()
@@ -30,9 +31,19 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMenu,
     QCompleter,
+    QFrame,
+    QGraphicsOpacityEffect,
 )
-from PySide6.QtGui import QShortcut, QKeySequence, QFont, QColor, QIcon
-from PySide6.QtCore import Qt, QTimer, QEvent
+from PySide6.QtGui import QShortcut, QKeySequence, QColor, QFont, QFontMetrics
+from PySide6.QtCore import (
+    Qt,
+    QTimer,
+    QEvent,
+    QPropertyAnimation,
+    QParallelAnimationGroup,
+    QAbstractAnimation,
+    QEasingCurve,
+)
 
 
 class ConnectionDialog(QDialog):
@@ -45,6 +56,16 @@ class ConnectionDialog(QDialog):
     # connections.json on load rather than trusting its shape.
     _ALLOWED_TYPES = ("mysql", "postgresql")
     _MAX_STRING_LEN = 4096
+
+    _TYPE_LABELS = {"mysql": "MySQL", "postgresql": "PostgreSQL"}
+    _TYPE_ICONS = {"mysql": "\U0001F42C", "postgresql": "\U0001F418"}  # dolphin / elephant
+
+    # Sidebar "Recent" quick filter — a small persisted MRU list of
+    # connection ids, most-recent-first (services/preferences.py), separate
+    # from LAST_CONNECTION_FILE (which only ever remembers the single most
+    # recent one, for auto-selecting on next launch).
+    _RECENT_PREF_KEY = "recent_connection_ids"
+    _MAX_RECENT = 10
 
     # Form field widths (issue #55) — small/medium/large are fixed caps;
     # content-fit fields (host, database, ssh key path) start at the medium
@@ -64,12 +85,16 @@ class ConnectionDialog(QDialog):
         # don't hit the OS keychain (and its access-control prompt) once per
         # saved profile every time the connection list loads or saves.
         self._resolved_passwords = {}
+        # In-flight group expand/collapse fades, kept alive here since
+        # nothing else holds a Python reference to them once started (see
+        # _fade_in_group_children / _animate_group_collapse).
+        self._active_row_animations = []
 
         self.setWindowTitle("Connection Manager")
         self._compact_height = 530
         self._expanded_height = 730
-        self.resize(760, self._compact_height)
-        self.setMinimumSize(700, 420)
+        self.resize(860, self._compact_height)
+        self.setMinimumSize(800, 420)
         self.setSizeGripEnabled(True)
 
         close_shortcut = QShortcut(QKeySequence("Ctrl+W"), self)
@@ -90,28 +115,66 @@ class ConnectionDialog(QDialog):
 
         # ── LEFT PANEL ──────────────────────────────────────────
         left_panel = QWidget()
-        left_panel.setFixedWidth(210)
-        left_panel.setStyleSheet("QWidget { border-right: 1px solid #3a3a3c; }")
+        left_panel.setFixedWidth(310)
+        left_panel.setObjectName("connectionsLeftPanel")
+        # ID-scoped selector, not a bare "QWidget {...}" rule: the latter
+        # cascades to every QWidget descendant (each row's icon/name/
+        # subtitle labels included), giving each one its own right border
+        # and showing up as stray vertical divider lines inside every row.
+        left_panel.setStyleSheet("QWidget#connectionsLeftPanel { border-right: 1px solid #3a3a3c; }")
         left_layout = QVBoxLayout()
-        left_layout.setContentsMargins(8, 8, 8, 8)
-        left_layout.setSpacing(6)
+        left_layout.setContentsMargins(10, 10, 10, 10)
+        left_layout.setSpacing(8)
 
-        search_label = QLabel("🔍 Search Connections:")
-        search_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        search_row = QHBoxLayout()
+        search_row.setSpacing(6)
         self.connection_search = QLineEdit()
-        self.connection_search.setPlaceholderText("Type to filter connections...")
-        self.connection_search.setStyleSheet("font-size: 12px; padding: 8px;")
-        self.connection_search.textChanged.connect(self.filter_connections)
+        self.connection_search.setPlaceholderText("Search connections...")
+        self.connection_search.setStyleSheet("font-size: 12px; padding: 6px 8px;")
+        self.connection_search.textChanged.connect(lambda _text: self._apply_filters())
         self.connection_search.installEventFilter(self)
+        search_row.addWidget(self.connection_search, 1)
+        search_hint = QLabel("⌘F")
+        search_hint.setStyleSheet(
+            "color: #8b8b90; font-size: 10px; border: 1px solid #48484a;"
+            " border-radius: 4px; padding: 2px 5px; background: #2c2c2e;"
+        )
+        search_row.addWidget(search_hint)
+        left_layout.addLayout(search_row)
+        search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        search_shortcut.activated.connect(self._focus_search)
 
-        left_layout.addWidget(search_label)
-        left_layout.addWidget(self.connection_search)
+        # Quick filters: All Connections / Recent / Favorites. Deliberately
+        # no "Environments" smart-folder section and no per-row colored
+        # dots — environment safety is still shown as TEXT in each row's
+        # subtitle (see _build_connection_row_widget): colour alone must
+        # never be the only thing communicating risk (ai/ui-design.md).
+        self._quick_filter = "all"
+        self._quick_filter_rows: dict[str, QFrame] = {}
+        filters_box = QVBoxLayout()
+        filters_box.setSpacing(2)
+        for key, icon, label_text in (
+            ("all", "▤", "All Connections"),
+            ("recent", "\U0001F551", "Recent"),
+            ("favorites", "★", "Favorites"),
+        ):
+            row = self._build_quick_filter_row(key, icon, label_text)
+            self._quick_filter_rows[key] = row
+            filters_box.addWidget(row)
+        left_layout.addLayout(filters_box)
 
         self.connection_tree = QTreeWidget()
         self.connection_tree.setHeaderHidden(True)
-        self.connection_tree.setIndentation(20)
+        self.connection_tree.setIndentation(0)
         self.connection_tree.setRootIsDecorated(True)
-        self.connection_tree.setAnimated(True)
+        # Qt's native slide animation only works for delegate-painted rows;
+        # every row here is a real setItemWidget widget, so its attempt at
+        # animating the reveal just fights with our own opacity fade below
+        # (_fade_in_group_children / _animate_group_collapse) — visible as
+        # a jump on expand specifically, since collapse's fade finishes
+        # *before* the row is actually removed and has nothing left to
+        # clash with.
+        self.connection_tree.setAnimated(False)
         # ── Drag-to-reorder ─────────────────────────────────────
         self.connection_tree.setDragEnabled(True)
         self.connection_tree.setAcceptDrops(True)
@@ -121,7 +184,14 @@ class ConnectionDialog(QDialog):
         # ── Right-click context menu ─────────────────────────────
         self.connection_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.connection_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
-        left_layout.addWidget(self.connection_tree)
+        # setItemWidget rows suppress the delegate's own paint entirely
+        # (including the QSS QTreeWidget::item:selected highlight), so the
+        # "currently selected connection" affordance has to be applied to
+        # the row widget by hand instead.
+        self.connection_tree.currentItemChanged.connect(self._on_tree_current_item_changed)
+        self.connection_tree.itemExpanded.connect(self._on_tree_group_expansion_changed)
+        self.connection_tree.itemCollapsed.connect(self._on_tree_group_expansion_changed)
+        left_layout.addWidget(self.connection_tree, 1)
 
         # Annotated empty state (issue #164) — a first-time user's only
         # in-app path to discovering SSH tunnels, the SQL editor, and the
@@ -134,13 +204,16 @@ class ConnectionDialog(QDialog):
 
         new_conn_btn = QPushButton("+ New Connection")
         new_conn_btn.setToolTip("Clear form to create a new connection")
-        new_conn_btn.setStyleSheet(
-            "QPushButton { background: #2c2c2e; color: #e5e5ea; border: 1px solid #48484a;"
-            " border-radius: 5px; padding: 6px 10px; font-size: 13px; }"
-            "QPushButton:hover { background: #3a3a3c; border-color: #636366; }"
-        )
         new_conn_btn.clicked.connect(self._new_connection)
         left_layout.addWidget(new_conn_btn)
+
+        # Placeholder — no backing feature yet (GitHub issue #348); mirrors
+        # ui/welcome_screen.py's identically-scoped button/message.
+        import_btn = QPushButton("⤓  Import Connections")
+        import_btn.setProperty("flat", "true")
+        import_btn.setToolTip("Coming soon")
+        import_btn.clicked.connect(self._show_import_not_available)
+        left_layout.addWidget(import_btn)
 
         left_panel.setLayout(left_layout)
         layout.addWidget(left_panel)
@@ -450,16 +523,52 @@ class ConnectionDialog(QDialog):
         item = items[0]
         return item if item.parent() is not None else None
 
-    def _select_connection_by_index(self, idx):
-        """Walk the tree and select the item whose UserRole data equals idx."""
+    def _find_tree_item(self, idx):
+        """Walk the tree and return the leaf item whose UserRole data equals
+        idx, or None. Shared by _select_connection_by_index and the
+        sidebar row's "⋮" menu button (_show_row_menu)."""
         for gi in range(self.connection_tree.topLevelItemCount()):
             group_item = self.connection_tree.topLevelItem(gi)
             for ci in range(group_item.childCount()):
                 child = group_item.child(ci)
                 if child.data(0, Qt.UserRole) == idx:
-                    self.connection_tree.setCurrentItem(child)
-                    self.load_selected_connection()
-                    return
+                    return child
+        return None
+
+    def _select_connection_by_index(self, idx):
+        item = self._find_tree_item(idx)
+        if item is not None:
+            self.connection_tree.setCurrentItem(item)
+            self.load_selected_connection()
+
+    def _show_row_menu(self, conn_idx, _anchor=None):
+        """Open the same menu as a right-click on this row (_on_tree_context_
+        menu), triggered from the row's "⋮" button instead — it hit-tests
+        by position, so just feed it that item's position."""
+        item = self._find_tree_item(conn_idx)
+        if item is not None:
+            self._on_tree_context_menu(self.connection_tree.visualItemRect(item).center())
+
+    def _toggle_favorite(self, conn_idx: int):
+        if not (0 <= conn_idx < len(self.connections)):
+            return
+        self.connections[conn_idx]["favorite"] = not self.connections[conn_idx].get("favorite", False)
+        self.save_connections()
+        self.load_connections()
+
+    def _show_import_not_available(self):
+        """Placeholder — see ui/welcome_screen.py's identically-scoped
+        button; no backing feature yet (GitHub issue #348)."""
+        QMessageBox.information(
+            self,
+            "Import Connections",
+            "Importing connections from other tools isn't available yet.\n\n"
+            "It's on the roadmap — tracked as a GitHub issue.",
+        )
+
+    def _focus_search(self):
+        self.connection_search.setFocus()
+        self.connection_search.selectAll()
 
     # ── DB type change ───────────────────────────────────────────
 
@@ -610,6 +719,9 @@ class ConnectionDialog(QDialog):
         if "read_only" in conn and not isinstance(conn["read_only"], bool):
             conn["read_only"] = bool(conn["read_only"])
 
+        if "favorite" in conn and not isinstance(conn["favorite"], bool):
+            conn["favorite"] = bool(conn["favorite"])
+
         if "environment" in conn and not isinstance(conn["environment"], str):
             conn["environment"] = environment.DEFAULT_ENVIRONMENT
 
@@ -746,13 +858,285 @@ class ConnectionDialog(QDialog):
         show = not self.connections and not onboarding.is_connection_hint_dismissed()
         self._first_run_hint.setVisible(show)
 
+    # Available width for the name/subtitle column of a sidebar row —
+    # left_panel's fixed width, minus its layout margins, the tree's own
+    # frame, the row's margins, and its icon/star/"⋮" siblings — so a long
+    # connection name/host/group can't grow a row wide enough to push
+    # those buttons out of the visible cell (QLabel doesn't elide on its
+    # own, and setItemWidget's cell doesn't shrink children below their
+    # layout's natural size).
+    _ROW_TEXT_MAX_WIDTH = 165
+
+    @staticmethod
+    def _elide(text: str, pixel_size: int, bold: bool = False,
+               max_width: int = None) -> str:
+        """Pixel-accurate eliding (QFontMetrics), not a character-count
+        guess — the latter fell over as soon as font size/weight or the
+        panel width changed: a string well under the char budget still
+        overflowed its pixel budget and got hard-clipped (no "…") instead
+        of the layout just showing less of it."""
+        font = QFont()
+        font.setPixelSize(pixel_size)
+        font.setBold(bold)
+        width = ConnectionDialog._ROW_TEXT_MAX_WIDTH if max_width is None else max_width
+        return QFontMetrics(font).elidedText(text, Qt.ElideRight, width)
+
+    def _build_connection_row_widget(self, conn_idx: int, conn: dict) -> QWidget:
+        """The visible content of one sidebar connection row — a DB icon,
+        name + subtitle, a favorite star, and a "⋮" menu button. Column 0's
+        own item text is left empty and unused for display (see
+        load_connections's comment) — this widget is the only thing shown."""
+        T = ThemeManager
+        row = QWidget()
+        self._style_connection_row(row, selected=False)
+        row.setCursor(Qt.PointingHandCursor)
+        row.mousePressEvent = lambda _event, idx=conn_idx: self._select_connection_by_index(idx)
+
+        db_type = conn.get("type", "mysql")
+        host = conn.get("host", "")
+        row.setToolTip(f"{self._TYPE_LABELS.get(db_type, db_type.upper())} — {host}")
+
+        h = QHBoxLayout(row)
+        h.setContentsMargins(6, 7, 6, 7)
+        h.setSpacing(10)
+
+        icon_lbl = QLabel(self._TYPE_ICONS.get(db_type, "\U0001F5C4"))
+        icon_lbl.setStyleSheet("background: transparent; font-size: 17px;")
+        h.addWidget(icon_lbl)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        name_lbl = QLabel(self._elide(conn.get("name", ""), 14, bold=True))
+        name_lbl.setStyleSheet(f"background: transparent; color: {T.D_TEXT}; font-size: 13.5px; font-weight: 700;")
+        text_col.addWidget(name_lbl)
+
+        subtitle_bits = []
+        if host:
+            subtitle_bits.append(host)
+        if conn.get("read_only"):
+            subtitle_bits.append("\U0001F512")
+        subtitle_lbl = QLabel(self._elide("  ·  ".join(subtitle_bits), 12))
+        subtitle_lbl.setStyleSheet(f"background: transparent; color: {T.D_TEXT3}; font-size: 11.5px;")
+        text_col.addWidget(subtitle_lbl)
+        h.addLayout(text_col, 1)
+
+        is_favorite = bool(conn.get("favorite"))
+        star_btn = QPushButton("★" if is_favorite else "☆")
+        star_btn.setFixedSize(24, 24)
+        star_btn.setCursor(Qt.PointingHandCursor)
+        star_color = "#E0A23D" if is_favorite else T.D_TEXT3
+        star_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; padding: 0; color: {star_color}; font-size: 15px; }}"
+        )
+        star_btn.setToolTip("Remove from Favorites" if is_favorite else "Add to Favorites")
+        star_btn.clicked.connect(lambda _checked, idx=conn_idx: self._toggle_favorite(idx))
+        h.addWidget(star_btn)
+
+        menu_btn = QPushButton("⋮")
+        menu_btn.setFixedSize(18, 24)
+        menu_btn.setCursor(Qt.PointingHandCursor)
+        menu_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; padding: 0; color: {T.D_TEXT3}; font-size: 14px; }}"
+        )
+        menu_btn.clicked.connect(lambda _checked, idx=conn_idx: self._show_row_menu(idx))
+        h.addWidget(menu_btn)
+
+        return row
+
+    def _build_group_header_widget(self, group_item: QTreeWidgetItem, group_name: str, count: int) -> QWidget:
+        """A clickable header row for one connection group — a chevron
+        (kept in sync with expand/collapse via _on_tree_group_expansion_
+        changed), the group name, and its connection count. A custom
+        widget rather than the tree's own native branch/text rendering for
+        the same reason leaf rows are (see _build_connection_row_widget):
+        with setIndentation(0) there's no native decoration left to draw
+        a chevron with, and this keeps the whole sidebar on one rendering
+        approach instead of two."""
+        T = ThemeManager
+        row = QWidget()
+        row.setStyleSheet("background: transparent;")
+        row.setCursor(Qt.PointingHandCursor)
+        row.mousePressEvent = lambda _event, gi=group_item: self._toggle_group_expansion(gi)
+
+        h = QHBoxLayout(row)
+        h.setContentsMargins(4, 10, 6, 4)
+        h.setSpacing(6)
+
+        chevron = QLabel("⌄" if group_item.isExpanded() else "›")
+        chevron.setFixedWidth(14)
+        chevron.setStyleSheet(f"background: transparent; color: {T.D_TEXT2}; font-size: 13px; font-weight: 700;")
+        h.addWidget(chevron)
+
+        name_lbl = QLabel(self._elide(group_name, 14, bold=True, max_width=190))
+        name_lbl.setStyleSheet(f"background: transparent; color: {T.D_TEXT2}; font-size: 13.5px; font-weight: 700;")
+        h.addWidget(name_lbl, 1)
+
+        count_lbl = QLabel(str(count))
+        count_lbl.setStyleSheet(f"background: transparent; color: {T.D_TEXT3}; font-size: 12px;")
+        count_lbl.setMinimumWidth(14)
+        count_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        h.addWidget(count_lbl, 0)
+
+        row.chevron_label = chevron
+        return row
+
+    def _on_tree_group_expansion_changed(self, item: QTreeWidgetItem):
+        if item.parent() is not None:
+            return
+        w = self.connection_tree.itemWidget(item, 0)
+        if w is not None:
+            w.chevron_label.setText("⌄" if item.isExpanded() else "›")
+        # Collapsing is animated up front by _animate_group_collapse (it
+        # has to run *before* the item actually collapses, since the rows
+        # are simply gone once isExpanded() is False); expanding has no
+        # such ordering problem, so it's handled here, uniformly, for
+        # every path that expands a group (header click, auto-expand on
+        # load, a search match, ...).
+        if item.isExpanded():
+            self._fade_in_group_children(item)
+
+    def _toggle_group_expansion(self, group_item: QTreeWidgetItem):
+        """Expand/collapse with a quick opacity fade instead of the hard,
+        instant show/hide QTreeWidget defaults to for setItemWidget rows.
+        Qt's own setAnimated(True) slide-open animation only animates
+        natively delegate-painted rows — it silently does nothing once a
+        row has a real item widget on it, which is why toggling a group
+        used to look like a jump-cut instead of a smooth open/close."""
+        if group_item.isExpanded():
+            self._animate_group_collapse(group_item)
+        else:
+            group_item.setExpanded(True)
+
+    def _fade_in_group_children(self, group_item: QTreeWidgetItem):
+        for i in range(group_item.childCount()):
+            w = self.connection_tree.itemWidget(group_item.child(i), 0)
+            if w is None:
+                continue
+            effect = QGraphicsOpacityEffect(w)
+            w.setGraphicsEffect(effect)
+            anim = QPropertyAnimation(effect, b"opacity", w)
+            anim.setDuration(160)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.finished.connect(lambda w=w: self._clear_row_opacity_effect(w))
+            self._active_row_animations.append(anim)
+            anim.start(QAbstractAnimation.DeleteWhenStopped)
+
+    def _animate_group_collapse(self, group_item: QTreeWidgetItem):
+        widgets = [
+            self.connection_tree.itemWidget(group_item.child(i), 0)
+            for i in range(group_item.childCount())
+        ]
+        widgets = [w for w in widgets if w is not None]
+        if not widgets:
+            group_item.setExpanded(False)
+            return
+
+        group_anim = QParallelAnimationGroup(self)
+        for w in widgets:
+            effect = QGraphicsOpacityEffect(w)
+            w.setGraphicsEffect(effect)
+            anim = QPropertyAnimation(effect, b"opacity")
+            anim.setDuration(140)
+            anim.setStartValue(1.0)
+            anim.setEndValue(0.0)
+            anim.setEasingCurve(QEasingCurve.InCubic)
+            group_anim.addAnimation(anim)
+
+        def _finish(gi=group_item, group_anim=group_anim):
+            if group_anim in self._active_row_animations:
+                self._active_row_animations.remove(group_anim)
+            try:
+                gi.setExpanded(False)
+            except RuntimeError:
+                pass  # tree was cleared/rebuilt while the fade was running
+
+        group_anim.finished.connect(_finish)
+        self._active_row_animations.append(group_anim)
+        group_anim.start(QAbstractAnimation.DeleteWhenStopped)
+
+    def _clear_row_opacity_effect(self, w: QWidget):
+        try:
+            w.setGraphicsEffect(None)
+        except RuntimeError:
+            pass  # widget was detached/deleted (tree reload) mid-fade
+
+    def _style_connection_row(self, row: QWidget, selected: bool):
+        T = ThemeManager
+        if selected:
+            row.setStyleSheet(f"background: {T._alpha(T.D_BLUE, '22')}; border-radius: 6px;")
+        else:
+            row.setStyleSheet("background: transparent;")
+
+    def _on_tree_current_item_changed(self, current, previous):
+        """A setItemWidget row suppresses the delegate's own paint entirely,
+        including the QSS QTreeWidget::item:selected highlight, so "this is
+        the connection currently loaded in the form" has to be drawn on the
+        row widget by hand instead — this is the one signal every selection
+        path (click, arrow keys, select_last_connection, a fresh reload)
+        already funnels through via setCurrentItem."""
+        if previous is not None and previous.parent() is not None:
+            w = self.connection_tree.itemWidget(previous, 0)
+            if w is not None:
+                self._style_connection_row(w, selected=False)
+        if current is not None and current.parent() is not None:
+            w = self.connection_tree.itemWidget(current, 0)
+            if w is not None:
+                self._style_connection_row(w, selected=True)
+
+    def _clear_connection_tree(self):
+        """QTreeWidget.clear() removes items but is well known not to
+        reliably clean up widgets set via setItemWidget() with them —
+        leaving orphaned widgets rendered at their old, now-stale
+        positions (visible as a stray colored block behind/beside
+        unrelated rows) the next time this rebuilds the tree, e.g. after
+        _toggle_favorite or a drag-to-reorder. Explicitly detach each
+        leaf's row widget first. Signals are blocked for the duration —
+        clear() drops the current item, and _on_tree_current_item_changed
+        touching an item mid-teardown (already-deleted C++ object) is a
+        crash waiting to happen, not just a wasted no-op call."""
+        self.connection_tree.blockSignals(True)
+        try:
+            # Stop rather than let finish: a collapse fade's completion
+            # callback calls setExpanded(False) on a group item that's
+            # about to be deleted below. stop() doesn't emit finished(),
+            # so that callback never fires for a reload that interrupts it.
+            for anim in self._active_row_animations:
+                anim.stop()
+            self._active_row_animations.clear()
+            for gi in range(self.connection_tree.topLevelItemCount()):
+                group_item = self.connection_tree.topLevelItem(gi)
+                self._detach_item_widget(group_item)
+                for ci in range(group_item.childCount()):
+                    self._detach_item_widget(group_item.child(ci))
+            self.connection_tree.clear()
+        finally:
+            self.connection_tree.blockSignals(False)
+
+    def _detach_item_widget(self, item: QTreeWidgetItem):
+        w = self.connection_tree.itemWidget(item, 0)
+        if w is not None:
+            # removeItemWidget only detaches it — Qt explicitly does NOT
+            # take ownership/delete it, hide it, or even unparent it —
+            # without both calls below it keeps existing *and rendering*,
+            # at its last position, as an orphaned child of the viewport
+            # (visible as a stray colored block over/behind unrelated rows
+            # the moment this rebuilds — hide() is what actually stops
+            # that, synchronously; deleteLater() is just the eventual
+            # cleanup).
+            self.connection_tree.removeItemWidget(item, 0)
+            w.hide()
+            w.deleteLater()
+
     def load_connections(self):
         self._migrate_legacy_connections()
-        self.connection_tree.clear()
+        self._clear_connection_tree()
         self.connections = []
 
         if not os.path.exists(self.CONNECTION_FILE):
             self._update_first_run_hint_visibility()
+            self._apply_filters()
             return
 
         try:
@@ -761,6 +1145,7 @@ class ConnectionDialog(QDialog):
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
             self._update_first_run_hint_visibility()
+            self._apply_filters()
             return
         if not isinstance(raw, list):
             raw = []
@@ -786,23 +1171,21 @@ class ConnectionDialog(QDialog):
             group = (conn.get("group") or "Default").strip()
             groups.setdefault(group, []).append(idx)
 
-        bold_font = QFont()
-        bold_font.setBold(True)
-
         for group_name, indices in groups.items():
             group_item = QTreeWidgetItem(self.connection_tree)
-            group_item.setText(0, group_name)
-            group_item.setFont(0, bold_font)
             group_item.setData(0, Qt.UserRole, None)
+            group_item.setData(0, Qt.UserRole + 1, group_name)
             # Group headers are not selectable
             group_item.setFlags(group_item.flags() & ~Qt.ItemIsSelectable)
             group_item.setExpanded(True)
+            self.connection_tree.setItemWidget(
+                group_item, 0, self._build_group_header_widget(group_item, group_name, len(indices))
+            )
 
             for conn_idx in indices:
                 conn = self.connections[conn_idx]
-                _type_names = {"mysql": "MySQL", "postgresql": "PostgreSQL"}
                 raw_type = conn.get("type", "mysql")
-                db_type = _type_names.get(raw_type, raw_type.upper())
+                db_type = self._TYPE_LABELS.get(raw_type, raw_type.upper())
                 host = conn.get("host", "")
                 suffix = f"  [{db_type}]" + (f"  {host}" if host else "")
                 env = environment.normalize(conn.get("environment"))
@@ -812,16 +1195,24 @@ class ConnectionDialog(QDialog):
                 )
                 read_only_suffix = "  🔒" if conn.get("read_only") else ""
                 child = QTreeWidgetItem(group_item)
-                child.setText(0, conn["name"] + suffix + env_suffix + read_only_suffix)
+                # Column 0's own text is left empty — the row below
+                # (setItemWidget) covers the cell instead, and a heavily
+                # customized QTreeWidget::item stylesheet (ThemeManager)
+                # was still painting this text underneath/behind that
+                # widget rather than being fully suppressed by it, showing
+                # as ghosted double text. The search string _apply_filters
+                # matches against lives in UserRole + 1 instead.
                 child.setData(0, Qt.UserRole, conn_idx)
+                child.setData(0, Qt.UserRole + 1, conn["name"] + suffix + env_suffix + read_only_suffix)
                 child.setToolTip(0, f"{db_type} — {host}")
-                if env != environment.UNCLASSIFIED:
-                    _, _, border_color = ThemeManager.env_colors(env, self._is_dark_theme())
-                    child.setIcon(0, QIcon(ThemeManager.env_dot_icon_path(border_color)))
+                self.connection_tree.setItemWidget(
+                    child, 0, self._build_connection_row_widget(conn_idx, conn)
+                )
 
         # Refresh the group combo with all known group names
         self._populate_group_combo()
         self._update_first_run_hint_visibility()
+        self._apply_filters()
 
     def _populate_group_combo(self):
         """Rebuild the group combo items from all saved connections."""
@@ -1251,10 +1642,25 @@ class ConnectionDialog(QDialog):
 
         self.selected_connection = data
         self.save_last_connection(self.selected_connection)
+        self._record_recent_connection(data["id"])
         self.accept()
 
     def get_selected_connection(self):
         return self.selected_connection
+
+    def _record_recent_connection(self, conn_id: str):
+        """Feeds the sidebar's "Recent" quick filter (see _apply_filters) —
+        a small persisted MRU list, most-recent-first, capped at
+        _MAX_RECENT. Only called for an actual saved profile (not a
+        throwaway "New Connection" that was never saved) — see caller."""
+        if not conn_id:
+            return
+        ids = preferences.get(self._RECENT_PREF_KEY, [])
+        if not isinstance(ids, list):
+            ids = []
+        ids = [i for i in ids if i != conn_id]
+        ids.insert(0, conn_id)
+        preferences.set(self._RECENT_PREF_KEY, ids[:self._MAX_RECENT])
 
     # ── Test connection ──────────────────────────────────────────
 
@@ -1346,26 +1752,101 @@ class ConnectionDialog(QDialog):
 
     # ── Search / filter ──────────────────────────────────────────
 
-    def filter_connections(self, search_text):
-        search_text = search_text.lower().strip()
+    def _build_quick_filter_row(self, key: str, icon: str, label_text: str) -> QFrame:
+        row = QFrame()
+        row.setObjectName(f"quickFilter_{key}")
+        row.setCursor(Qt.PointingHandCursor)
+        row.mousePressEvent = lambda _event, k=key: self._set_quick_filter(k)
+
+        h = QHBoxLayout(row)
+        h.setContentsMargins(8, 6, 8, 6)
+        h.setSpacing(8)
+        icon_lbl = QLabel(icon)
+        icon_lbl.setStyleSheet("background: transparent; font-size: 12px;")
+        h.addWidget(icon_lbl)
+        text_lbl = QLabel(label_text)
+        text_lbl.setStyleSheet("background: transparent; font-size: 12.5px; font-weight: 600;")
+        h.addWidget(text_lbl, 1)
+        count_lbl = QLabel("0")
+        count_lbl.setStyleSheet(f"background: transparent; color: {ThemeManager.D_TEXT3}; font-size: 11.5px;")
+        h.addWidget(count_lbl)
+        row.count_label = count_lbl
+
+        self._restyle_quick_filter_row(row, active=(key == self._quick_filter))
+        return row
+
+    def _restyle_quick_filter_row(self, row: QFrame, active: bool):
+        T = ThemeManager
+        name = row.objectName()
+        if active:
+            row.setStyleSheet(
+                f"QFrame#{name} {{ background: {T._alpha(T.D_BLUE, '22')}; border-radius: 6px; }}"
+            )
+        else:
+            row.setStyleSheet(
+                f"QFrame#{name} {{ background: transparent; border-radius: 6px; }}"
+                f"QFrame#{name}:hover {{ background: {T.D_HOVER}; }}"
+            )
+
+    def _set_quick_filter(self, key: str):
+        if self._quick_filter == key:
+            return
+        self._quick_filter = key
+        for k, row in self._quick_filter_rows.items():
+            self._restyle_quick_filter_row(row, active=(k == key))
+        self._apply_filters()
+
+    def _update_quick_filter_counts(self):
+        recent_ids = preferences.get(self._RECENT_PREF_KEY, [])
+        if not isinstance(recent_ids, list):
+            recent_ids = []
+        counts = {
+            "all": len(self.connections),
+            "recent": sum(1 for c in self.connections if c.get("id") in recent_ids),
+            "favorites": sum(1 for c in self.connections if c.get("favorite")),
+        }
+        for key, row in self._quick_filter_rows.items():
+            row.count_label.setText(str(counts.get(key, 0)))
+
+    def _apply_filters(self):
+        """Combines the search box with the active quick filter (All/
+        Recent/Favorites) to decide which tree rows are visible — the
+        merged replacement for what used to be a search-only
+        filter_connections(). No "Environments" filter and no per-row
+        colour dot by design (see init_ui's comment)."""
+        search_text = self.connection_search.text().lower().strip()
+        recent_ids = preferences.get(self._RECENT_PREF_KEY, [])
+        if not isinstance(recent_ids, list):
+            recent_ids = []
+
         for gi in range(self.connection_tree.topLevelItemCount()):
             group_item = self.connection_tree.topLevelItem(gi)
             group_has_visible = False
             for ci in range(group_item.childCount()):
                 child = group_item.child(ci)
-                visible = not search_text or search_text in child.text(0).lower()
+                searchable = (child.data(0, Qt.UserRole + 1) or "").lower()
+                visible = not search_text or search_text in searchable
+                if visible and self._quick_filter != "all":
+                    conn_idx = child.data(0, Qt.UserRole)
+                    conn = self.connections[conn_idx] if conn_idx is not None else {}
+                    if self._quick_filter == "favorites":
+                        visible = bool(conn.get("favorite"))
+                    elif self._quick_filter == "recent":
+                        visible = conn.get("id") in recent_ids
                 child.setHidden(not visible)
                 if visible:
                     group_has_visible = True
-            group_item.setHidden(bool(search_text) and not group_has_visible)
+            group_item.setHidden(not group_has_visible)
             if group_has_visible:
                 group_item.setExpanded(True)
 
-        if search_text:
+        if search_text or self._quick_filter != "all":
             visible_items = self._visible_connection_items()
             if visible_items and self._get_selected_conn_item() not in visible_items:
                 self.connection_tree.setCurrentItem(visible_items[0])
                 self.load_selected_connection()
+
+        self._update_quick_filter_counts()
 
     def _visible_connection_items(self):
         """Return connection leaf items that are currently shown, in display order."""
