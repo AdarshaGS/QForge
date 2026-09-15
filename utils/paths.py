@@ -22,3 +22,14 @@ def app_data_dir() -> Path:
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return base / "QForge"
+
+
+def bundled_asset_path(name: str) -> str:
+    """Resolve a bundled asset (e.g. "logo.png", "assets/logo_mark.svg")
+    both when running from source and when frozen by PyInstaller, which
+    extracts/collects data files next to `sys._MEIPASS`. Was duplicated as
+    main.py's module-local _asset_path() before ui/welcome_screen.py also
+    needed it.
+    """
+    base = getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)
+    return str(Path(base) / name)

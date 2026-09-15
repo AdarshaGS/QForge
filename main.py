@@ -31,19 +31,14 @@ from utils.self_updater import UpdateInstaller, running_app_bundle_path, relaunc
 from utils.entitlement_fetcher import EntitlementConfigFetcher
 from utils.homebrew_updater import HomebrewUpdateInstaller
 from utils import install_source
-from utils.paths import app_data_dir
+from utils.paths import app_data_dir, bundled_asset_path
 from utils import environment
 from utils import schema_cache
 from utils import perf_metrics
 
 logger = setup_logger()
 
-
-def _asset_path(name: str) -> str:
-    """Resolve a bundled asset both when running from source and when frozen
-    by PyInstaller (which extracts/collects data files next to `sys._MEIPASS`)."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, name)
+_asset_path = bundled_asset_path
 
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
@@ -95,7 +90,7 @@ class MainWindow(QMainWindow):
         # _prompt_new_connection accumulates the modal dialog's own exec()
         # time into this — see its comment (issue #173).
         self._dialog_wait_ms = 0.0
-        self._prompt_new_connection(allow_cancel_quit=True)
+        self._run_startup_flow()
         _elapsed_ms = (time.perf_counter() - _startup_t0) * 1000
         perf_metrics.record("startup", "dialog_wait", self._dialog_wait_ms)
         perf_metrics.record("startup", "connection_manager_ready", _elapsed_ms - self._dialog_wait_ms)
@@ -561,13 +556,74 @@ class MainWindow(QMainWindow):
 
     # ─── Open connection ──────────────────────────────────────────────────────
 
-    def _prompt_new_connection(self, allow_cancel_quit: bool = False):
+    def _run_startup_flow(self):
+        """First thing shown at startup: the landing screen (unless the user
+        turned it off), then whatever it asked for. See ui/welcome_screen.py
+        for the four possible outcomes.
+
+        `listing_dialog` is a ConnectionDialog built with auto_connect_last=
+        False and never shown — WelcomeScreen has no connections.json/
+        keychain access of its own, so this is purely to reuse
+        ConnectionDialog's already-sanitized `connections` list (for display)
+        and its lazy per-connection credential resolution + _select_
+        connection_by_index/connect_selected (for actually connecting to a
+        Recent Connections row), instead of duplicating either."""
+        if preferences.get("show_welcome_screen", True):
+            from ui.welcome_screen import WelcomeScreen
+            listing_dialog = ConnectionDialog(auto_connect_last=False, parent=self)
+            welcome = WelcomeScreen(connections=listing_dialog.connections, parent=self)
+            # Same accumulate-and-subtract-back-out treatment as the
+            # dialog.exec() below (issue #173) — this is human think-time
+            # too, not startup overhead.
+            _welcome_t0 = time.perf_counter()
+            welcome.exec()
+            self._dialog_wait_ms += (time.perf_counter() - _welcome_t0) * 1000
+
+            if welcome.action == "quit":
+                sys.exit()
+
+            if welcome.action == "connect" and welcome.selected_index is not None:
+                listing_dialog._select_connection_by_index(welcome.selected_index)
+                listing_dialog.connect_selected()
+                config = listing_dialog.get_selected_connection()
+                listing_dialog.deleteLater()
+                if config and self._connect_and_add_panel(config):
+                    return
+                self._prompt_new_connection(allow_cancel_quit=True)
+                return
+
+            listing_dialog.deleteLater()
+
+            if welcome.action == "add_new":
+                self._prompt_new_connection(
+                    allow_cancel_quit=True, auto_connect_last=False,
+                    initial_db_type=welcome.chosen_db_type,
+                )
+                return
+
+            # "skip" — fall through to the plain picker below.
+
+        self._prompt_new_connection(allow_cancel_quit=True)
+
+    def _prompt_new_connection(
+        self, allow_cancel_quit: bool = False, auto_connect_last: bool | None = None,
+        initial_db_type: str | None = None,
+    ):
         while True:
             # Always parent to the main window: an unparented dialog is a
             # fully independent top-level window to macOS, so opening one
             # while the main window is in native full-screen kicks the app
             # out to a new desktop/Space instead of staying put (issue #15).
-            dialog = ConnectionDialog(auto_connect_last=(len(self._panels) == 0), parent=self)
+            effective_auto_last = (len(self._panels) == 0) if auto_connect_last is None else auto_connect_last
+            dialog = ConnectionDialog(auto_connect_last=effective_auto_last, parent=self)
+            if initial_db_type:
+                # Land on a blank "new connection" form pre-set to the
+                # requested type (a welcome-screen quick-create pill), not
+                # whatever auto_connect_last/the tree would otherwise select.
+                dialog._new_connection()
+                dialog.type_input.setCurrentText(initial_db_type)
+                initial_db_type = None  # only pre-fill once, across re-prompt loops
+
             # dialog.exec()'s blocking modal loop is the user picking a
             # connection and clicking Connect — real human think-time, not
             # app overhead. Accumulated (the while loop can re-prompt on an

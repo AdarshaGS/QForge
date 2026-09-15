@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="hexStroke" x1="6" y1="88" x2="94" y2="12" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1e3a8a"/>
+      <stop offset="55%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#60a5fa"/>
+    </linearGradient>
+    <linearGradient id="cubeTop" x1="32" y1="36" x2="68" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#bfdbfe"/>
+      <stop offset="100%" stop-color="#93c5fd"/>
+    </linearGradient>
+    <linearGradient id="cubeLeft" x1="32" y1="46" x2="50" y2="74" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="cubeRight" x1="50" y1="56" x2="68" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2149c4"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+
+  <polygon points="94,50 72,88.1 28,88.1 6,50 28,11.9 72,11.9"
+           fill="none" stroke="url(#hexStroke)" stroke-width="6" stroke-linejoin="round"/>
+
+  <polygon points="50,34 69,45.5 50,57 31,45.5" fill="url(#cubeTop)"/>
+  <polygon points="31,45.5 50,57 50,76 31,64.5" fill="url(#cubeLeft)"/>
+  <polygon points="69,45.5 50,57 50,76 69,64.5" fill="url(#cubeRight)"/>
+</svg>

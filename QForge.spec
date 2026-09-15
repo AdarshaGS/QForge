@@ -30,6 +30,7 @@ a = Analysis(
         ('services/*.py', 'services'),
         ('utils/*.py', 'utils'),
         ('logo.png', '.'),
+        ('assets/*.svg', 'assets'),
     ],
     hiddenimports=[
         'pymysql',
@@ -44,6 +45,8 @@ a = Analysis(
         'PySide6.QtCore',
         'PySide6.QtGui',
         'PySide6.QtWidgets',
+        'PySide6.QtSvg',
+        'PySide6.QtSvgWidgets',
     ],
     hookspath=[],
     hooksconfig={},
