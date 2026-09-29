@@ -605,6 +605,33 @@ class MainWindow(QMainWindow):
 
         self._prompt_new_connection(allow_cancel_quit=True)
 
+    def _show_welcome_screen_manual(self):
+        """Help -> Show Welcome Screen…. Re-opens the onboarding screen on
+        demand, independent of its "show this on launch" checkbox — once a
+        user unchecks that there was previously no way back short of
+        editing preferences.json by hand. Unlike _run_startup_flow above,
+        this never quits the app on close/skip; the app is already
+        running with the checkbox's own toggle still wired up for
+        launch-time behavior."""
+        from ui.welcome_screen import WelcomeScreen
+        listing_dialog = ConnectionDialog(auto_connect_last=False, parent=self)
+        welcome = WelcomeScreen(connections=listing_dialog.connections, parent=self)
+        welcome.exec()
+
+        if welcome.action == "connect" and welcome.selected_index is not None:
+            listing_dialog._select_connection_by_index(welcome.selected_index)
+            listing_dialog.connect_selected()
+            config = listing_dialog.get_selected_connection()
+            listing_dialog.deleteLater()
+            if config:
+                self._connect_and_add_panel(config)
+            return
+
+        listing_dialog.deleteLater()
+
+        if welcome.action == "add_new":
+            self._prompt_new_connection(auto_connect_last=False, initial_db_type=welcome.chosen_db_type)
+
     def _prompt_new_connection(
         self, allow_cancel_quit: bool = False, auto_connect_last: bool | None = None,
         initial_db_type: str | None = None,
@@ -994,13 +1021,18 @@ class MainWindow(QMainWindow):
         from PySide6.QtCore import QEventLoop
         checker = UpdateChecker()
         found = {"tag": None, "url": None, "dmg_url": None}
+        failure = {"reason": None}
 
         def _got(tag, url, dmg_url):
             found["tag"] = tag
             found["url"] = url
             found["dmg_url"] = dmg_url
 
+        def _failed(reason):
+            failure["reason"] = reason
+
         checker.update_available.connect(_got)
+        checker.check_failed.connect(_failed)
         checker.start()
         checker.wait(10_000)   # max 10 s
 
@@ -1023,6 +1055,14 @@ class MainWindow(QMainWindow):
             )
             if reply == QMessageBox.Yes:
                 self._handle_update_click()
+        elif failure["reason"]:
+            QMessageBox.warning(
+                self,
+                "Couldn't Check for Updates",
+                f"QForge couldn't reach the update server:\n\n{failure['reason']}\n\n"
+                f"You're currently on v{APP_VERSION}. Check your network "
+                f"connection and try again.",
+            )
         else:
             QMessageBox.information(
                 self,
@@ -1261,6 +1301,11 @@ class MainWindow(QMainWindow):
 
         act = help_menu.addAction("Keyboard Shortcuts")
         act.triggered.connect(self._show_shortcuts)
+
+        help_menu.addSeparator()
+
+        act = help_menu.addAction("Show Welcome Screen…")
+        act.triggered.connect(self._show_welcome_screen_manual)
 
         help_menu.addSeparator()
 

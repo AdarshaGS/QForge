@@ -15,7 +15,9 @@ outcome (most users won't have this configured), not an exceptional one.
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -82,8 +84,38 @@ class AiResult:
     error_kind: str | None = None
 
 
+@functools.lru_cache(maxsize=1)
+def _shell_path() -> str:
+    """Best-effort PATH as the user's own login shell would see it.
+
+    A Finder/Dock-launched .app inherits launchd's minimal PATH
+    (/usr/bin:/bin:/usr/sbin:/sbin) and never sources .zprofile/.zshrc —
+    which is where Homebrew, nvm, or the native Claude Code installer add
+    their own bin dir. shutil.which("claude") alone misses a real install
+    in that case. Asking the shell directly (instead of hardcoding a list
+    of common install paths, see utils/install_source.py's brew_path())
+    finds it regardless of where the user's setup put it. Cached for the
+    process lifetime — spawning a login shell is relatively slow and PATH
+    doesn't change mid-run.
+    """
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    try:
+        proc = subprocess.run(
+            [shell, "-ilc", "echo -n $PATH"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return proc.stdout.strip()
+    except Exception as ex:
+        logger.debug(f"ai_client: login shell PATH lookup failed: {ex}")
+        return ""
+
+
 def _claude_path() -> str | None:
-    return shutil.which("claude")
+    found = shutil.which("claude")
+    if found:
+        return found
+    login_path = _shell_path()
+    return shutil.which("claude", path=login_path) if login_path else None
 
 
 def is_enabled() -> bool:

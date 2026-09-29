@@ -45,7 +45,8 @@ class _FakePopen:
 # ===========================================================================
 
 def test_check_availability_not_installed():
-    with patch("services.ai_client.shutil.which", return_value=None):
+    with patch("services.ai_client.shutil.which", return_value=None), \
+         patch("services.ai_client._shell_path", return_value=""):
         result = ai_client.check_availability()
     assert result.installed is False
     assert result.authenticated is False
@@ -92,10 +93,34 @@ def test_check_availability_malformed_json_never_raises():
 # ===========================================================================
 
 def test_run_prompt_not_installed():
-    with patch("services.ai_client.shutil.which", return_value=None):
+    with patch("services.ai_client.shutil.which", return_value=None), \
+         patch("services.ai_client._shell_path", return_value=""):
         result = ai_client.run_prompt("hello")
     assert result.ok is False
     assert result.error_kind == "not_installed"
+
+
+# ===========================================================================
+# _claude_path login-shell fallback (Finder-launched .app minimal PATH)
+# ===========================================================================
+
+def test_claude_path_falls_back_to_login_shell_path():
+    """shutil.which misses claude on launchd's minimal PATH, but it's on
+    the login shell's PATH (e.g. Homebrew/nvm/native installer)."""
+    with patch("services.ai_client.shutil.which",
+               side_effect=[None, "/opt/homebrew/bin/claude"]) as which, \
+         patch("services.ai_client._shell_path",
+               return_value="/opt/homebrew/bin:/usr/bin:/bin"):
+        result = ai_client._claude_path()
+    assert result == "/opt/homebrew/bin/claude"
+    assert which.call_count == 2
+
+
+def test_claude_path_no_fallback_when_shell_path_unavailable():
+    with patch("services.ai_client.shutil.which", return_value=None), \
+         patch("services.ai_client._shell_path", return_value=""):
+        result = ai_client._claude_path()
+    assert result is None
 
 
 def test_run_prompt_happy_path_no_schema():

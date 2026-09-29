@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QCheckBox,
+    QComboBox,
     QGroupBox,
     QSpinBox,
     QScrollArea,
@@ -55,7 +56,16 @@ class ExportScopeDialog(QDialog):
     on MySQL, whose DDL text can actually contain a GENERATED clause to
     strip (issue #160)."""
 
-    def __init__(self, tables: list[str], dialect: str = "mysql", parent=None):
+    def __init__(self, tables: list[str], dialect: str = "mysql", parent=None,
+                 databases: list[str] = None, current_database: str = "",
+                 tables_for_database=None):
+        """*databases*/*current_database*/*tables_for_database* (all optional,
+        database-export only — omitted for the single-table _export_table()
+        dialog) add a database picker above the table grid: switching it
+        calls tables_for_database(name) to refill the grid with that
+        database's tables. The caller is expected to answer that call from
+        already-loaded state (current tables in memory, or a schema-cache
+        hit) rather than a fresh live query, to keep switching instant."""
         super().__init__(parent)
         self.setWindowTitle("Export Options")
         self.setMinimumWidth(480)
@@ -66,10 +76,23 @@ class ExportScopeDialog(QDialog):
             "strip_generated": dialect == "mysql",
         }
 
+        self._tables_for_database = tables_for_database
         self._table_checks: dict[str, dict[str, QCheckBox]] = {}
         self._table_labels: dict[str, QLabel] = {}
         self._column_widgets: dict[str, list] = {key: [] for key, _, _ in _COLUMNS}
         layout = QVBoxLayout(self)
+
+        self._db_combo = None
+        if databases and tables_for_database:
+            db_row = QHBoxLayout()
+            db_row.addWidget(QLabel("Database:"))
+            self._db_combo = QComboBox()
+            self._db_combo.addItems(databases)
+            if current_database in databases:
+                self._db_combo.setCurrentText(current_database)
+            self._db_combo.currentTextChanged.connect(self._on_database_changed)
+            db_row.addWidget(self._db_combo, 1)
+            layout.addLayout(db_row)
 
         self._tab_bar = QTabBar()
         for label in _FORMAT_LABELS:
@@ -100,7 +123,9 @@ class ExportScopeDialog(QDialog):
         bulk_row.addStretch()
         layout.addLayout(bulk_row)
 
-        layout.addWidget(self._build_grid(tables))
+        self._grid_container_layout = layout
+        self._grid_scroll = self._build_grid(tables)
+        layout.addWidget(self._grid_scroll)
         layout.addWidget(self._build_advanced_panel())
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -156,6 +181,22 @@ class ExportScopeDialog(QDialog):
         scroll.setMaximumHeight(260)
         scroll.setWidget(grid_widget)
         return scroll
+
+    def _on_database_changed(self, database: str):
+        """Re-fetch the table list for *database* (from the caller's
+        already-loaded state, see __init__'s docstring) and rebuild the
+        grid in place — the S/C/D checkbox state for the old database's
+        tables is intentionally discarded since it's a different table set."""
+        tables = self._tables_for_database(database) or []
+        self._table_checks.clear()
+        self._table_labels.clear()
+        self._column_widgets = {key: [] for key, _, _ in _COLUMNS}
+        old_scroll = self._grid_scroll
+        self._grid_scroll = self._build_grid(tables)
+        self._grid_container_layout.replaceWidget(old_scroll, self._grid_scroll)
+        old_scroll.deleteLater()
+        self._search_edit.clear()
+        self._on_format_changed(self._tab_bar.currentIndex())
 
     def _set_column(self, key: str, checked: bool):
         for checks in self._table_checks.values():
@@ -260,6 +301,11 @@ class ExportScopeDialog(QDialog):
             for w in widgets:
                 w.setEnabled(enabled)
             widgets[0].setChecked(enabled and _ADVANCED_DEFAULTS[key])
+
+    def selected_database(self) -> str:
+        """Chosen database, or "" when this dialog has no picker (single-
+        table export, or export_database() before this feature)."""
+        return self._db_combo.currentText() if self._db_combo else ""
 
     def export_format(self) -> str:
         """'sql' | 'csv' | 'xml' | 'dot'"""

@@ -3503,16 +3503,26 @@ class ConnectionPanel(QWidget):
         """Export chosen tables' structure and/or data to a single SQL dump
         (issue #39: whole-database export, independent of any query tab).
         Per-table Structure/Content/Drop and the advanced options (hex BLOBs,
-        BOM, gzip, KiB-batched INSERTs) are all chosen up front via
-        ExportScopeDialog (issue #157). The write itself streams rows off a
-        background thread, pipelined across tables (issue #158) — see
-        _run_export()/_ExportWorker."""
-        all_tables = self.db_service.get_tables()
+        BOM, gzip, KiB-batched INSERTs), plus which database to export, are
+        all chosen up front via ExportScopeDialog (issue #157). The write
+        itself streams rows off a background thread, pipelined across
+        tables (issue #158) — see _run_export()/_ExportWorker.
+
+        The table list for the currently-connected database comes from
+        self.all_tables (already populated by load_schema()) rather than a
+        fresh live query — see _tables_for_database()."""
+        all_tables = self.all_tables
         if not all_tables:
             QMessageBox.information(self, "Export Database", "No tables to export.")
             return
 
-        scope = ExportScopeDialog(all_tables, dialect=self.db_service.db_type, parent=self)
+        current_db = self.config.get("database", "")
+        databases = self._available_dbs or ([current_db] if current_db else [])
+        scope = ExportScopeDialog(
+            all_tables, dialect=self.db_service.db_type, parent=self,
+            databases=databases, current_database=current_db,
+            tables_for_database=self._tables_for_database,
+        )
         if not scope.exec():
             return
         table_opts = scope.table_options()
@@ -3524,7 +3534,35 @@ class ConnectionPanel(QWidget):
         if not file_path:
             return
 
-        self._run_export(table_opts, file_path, scope, title="Export Database")
+        export_config = dict(self.config)
+        selected_db = scope.selected_database()
+        if selected_db:
+            export_config["database"] = selected_db
+
+        self._run_export(table_opts, file_path, scope, title="Export Database", config=export_config)
+
+    def _tables_for_database(self, database: str) -> list[str]:
+        """Tables for *database*, preferring already-loaded state over a
+        live query (the export dialog's database picker calls this on every
+        switch, so it needs to stay fast): the currently-connected database's
+        tables are already in self.all_tables, and any other previously
+        visited database has a schema_cache entry from its own last
+        load_schema(). Only a database never opened in this app falls back
+        to a one-off live query over a throwaway connection."""
+        if not database or database == self.config.get("database", ""):
+            return self.all_tables
+        cached = schema_cache.load(self.config.get("id", ""), database)
+        if cached:
+            return cached.get("tables", [])
+        probe = DbService()
+        try:
+            probe.connect({**self.config, "database": database})
+            return probe.get_tables()
+        except Exception as ex:
+            logger.warning(f"Failed to list tables for database {database}: {ex}")
+            return []
+        finally:
+            probe.disconnect()
 
     def _pick_export_file(self, title: str, default_stem: str, scope) -> str | None:
         """Prompt for a save path whose filter/extension matches *scope*'s
@@ -3550,7 +3588,7 @@ class ConnectionPanel(QWidget):
             file_path += ".gz"
         return file_path
 
-    def _run_export(self, table_opts: dict, file_path: str, scope, title: str):
+    def _run_export(self, table_opts: dict, file_path: str, scope, title: str, config: dict = None):
         """Stream *table_opts* to *file_path* on a background QThread via
         _ExportWorker (issue #158): a producer thread walks the tables and
         pushes structure/row-chunk items onto a bounded queue while the
@@ -3558,10 +3596,13 @@ class ConnectionPanel(QWidget):
         table N+1's fetch overlaps table N's disk/gzip flush instead of
         running strictly sequentially. Uses a dedicated DbService connection
         so the export never shares state with the main schema-browsing
-        connection (same reasoning as _QueryWorker's dedicated connection)."""
+        connection (same reasoning as _QueryWorker's dedicated connection).
+        *config* overrides self.config, e.g. export_database()'s database
+        picker exporting a database other than the one this panel is
+        browsing."""
         export_db = DbService()
         try:
-            export_db.connect(self.config)
+            export_db.connect(config or self.config)
         except Exception as ex:
             QMessageBox.critical(self, "Export Error", f"Could not open export connection:\n{ex}")
             return

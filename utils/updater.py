@@ -29,6 +29,11 @@ class UpdateChecker(QThread):
     # emitted on main thread when a newer release is found
     # (tag_name e.g. "v1.2.0", html_url, macOS .dmg asset download URL or "")
     update_available = Signal(str, str, str)
+    # emitted when the request itself failed (no network, GitHub rate-limit,
+    # DNS, etc.) — distinct from "checked fine, nothing newer" so a
+    # user-initiated check can tell the two apart instead of reporting "you
+    # are on the latest version" when it actually just couldn't find out.
+    check_failed = Signal(str)
 
     def run(self):
         try:
@@ -57,5 +62,5 @@ class UpdateChecker(QThread):
             if tag and _vtuple(tag) > _vtuple(APP_VERSION):
                 self.update_available.emit(tag, html_url, dmg_url)
 
-        except Exception:
-            pass   # silently ignore — no network, rate-limit, etc.
+        except Exception as exc:
+            self.check_failed.emit(str(exc))
