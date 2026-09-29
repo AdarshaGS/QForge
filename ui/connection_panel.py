@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QCursor, QFont
 
+from services import remote_backup as rb
 from services.db_service import DbService
 from services import ai_client, ai_prompts, preferences, query_cost
 from ui.ai_async import AiCallManager
@@ -3539,7 +3540,35 @@ class ConnectionPanel(QWidget):
         if selected_db:
             export_config["database"] = selected_db
 
+        if scope.export_format() == "sql" and rb.supports_remote_backup(export_config) and \
+                QMessageBox.question(
+                    self, "Export Database",
+                    "Run as a background backup job on the SSH server?\n\n"
+                    "It keeps running if the connection drops or QForge closes, and can be "
+                    "reopened from File \u2192 Backup Jobs. Requires mysqldump on the server; "
+                    "per-table Structure/Content options are ignored (whole tables are dumped).",
+                ) == QMessageBox.Yes:
+            self._start_backup_job(export_config, list(table_opts), file_path)
+            return
+
         self._run_export(table_opts, file_path, scope, title="Export Database", config=export_config)
+
+    def _start_backup_job(self, config: dict, tables: list, file_path: str):
+        from services import backup_job as bj
+        from ui.backup_jobs_dialog import BackupJobsDialog
+        store = bj.JobStore()
+        job = bj.new_job(config.get("id", ""), config.get("database", ""), file_path, tables)
+        remote = None
+        try:
+            remote = rb.open_remote(config)
+            rb.start(job, config, remote, store)
+        except Exception as ex:
+            QMessageBox.critical(self, "Backup Job", f"Could not start backup:\n{ex}")
+            return
+        finally:
+            if remote:
+                remote.close()
+        BackupJobsDialog(self, store).exec()
 
     def _tables_for_database(self, database: str) -> list[str]:
         """Tables for *database*, preferring already-loaded state over a

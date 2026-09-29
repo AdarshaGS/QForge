@@ -1131,6 +1131,9 @@ class MainWindow(QMainWindow):
         act.setShortcut("Ctrl+E")
         act.triggered.connect(self._export_database)
 
+        act = file_menu.addAction("Backup Jobs…")
+        act.triggered.connect(self._show_backup_jobs)
+
         act = file_menu.addAction("Import Data…")
         act.setShortcut("Ctrl+Shift+E")
         act.triggered.connect(self._import_data)
@@ -1408,6 +1411,10 @@ class MainWindow(QMainWindow):
         if not panel:
             return
         panel.export_database()
+
+    def _show_backup_jobs(self):
+        from ui.backup_jobs_dialog import BackupJobsDialog
+        BackupJobsDialog(self).exec()
 
     def _import_data(self):
         panel = self._current_panel()
